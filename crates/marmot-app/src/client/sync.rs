@@ -839,6 +839,39 @@ impl DrainCounts {
     }
 }
 
+/// Exact candidate IDs from a clean, finite reconciliation suffix. These are
+/// only proposals until the account owner confirms post-drain retention.
+pub(super) struct PositiveSuffixEvidence {
+    route: TransportReconciliationRoute,
+    candidate_ids: Vec<[u8; 32]>,
+}
+
+fn positive_suffix_evidence(
+    route: &TransportReconciliationRoute,
+    frozen_items: &[transport_nostr_adapter::NostrReconciliationItem],
+    summary: &transport_nostr_adapter::NostrReconciliationSummary,
+    events: &[transport_nostr_adapter::NostrRelayEvent],
+) -> Option<PositiveSuffixEvidence> {
+    if !summary.clean_bounded_suffix {
+        return None;
+    }
+    let frozen = frozen_items
+        .iter()
+        .map(|item| item.event_id)
+        .collect::<HashSet<_>>();
+    let candidate_ids = events
+        .iter()
+        .filter_map(|event| hex::decode(&event.event.id).ok())
+        .filter_map(|id| <[u8; 32]>::try_from(id.as_slice()).ok())
+        .filter(|id| !frozen.contains(id))
+        .take(16)
+        .collect::<Vec<_>>();
+    (!candidate_ids.is_empty()).then(|| PositiveSuffixEvidence {
+        route: route.clone(),
+        candidate_ids,
+    })
+}
+
 /// What the convergence scheduler should do next for a group, derived from
 /// the engine's durable pass state. Expected collection time is not an error;
 /// storage and projection failures are, and they surface as `Err` from
@@ -1345,10 +1378,13 @@ impl AppClient {
         &mut self,
         frozen: &[super::recovery::FrozenRecoveryInventory],
     ) -> Result<
-        Vec<(
-            TransportReconciliationRoute,
-            storage_sqlite::RecoveryComparisonOutcome,
-        )>,
+        (
+            Vec<(
+                TransportReconciliationRoute,
+                storage_sqlite::RecoveryComparisonOutcome,
+            )>,
+            Vec<PositiveSuffixEvidence>,
+        ),
         AppError,
     > {
         use storage_sqlite::RecoveryComparisonOutcome as Outcome;
@@ -1358,6 +1394,7 @@ impl AppClient {
             witness.record_reconciliation_deadline(deadline);
         }
         let mut outcomes = Vec::new();
+        let mut positive_suffix = Vec::new();
         let storage = self.app.account_storage(&self.state.label)?;
         let mut attempted_routes = 0usize;
         let mut routes_failed = 0usize;
@@ -1423,6 +1460,8 @@ impl AppClient {
                 let Some((summary, events)) = owned else {
                     return Ok::<_, cgka_traits::TransportAdapterError>(None);
                 };
+                let evidence =
+                    positive_suffix_evidence(&inventory.route, &inventory.items, &summary, &events);
                 // This is still an inline worker phase. Keep queue submission
                 // inside the original per-route deadline and error boundary:
                 // a full queue or closed adapter remains a transient route
@@ -1446,15 +1485,18 @@ impl AppClient {
                     }
                     self.adapter.queue_reconciled_event(event).await?;
                 }
-                Ok(Some(summary))
+                Ok(Some((summary, evidence)))
             })
             .await;
             let outcome = match result {
-                Ok(Ok(Some(summary))) => {
+                Ok(Ok(Some((summary, evidence)))) => {
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
                     remote_items += summary.remote_items;
                     received_items += summary.received_items;
+                    if let Some(evidence) = evidence {
+                        positive_suffix.push(evidence);
+                    }
                     if summary.relays_failed > 0 {
                         Outcome::TransientFailure
                     } else {
@@ -1488,7 +1530,7 @@ impl AppClient {
             received_items,
             "completed transport set reconciliation"
         );
-        Ok(outcomes)
+        Ok((outcomes, positive_suffix))
     }
 
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
@@ -4556,12 +4598,16 @@ impl AppClient {
         &mut self,
         mut recovery: OnlineEpochGapRecovery,
         drain: Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure>,
-        submissions: Vec<RouteSubmission>,
+        mut submissions: Vec<RouteSubmission>,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         #[cfg(test)]
         drop(recovery.phase.take());
         let result = match drain {
             Ok((summary, verdict)) => {
+                let positive_suffix = submissions
+                    .iter_mut()
+                    .filter_map(|route| route.positive_suffix.take())
+                    .collect();
                 let outcomes = self
                     .app
                     .account_storage(&self.state.label)
@@ -4584,7 +4630,7 @@ impl AppClient {
                             &recovery.grant,
                             &mut recovery.execution.counts,
                             &mut recovery.execution.drain_verdict,
-                            outcomes,
+                            (outcomes, positive_suffix),
                             summary,
                             verdict,
                         )
@@ -4732,21 +4778,22 @@ impl AppClient {
                             | storage_sqlite::RecoveryCause::Maintenance
                     )
                 });
-        let comparison_outcomes = if grant.comparison_revision.is_some() || !quiet_prerequisites {
-            #[cfg(test)]
-            let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Reconciliation);
-            self.reconcile_transport_history(&grant.inventory)
-                .await
-                .map_err(|error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::Unknown,
-                    )
-                })?
-        } else {
-            Vec::new()
-        };
+        let (comparison_outcomes, positive_suffix) =
+            if grant.comparison_revision.is_some() || !quiet_prerequisites {
+                #[cfg(test)]
+                let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Reconciliation);
+                self.reconcile_transport_history(&grant.inventory)
+                    .await
+                    .map_err(|error| {
+                        ClassifiedSyncFailure::at_stage(
+                            SyncSummary::default(),
+                            error,
+                            SyncFailureStage::Unknown,
+                        )
+                    })?
+            } else {
+                (Vec::new(), Vec::new())
+            };
         #[cfg(test)]
         let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Completion);
         self.complete_recovery_grant_inner(
@@ -4755,6 +4802,7 @@ impl AppClient {
             counts,
             drain_verdict,
             comparison_outcomes,
+            positive_suffix,
         )
         .await
     }
@@ -4904,6 +4952,7 @@ impl AppClient {
             TransportReconciliationRoute,
             storage_sqlite::RecoveryComparisonOutcome,
         )>,
+        positive_suffix: Vec<PositiveSuffixEvidence>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let quiet_prerequisites =
             grant
@@ -4935,7 +4984,7 @@ impl AppClient {
             grant,
             counts,
             drain_verdict,
-            comparison_outcomes,
+            (comparison_outcomes, positive_suffix),
             summary,
             verdict,
         )
@@ -4947,13 +4996,17 @@ impl AppClient {
         grant: &AttemptGrant,
         counts: &mut DrainCounts,
         drain_verdict: &mut Option<DrainVerdict>,
-        comparison_outcomes: Vec<(
-            TransportReconciliationRoute,
-            storage_sqlite::RecoveryComparisonOutcome,
-        )>,
+        comparison: (
+            Vec<(
+                TransportReconciliationRoute,
+                storage_sqlite::RecoveryComparisonOutcome,
+            )>,
+            Vec<PositiveSuffixEvidence>,
+        ),
         mut summary: SyncSummary,
         verdict: DrainVerdict,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let (comparison_outcomes, positive_suffix) = comparison;
         *drain_verdict = Some(verdict);
         let local = self.drain_pending_session_events().await.map_err(|error| {
             ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::Unknown)
@@ -5052,16 +5105,17 @@ impl AppClient {
                 } else {
                     outcome
                 };
-                let eligibility = super::recovery::eligibility_after_observation(
+                let investigation_ended = matches!(
+                    verdict,
+                    DrainVerdict::Complete
+                        | DrainVerdict::RepairDeadline
+                        | DrainVerdict::NovelProgressQuantumYield
+                        | DrainVerdict::NoProgressQuantumYield
+                );
+                let mut eligibility = super::recovery::eligibility_after_observation(
                     obligation.cause,
                     outcome,
-                    matches!(
-                        verdict,
-                        DrainVerdict::Complete
-                            | DrainVerdict::RepairDeadline
-                            | DrainVerdict::NovelProgressQuantumYield
-                            | DrainVerdict::NoProgressQuantumYield
-                    ),
+                    investigation_ended,
                     obligation
                         .group_id
                         .as_ref()
@@ -5069,6 +5123,71 @@ impl AppClient {
                             counts.refused_groups.contains(group)
                         }),
                 );
+                // A standalone queue-loss investigation may continue only
+                // when a clean, finite comparison suffix yielded a genuinely
+                // retained event in this selected scope after the drain.
+                // The ordinary outcome and endpoint coverage remain Unknown.
+                if obligation.cause == storage_sqlite::RecoveryCause::QueueLoss
+                    && grant.comparison_revision.is_none()
+                    && investigation_ended
+                    && matches!(
+                        outcome,
+                        storage_sqlite::RecoveryScopeOutcome::Unknown
+                            | storage_sqlite::RecoveryScopeOutcome::BudgetExhausted
+                    )
+                    && counts.refused == 0
+                    && matches!(
+                        verdict,
+                        DrainVerdict::Complete | DrainVerdict::NovelProgressQuantumYield
+                    )
+                    && eligibility == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+                    && !comparison_outcomes.iter().any(|(route, observed)| {
+                        *observed == storage_sqlite::RecoveryComparisonOutcome::Unsupported
+                            || (*observed
+                                == storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+                                && !positive_suffix
+                                    .iter()
+                                    .any(|evidence| evidence.route == *route))
+                    })
+                {
+                    let current = storage.recovery_revision_fence()?;
+                    let stable = current.loss_revision == grant.fence.loss_revision
+                        && current.route_revision == grant.fence.route_revision
+                        && current.inventory_revision == grant.fence.inventory_revision
+                        && grant
+                            .fence
+                            .obligations
+                            .iter()
+                            .all(|selected| current.obligations.contains(selected));
+                    if stable {
+                        'evidence: for evidence in &positive_suffix {
+                            for scope in &obligation.scopes {
+                                let selected_route =
+                                    match (scope.goal.route_kind, scope.goal.transport_group_id) {
+                                        (0, _) => Some(TransportReconciliationRoute::Inbox),
+                                        (1, Some(id)) => {
+                                            Some(TransportReconciliationRoute::Group(id))
+                                        }
+                                        _ => None,
+                                    };
+                                if selected_route.as_ref() != Some(&evidence.route) {
+                                    continue;
+                                }
+                                for id in &evidence.candidate_ids {
+                                    if storage.retained_recovery_event(
+                                        &evidence.route,
+                                        id,
+                                        scope.goal.since_seconds,
+                                        scope.goal.until_seconds,
+                                    )? {
+                                        eligibility = storage_sqlite::RecoveryEligibility::Retry;
+                                        break 'evidence;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let checkpoints = obligation
                     .scopes
                     .iter()

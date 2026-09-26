@@ -126,6 +126,16 @@ fn bounded_reconciliation_remote_ids(
     ids
 }
 
+fn exact_id_request_clean(
+    outcome: &NostrAcquisitionEndpoint,
+    wanted_id: &str,
+    claimed_by_endpoint: bool,
+) -> bool {
+    outcome.end == NostrAcquisitionEnd::RequestPolicySatisfied
+        && (!claimed_by_endpoint || outcome.events.iter().any(|event| event.id == wanted_id))
+        && outcome.events.iter().all(|event| event.id == wanted_id)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrReconciliationItem {
     pub event_id: [u8; 32],
@@ -141,6 +151,10 @@ pub struct NostrReconciliationSummary {
     pub relays_failed: usize,
     pub remote_items: usize,
     pub received_items: usize,
+    /// A finite local pass limit left remote-only IDs unattempted after all
+    /// attempted comparisons and exact requests completed without failure.
+    /// This is continuation evidence, never endpoint coverage or admission.
+    pub clean_bounded_suffix: bool,
     #[cfg(feature = "test-policy-overrides")]
     pub comparison_diagnostics: NostrComparisonDiagnostics,
 }
@@ -849,6 +863,7 @@ impl NostrSdkRelayClient {
         let mut remote = HashSet::new();
         let mut remote_by_endpoint = HashMap::new();
         let mut failed_endpoints = HashSet::new();
+        let mut clean_requests = true;
         #[cfg(feature = "test-policy-overrides")]
         let mut comparison_diagnostics = NostrComparisonDiagnostics::default();
         for outcome in outcomes {
@@ -865,6 +880,7 @@ impl NostrSdkRelayClient {
                 }
                 Some(Err(_)) | None => {
                     failed_endpoints.insert(endpoint);
+                    clean_requests = false;
                 }
             }
         }
@@ -915,6 +931,7 @@ impl NostrSdkRelayClient {
                 if remaining_items == 0 || event_bytes > remaining_bytes {
                     incomplete = true;
                     if event_bytes > SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES {
+                        clean_requests = false;
                         // This object can never fit the pass allowance. Rotate
                         // past it so smaller missing IDs remain reachable;
                         // durable inventory still keeps it eligible on wrap.
@@ -1008,13 +1025,12 @@ impl NostrSdkRelayClient {
                 request_items = request_items.max(outcome.stats.received_items);
                 request_bytes = request_bytes.max(outcome.stats.serialized_event_bytes);
                 byte_limited |= outcome.end == NostrAcquisitionEnd::ByteLimitReached;
-                let claimed_id_missing = remote_by_endpoint
+                let claimed_by_endpoint = remote_by_endpoint
                     .get(endpoint)
-                    .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id))
-                    && !outcome.events.iter().any(|event| event.id == wanted_id);
-                if outcome.end != NostrAcquisitionEnd::RequestPolicySatisfied || claimed_id_missing
-                {
+                    .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id));
+                if !exact_id_request_clean(&outcome, &wanted_id, claimed_by_endpoint) {
                     failed_endpoints.insert(endpoint.clone());
+                    clean_requests = false;
                 }
                 for event in outcome.events {
                     if event.id != wanted_id {
@@ -1080,6 +1096,7 @@ impl NostrSdkRelayClient {
             relays_failed: failed_endpoints.len(),
             remote_items: remote_item_count,
             received_items: remote_events.len(),
+            clean_bounded_suffix: incomplete && clean_requests,
             #[cfg(feature = "test-policy-overrides")]
             comparison_diagnostics: NostrComparisonDiagnostics {
                 account_lookup_ms,
@@ -2879,6 +2896,13 @@ mod tests {
         assert_eq!(partial.events.len(), 2);
         assert_eq!(partial.stats.received_items, 3);
         assert_eq!(partial.stats.retained_high_water_items, 2);
+        let returned_id = partial.events[0].id.clone();
+        assert!(!exact_id_request_clean(partial, &returned_id, true));
+        let mut completed = partial.clone();
+        completed.end = NostrAcquisitionEnd::RequestPolicySatisfied;
+        completed.events.truncate(1);
+        assert!(exact_id_request_clean(&completed, &returned_id, true));
+        assert!(!exact_id_request_clean(&completed, "wrong-id", true));
 
         let one_id = vec![events[0].id.to_bytes()];
         let report = sdk
@@ -2893,6 +2917,18 @@ mod tests {
         assert!(oversized.events.is_empty());
         assert_eq!(oversized.stats.received_items, 1);
         assert!(oversized.stats.serialized_event_bytes > 1);
+        assert!(!exact_id_request_clean(
+            oversized,
+            &events[0].id.to_hex(),
+            true
+        ));
+        let mut claimed_but_missing = oversized.clone();
+        claimed_but_missing.end = NostrAcquisitionEnd::RequestPolicySatisfied;
+        assert!(!exact_id_request_clean(
+            &claimed_but_missing,
+            &events[0].id.to_hex(),
+            true,
+        ));
         relay.shutdown();
     }
 
@@ -3429,6 +3465,7 @@ mod tests {
             .unwrap();
         assert!(events.is_empty());
         assert_eq!(summary.relays_failed, 1);
+        assert!(!summary.clean_bounded_suffix);
         assert_eq!(summary.comparison_diagnostics.relay_missing, 1);
         assert_eq!(summary.comparison_diagnostics.neg_error, 0);
     }
@@ -3609,11 +3646,12 @@ mod tests {
         assert_eq!(resumed_ids, expected_next);
         progress.save_cursor(None).unwrap();
         let mut notifications = sdk.client.notifications();
-        let (_, first) = sdk
+        let (first_summary, first) = sdk
             .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
             .await
             .unwrap();
         assert_eq!(first.len(), SDK_RECONCILIATION_MAX_ID_REQUESTS);
+        assert!(first_summary.clean_bounded_suffix);
         while let Some(notification) =
             tokio::time::timeout(Duration::from_millis(10), notifications.next())
                 .await

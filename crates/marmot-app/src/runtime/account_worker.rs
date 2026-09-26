@@ -794,6 +794,13 @@ pub(crate) fn spawn_app_runtime_account_worker(
     ))
 }
 
+async fn cooperative_receive_handoff(pending: &mut bool, direct_overflow_pending: bool) {
+    if *pending && !direct_overflow_pending {
+        *pending = false;
+        tokio::task::yield_now().await;
+    }
+}
+
 async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     command_tx: mpsc::Sender<AccountWorkerCommand>,
@@ -1596,10 +1603,23 @@ async fn run_app_runtime_account_worker(
     // Resume the original Receive continuation after an owned direct-overflow
     // grant settles. In particular, an error must enter its reconnect arm.
     let mut completed_direct_overflow: Option<Result<(SyncSummary, bool), AppError>> = None;
+    // A claimed delivery completes its durable ingest and Receive continuation
+    // before yielding. Keep this outside the biased select so a ready account
+    // queue cannot immediately win another Receive in the same worker poll.
+    let mut handoff_after_completed_receive = false;
     let mut yield_to_bounded_admission = false;
     let mut bounded_probe_at = TokioInstant::now();
     let mut bounded_prepare_error_reported = false;
     'worker: loop {
+        // A direct-overflow result has a forced original Receive continuation;
+        // let it run first, then perform the pending cooperative handoff.
+        if handoff_after_completed_receive {
+            cooperative_receive_handoff(
+                &mut handoff_after_completed_receive,
+                completed_direct_overflow.is_some(),
+            )
+            .await;
+        }
         #[cfg(test)]
         let worker_pause = if comparison_recovery.is_none()
             && online_epoch_gap.is_none()
@@ -2608,6 +2628,7 @@ async fn run_app_runtime_account_worker(
                                                 retry_push_registration,
                                             },
                                         });
+                                        handoff_after_completed_receive = true;
                                         continue 'worker;
                                     }
                                     PendingComparisonExecution::OnlineEpochGap {
@@ -2628,6 +2649,7 @@ async fn run_app_runtime_account_worker(
                                                 retry_push_registration,
                                             },
                                         });
+                                        handoff_after_completed_receive = true;
                                         continue 'worker;
                                     }
                                     PendingComparisonExecution::Inline(result) => {
@@ -2678,6 +2700,9 @@ async fn run_app_runtime_account_worker(
                         #[cfg(test)]
                         if resumed_direct_overflow {
                             shared.comparison_test_trace.lock().unwrap().push("direct_overflow_receive_tail");
+                        }
+                        if delivery_started.is_some() {
+                            handoff_after_completed_receive = true;
                         }
                     }
                     Err(err) => {
@@ -7669,6 +7694,34 @@ mod tests {
             kind,
             phase,
         }
+    }
+
+    #[tokio::test]
+    async fn completed_receive_yields_only_after_forced_overflow_continuation() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut pending = true;
+        let mut forced = Box::pin(cooperative_receive_handoff(&mut pending, true));
+        assert!(matches!(
+            forced.as_mut().poll(&mut context),
+            Poll::Ready(())
+        ));
+        drop(forced);
+        assert!(pending, "forced Receive still owns the next worker turn");
+
+        let mut handoff = Box::pin(cooperative_receive_handoff(&mut pending, false));
+        assert!(matches!(handoff.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(
+            handoff.as_mut().poll(&mut context),
+            Poll::Ready(())
+        ));
+        drop(handoff);
+        assert!(
+            !pending,
+            "the completed Receive hands control to Tokio once"
+        );
     }
 
     #[tokio::test]

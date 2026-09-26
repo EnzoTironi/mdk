@@ -47,6 +47,40 @@ durable QueueLoss marker and
 demand remained pending because the SDK's EOSE and aggregate comparison do
 not certify exhaustive admission. The fixture asserts the loss stays honest.
 
+The account worker now makes one cooperative scheduler handoff after a claimed
+delivery completes its durable ingest and Receive continuation. A forced
+direct-overflow Receive continuation runs first. The handoff is outside the
+biased select, so a ready delivery queue does not immediately win another
+Receive in that worker poll. This deliberately paces the worker; it makes no
+guarantee about I/O latency, timers, or throughput under other loads.
+
+SDK reconciliation separately marks a **clean bounded suffix** only when a
+finite pass limit left remote-only IDs unattempted after clean comparisons and
+exact-ID requests. A missing or failed endpoint, request-policy failure,
+claimed ID with no returned event, wrong ID, completed byte-limit rejection,
+or intrinsically oversized cached event cannot supply that evidence. Inline
+and owned paths carry at most 16 IDs absent from the frozen route inventory,
+and only after the full returned batch reaches the delivery queue. After the
+drain, the owner requires an event retained in the selected route and time
+scope, a matching grant revision fence, and no refusal or overflow. Only then
+may a standalone QueueLoss obligation remain paced `Retry` on an unfinished
+pass. The checkpoint outcome remains `Unknown` or `BudgetExhausted`; endpoint
+coverage and admission flags remain false. Cursor movement or queue submission
+alone does not qualify, and repeated adversarial backdated novelty has no
+finite-lifetime bound from this rule.
+
+The cleaned composition passed one local offline Linux arm64 run of the
+original 500-event Receive fixture in 67.71 seconds: QueueLoss Receive
+attempts 5–8 proceeded through normal owner pacing; the held attempt 8
+requested and queued the missing commit, and the fixture verified durable
+retention, the MLS epoch advance, both dependent plaintext messages, and the
+existing status/send/live response bounds. The marker and demand remained
+pending as the fixture requires. Earlier local handoff-only and diagnostic
+runs failed, and the previously observed GitHub x86_64 failures remain open;
+this local result does not classify or close them. Temporary CPU, scheduler,
+target-rank, and cursor probes used during diagnosis were removed from the
+review patch.
+
 This is a focused local outcome, not proof for every account route shape,
 continuous traffic, relays without comparison support, process restart, or
 device delivery. The SDK's per-route negotiation and acquisition deadlines,
