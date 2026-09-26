@@ -37,6 +37,132 @@ struct HeldLossReplay {
 }
 
 const RELAY_TIMELINE_LIMIT: usize = 64;
+const WAKE_LAG_RECORD_LIMIT: usize = 64;
+const WAKE_LAG_CADENCE: Duration = Duration::from_millis(50);
+const WAKE_LAG_RECORD_THRESHOLD: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // The diagnostic output reads these fields through derived Debug.
+struct WakeLagRecord {
+    previous_wake_ms: u64,
+    expected_wake_ms: u64,
+    observed_wake_ms: u64,
+    gap_ms: u64,
+    late_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WakeLagSnapshot {
+    samples: u64,
+    max_gap_ms: u64,
+    first_poll: Option<WakeLagRecord>,
+    gaps: Vec<WakeLagRecord>,
+    dropped: u64,
+}
+
+struct TokioWakeLagProbe {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    snapshot: Arc<Mutex<WakeLagSnapshot>>,
+}
+
+impl TokioWakeLagProbe {
+    fn start(origin: std::time::Instant) -> Self {
+        let snapshot = Arc::new(Mutex::new(WakeLagSnapshot::default()));
+        let samples = snapshot.clone();
+        let spawned_at = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            let mut previous_wake = std::time::Instant::now();
+            Self::record(
+                &samples,
+                origin,
+                spawned_at,
+                spawned_at,
+                previous_wake,
+                true,
+            );
+            loop {
+                // Reschedule from the observed wake, so a late poll cannot
+                // produce a burst of catch-up samples.
+                let expected_wake = previous_wake + WAKE_LAG_CADENCE;
+                tokio::time::sleep_until(expected_wake.into()).await;
+                let observed_wake = std::time::Instant::now();
+                Self::record(
+                    &samples,
+                    origin,
+                    previous_wake,
+                    expected_wake,
+                    observed_wake,
+                    false,
+                );
+                previous_wake = observed_wake;
+            }
+        });
+        Self {
+            handle: Some(handle),
+            snapshot,
+        }
+    }
+
+    fn record(
+        snapshot: &Mutex<WakeLagSnapshot>,
+        origin: std::time::Instant,
+        previous_wake: std::time::Instant,
+        expected_wake: std::time::Instant,
+        observed_wake: std::time::Instant,
+        first_poll: bool,
+    ) {
+        let elapsed_ms = |instant: std::time::Instant| {
+            instant
+                .saturating_duration_since(origin)
+                .as_millis()
+                .min(u64::MAX as u128) as u64
+        };
+        let gap = observed_wake.saturating_duration_since(previous_wake);
+        let record = WakeLagRecord {
+            previous_wake_ms: elapsed_ms(previous_wake),
+            expected_wake_ms: elapsed_ms(expected_wake),
+            observed_wake_ms: elapsed_ms(observed_wake),
+            gap_ms: gap.as_millis().min(u64::MAX as u128) as u64,
+            late_ms: observed_wake
+                .saturating_duration_since(expected_wake)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        };
+        let mut snapshot = snapshot.lock().unwrap();
+        snapshot.samples = snapshot.samples.saturating_add(1);
+        snapshot.max_gap_ms = snapshot.max_gap_ms.max(record.gap_ms);
+        if first_poll {
+            snapshot.first_poll = Some(record);
+        } else if gap > WAKE_LAG_RECORD_THRESHOLD {
+            if snapshot.gaps.len() < WAKE_LAG_RECORD_LIMIT {
+                snapshot.gaps.push(record);
+            } else {
+                snapshot.dropped = snapshot.dropped.saturating_add(1);
+            }
+        }
+    }
+
+    fn stop_and_snapshot(&mut self) -> WakeLagSnapshot {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+        self.snapshot.lock().unwrap().clone()
+    }
+
+    async fn reap(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for TokioWakeLagProbe {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
 
 impl HeldLossReplay {
     fn release(&self) {
@@ -546,6 +672,9 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     let diagnostic_origin = std::time::Instant::now();
     *gate.diagnostic_origin.lock().unwrap() = Some(diagnostic_origin);
     *activity.diagnostic_origin.lock().unwrap() = Some(diagnostic_origin);
+    // One low-rate observer on this fixture's current-thread Tokio runtime.
+    // Its wakeups can perturb scheduling and do not identify why a poll was late.
+    let mut wake_lag_probe = TokioWakeLagProbe::start(diagnostic_origin);
     runtime
         .shared_services()
         .comparison_test_trace
@@ -683,6 +812,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .or_else(|| phases.reconciliation_deadline_remaining());
     let active_jobs_at_release = activity.active_jobs.load(Ordering::SeqCst);
     let active_requests_at_release = activity.active_requests.load(Ordering::SeqCst);
+    let wake_lag = wake_lag_probe.stop_and_snapshot();
     gate.release();
     let selected = selections.lock().unwrap().clone();
     let route_outcomes = activity
@@ -771,7 +901,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .iter()
         .any(|(_, target_route, target_time, _, _, _, _)| *target_route && *target_time);
     eprintln!(
-        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, neg_started={}, neg_completed={}, neg_active={}, neg_max_elapsed_ms={}, neg_max_items={}, relay_timeline={relay_timeline:?}, relay_timeline_dropped={relay_timeline_dropped}, selected={selected:?}, route_outcomes={route_outcomes:?}, trace_counts={trace_counts:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
+        "loss_probe: stimulated_receive={stimulated_receive}, held={held}, relay_active={active_at_probe}, neg_started={}, neg_completed={}, neg_active={}, neg_max_elapsed_ms={}, neg_max_items={}, relay_timeline={relay_timeline:?}, relay_timeline_dropped={relay_timeline_dropped}, wake_lag={wake_lag:?}, selected={selected:?}, route_outcomes={route_outcomes:?}, trace_counts={trace_counts:?}, phases={probe_phases:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, demand_covers_missing={loss_demand_covers_missing}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}",
         gate.neg_started.load(Ordering::SeqCst),
         gate.neg_completed.load(Ordering::SeqCst),
         gate.neg_active.load(Ordering::SeqCst),
@@ -915,6 +1045,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     );
     drop(bob_client);
     runtime.shutdown_and_close().await.unwrap();
+    wake_lag_probe.reap().await;
     relay.shutdown();
     healthy.shutdown();
     let selected_loss = selected.iter().any(|selection| {
