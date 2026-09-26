@@ -26,11 +26,42 @@ pub(crate) struct TestComparisonActivityWitness {
     #[cfg(feature = "test-policy-overrides")]
     pub(crate) route_outcomes: Arc<Mutex<Vec<TestComparisonRouteOutcome>>>,
     #[cfg(feature = "test-policy-overrides")]
+    pub(crate) target_decisions: Arc<Mutex<TestComparisonDecisionWindow>>,
+    #[cfg(feature = "test-policy-overrides")]
     pub(crate) diagnostic_origin: Arc<Mutex<Option<std::time::Instant>>>,
     pub(crate) returned_events: Arc<AtomicUsize>,
     pub(crate) matching_events: Arc<AtomicUsize>,
     pub(crate) matching_queued_deliveries: Arc<AtomicUsize>,
     pub(crate) panic_after_queue_submission: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+#[derive(Clone, Debug)]
+pub(crate) struct TestComparisonDecision {
+    pub(crate) attempt_serial: u64,
+    pub(crate) comparison_diagnostics: Option<transport_nostr_adapter::NostrComparisonDiagnostics>,
+    pub(crate) clean_suffix: Option<bool>,
+    pub(crate) candidate_count: Option<usize>,
+    pub(crate) full_queue_handoff: Option<bool>,
+    pub(crate) handed_off_candidates: Option<usize>,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TestComparisonDecisionWindow {
+    pub(crate) records: Vec<TestComparisonDecision>,
+    pub(crate) dropped: usize,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+impl TestComparisonDecisionWindow {
+    fn record(&mut self, record: TestComparisonDecision) {
+        if self.records.len() < 2 {
+            self.records.push(record);
+        } else {
+            self.dropped += 1;
+        }
+    }
 }
 
 #[cfg(all(test, feature = "test-policy-overrides"))]
@@ -102,6 +133,9 @@ struct FrozenRoute {
     initial_cursor: Option<[u8; 32]>,
 }
 
+// The feature-gated SDK decision fields slightly enlarge the owned summary;
+// boxing the route result would also change the production handoff.
+#[cfg_attr(feature = "test-policy-overrides", allow(clippy::large_enum_variant))]
 pub(crate) enum ComparisonRouteWorkResult {
     Skipped,
     TimedOut,
@@ -109,6 +143,8 @@ pub(crate) enum ComparisonRouteWorkResult {
 }
 
 pub(crate) struct ComparisonRouteResult {
+    #[cfg(all(test, feature = "test-policy-overrides"))]
+    attempt_serial: u64,
     route: TransportReconciliationRoute,
     initial_cursor: Option<[u8; 32]>,
     cursor: Option<[u8; 32]>,
@@ -328,6 +364,8 @@ impl ComparisonNetworkJob {
                             });
                     }
                     results.push(ComparisonRouteResult {
+                        #[cfg(all(test, feature = "test-policy-overrides"))]
+                        attempt_serial,
                         route: inventory.route,
                         initial_cursor,
                         cursor: initial_cursor,
@@ -435,6 +473,45 @@ impl ComparisonNetworkJob {
                         .unwrap()
                         .as_ref()
                         .is_some_and(|target| target == &inventory.route);
+                    if target_route {
+                        let (comparison_diagnostics, clean_suffix, candidate_count) =
+                            if let ComparisonRouteWorkResult::Returned(Ok(Some((
+                                summary,
+                                events,
+                            )))) = &result
+                            {
+                                let frozen = inventory
+                                    .items
+                                    .iter()
+                                    .map(|item| hex::encode(item.event_id))
+                                    .collect::<HashSet<_>>();
+                                (
+                                    Some(summary.comparison_diagnostics.clone()),
+                                    Some(summary.clean_bounded_suffix),
+                                    Some(
+                                        events
+                                            .iter()
+                                            .filter(|event| !frozen.contains(&event.event.id))
+                                            .take(16)
+                                            .count(),
+                                    ),
+                                )
+                            } else {
+                                (None, None, None)
+                            };
+                        witness
+                            .target_decisions
+                            .lock()
+                            .unwrap()
+                            .record(TestComparisonDecision {
+                                attempt_serial,
+                                comparison_diagnostics,
+                                clean_suffix,
+                                candidate_count,
+                                full_queue_handoff: None,
+                                handed_off_candidates: None,
+                            });
+                    }
                     witness
                         .route_outcomes
                         .lock()
@@ -454,6 +531,8 @@ impl ComparisonNetworkJob {
                         });
                 }
                 results.push(ComparisonRouteResult {
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    attempt_serial,
                     route: inventory.route,
                     initial_cursor,
                     cursor,
@@ -939,6 +1018,27 @@ async fn submit_reconciliation_route(
             }
         }
     };
+    #[cfg(all(test, feature = "test-policy-overrides"))]
+    if let Some(witness) = witness
+        && witness.target_route.lock().unwrap().as_ref() == Some(&route.route)
+    {
+        let mut window = witness.target_decisions.lock().unwrap();
+        if let Some(record) = window
+            .records
+            .iter_mut()
+            .find(|record| record.attempt_serial == route.attempt_serial)
+        {
+            record.full_queue_handoff = Some(fully_submitted);
+            record.handed_off_candidates = Some(if fully_submitted {
+                route
+                    .positive_suffix
+                    .as_ref()
+                    .map_or(0, |evidence| evidence.candidate_ids.len())
+            } else {
+                0
+            });
+        }
+    }
     RouteSubmission {
         route: route.route,
         initial_cursor: route.initial_cursor,
@@ -1038,6 +1138,8 @@ mod tests {
             ..Default::default()
         };
         let make_result = || ComparisonRouteResult {
+            #[cfg(feature = "test-policy-overrides")]
+            attempt_serial: 0,
             route: route.clone(),
             initial_cursor: None,
             cursor: Some([8; 32]),
@@ -1052,14 +1154,51 @@ mod tests {
                 vec![event.clone()],
             )))),
         };
+        #[cfg(feature = "test-policy-overrides")]
+        let witness = {
+            let witness = TestComparisonActivityWitness::default();
+            *witness.target_route.lock().unwrap() = Some(route.clone());
+            witness
+                .target_decisions
+                .lock()
+                .unwrap()
+                .record(TestComparisonDecision {
+                    attempt_serial: 0,
+                    comparison_diagnostics: None,
+                    clean_suffix: Some(true),
+                    candidate_count: Some(1),
+                    full_queue_handoff: None,
+                    handed_off_candidates: None,
+                });
+            witness
+        };
         let admitted = submit_reconciliation_route(
             &fixture.client.adapter,
             make_result(),
             tokio::time::Instant::now() + Duration::from_secs(5),
+            #[cfg(feature = "test-policy-overrides")]
+            Some(&witness),
+            #[cfg(not(feature = "test-policy-overrides"))]
             None,
         )
         .await;
         assert!(admitted.positive_suffix.is_some());
+        #[cfg(feature = "test-policy-overrides")]
+        {
+            let record = witness.target_decisions.lock().unwrap().records[0].clone();
+            assert_eq!(record.full_queue_handoff, Some(true));
+            assert_eq!(record.handed_off_candidates, Some(1));
+            *witness.target_decisions.lock().unwrap() = TestComparisonDecisionWindow::default();
+            witness
+                .target_decisions
+                .lock()
+                .unwrap()
+                .record(TestComparisonDecision {
+                    full_queue_handoff: None,
+                    handed_off_candidates: None,
+                    ..record
+                });
+        }
         let refused = TEST_COMPARISON_QUEUE_ACTIONS
             .scope(
                 RefCell::new([TestComparisonQueueAction::Fail].into()),
@@ -1067,12 +1206,56 @@ mod tests {
                     &fixture.client.adapter,
                     make_result(),
                     tokio::time::Instant::now() + Duration::from_secs(5),
+                    #[cfg(feature = "test-policy-overrides")]
+                    Some(&witness),
+                    #[cfg(not(feature = "test-policy-overrides"))]
                     None,
                 ),
             )
             .await;
         assert!(refused.positive_suffix.is_none());
         assert!(!refused.cursor_safe);
+        #[cfg(feature = "test-policy-overrides")]
+        {
+            let record = witness.target_decisions.lock().unwrap().records[0].clone();
+            assert_eq!(record.full_queue_handoff, Some(false));
+            assert_eq!(record.handed_off_candidates, Some(0));
+        }
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    #[test]
+    fn target_decision_window_caps_records_and_keeps_unknown_handoff() {
+        let mut window = TestComparisonDecisionWindow::default();
+        for serial in 1..=3 {
+            window.record(TestComparisonDecision {
+                attempt_serial: serial,
+                comparison_diagnostics: None,
+                clean_suffix: None,
+                candidate_count: None,
+                full_queue_handoff: None,
+                handed_off_candidates: None,
+            });
+        }
+        assert_eq!(
+            window
+                .records
+                .iter()
+                .map(|record| record.attempt_serial)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(window.dropped, 1);
+        assert!(
+            window
+                .records
+                .iter()
+                .all(|record| record.comparison_diagnostics.is_none()
+                    && record.clean_suffix.is_none()
+                    && record.candidate_count.is_none()
+                    && record.full_queue_handoff.is_none()
+                    && record.handed_off_candidates.is_none())
+        );
     }
 
     #[tokio::test]
@@ -1456,6 +1639,8 @@ mod tests {
     ) -> ComparisonNetworkResult {
         ComparisonNetworkResult {
             routes: vec![ComparisonRouteResult {
+                #[cfg(feature = "test-policy-overrides")]
+                attempt_serial: 0,
                 route,
                 initial_cursor: None,
                 cursor,
@@ -2075,40 +2260,60 @@ mod tests {
 
     #[tokio::test]
     async fn queue_loss_clean_suffix_requires_post_drain_retention_for_retry() {
-        for (retained, end, route_outcome, stale_fence) in [
+        for (retained, end, route_outcome, stale_fence, has_candidate) in [
             (
                 false,
                 DrainVerdict::Complete,
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 false,
+                true,
             ),
             (
                 true,
                 DrainVerdict::Complete,
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 false,
+                true,
             ),
             (
                 true,
                 DrainVerdict::NoProgressQuantumYield,
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 false,
+                true,
             ),
             (
                 true,
                 DrainVerdict::Complete,
                 storage_sqlite::RecoveryComparisonOutcome::Unsupported,
                 false,
+                true,
             ),
             (
                 true,
                 DrainVerdict::Complete,
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 true,
+                true,
+            ),
+            (
+                true,
+                DrainVerdict::Complete,
+                storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
+                false,
+                false,
             ),
         ] {
             let mut fixture = fixture_with_group_relays_and_comparison(None, false).await;
             arm_test_queue_loss(&mut fixture).await;
+            #[cfg(feature = "test-policy-overrides")]
+            let owner_witness = {
+                let witness = super::super::TestRecoveryPhaseWitness::default();
+                witness.arm_queue_loss();
+                witness.set_target_group_id(fixture.group_id.clone());
+                fixture.client.test_recovery_phase_witness = Some(witness.clone());
+                witness
+            };
             fixture
                 .client
                 .recovery_owner
@@ -2130,6 +2335,8 @@ mod tests {
                 .iter()
                 .find(|scope| scope.goal.route_kind == 1)
                 .unwrap();
+            #[cfg(feature = "test-policy-overrides")]
+            owner_witness.set_target_transport_route(scope.goal.transport_group_id.unwrap());
             let route = TransportReconciliationRoute::Group(scope.goal.transport_group_id.unwrap());
             let id = [0xa5; 32];
             if retained {
@@ -2159,7 +2366,7 @@ mod tests {
                         vec![(route.clone(), route_outcome)],
                         vec![PositiveSuffixEvidence {
                             route,
-                            candidate_ids: vec![id],
+                            candidate_ids: if has_candidate { vec![id] } else { Vec::new() },
                         }],
                     ),
                     SyncSummary::default(),
@@ -2167,6 +2374,70 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            #[cfg(feature = "test-policy-overrides")]
+            {
+                use super::super::TestQueueLossExclusion as Exclusion;
+                let (records, dropped) = owner_witness.queue_loss_decisions();
+                assert_eq!(dropped, 0);
+                assert_eq!(records.len(), 1);
+                let record = records[0];
+                assert_eq!(record.attempt_serial, grant.reservation.attempt_serial);
+                assert_eq!(record.verdict, end);
+                assert_eq!(
+                    record.fence_stable,
+                    if stale_fence {
+                        Some(false)
+                    } else if end == DrainVerdict::Complete
+                        && route_outcome != storage_sqlite::RecoveryComparisonOutcome::Unsupported
+                    {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(
+                    record.retained_any,
+                    if stale_fence
+                        || end != DrainVerdict::Complete
+                        || route_outcome == storage_sqlite::RecoveryComparisonOutcome::Unsupported
+                        || !has_candidate
+                    {
+                        None
+                    } else {
+                        Some(retained)
+                    }
+                );
+                assert_eq!(
+                    record.first_exclusion,
+                    if stale_fence {
+                        Some(Exclusion::FenceChanged)
+                    } else if end != DrainVerdict::Complete {
+                        Some(Exclusion::DrainVerdict)
+                    } else if route_outcome
+                        == storage_sqlite::RecoveryComparisonOutcome::Unsupported
+                    {
+                        Some(Exclusion::ComparisonRoute)
+                    } else if retained && has_candidate {
+                        None
+                    } else {
+                        Some(Exclusion::NoRetainedCandidate)
+                    }
+                );
+                assert_eq!(
+                    record.proposed,
+                    if !stale_fence
+                        && retained
+                        && has_candidate
+                        && end == DrainVerdict::Complete
+                        && route_outcome != storage_sqlite::RecoveryComparisonOutcome::Unsupported
+                    {
+                        storage_sqlite::RecoveryEligibility::Retry
+                    } else {
+                        storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+                    }
+                );
+                assert!(record.checkpoint_result.is_some());
+            }
             let demand = fixture
                 .storage
                 .pending_recovery_demands()
@@ -2179,6 +2450,7 @@ mod tests {
                 if stale_fence {
                     storage_sqlite::RecoveryEligibility::Ready
                 } else if retained
+                    && has_candidate
                     && end == DrainVerdict::Complete
                     && route_outcome != storage_sqlite::RecoveryComparisonOutcome::Unsupported
                 {

@@ -81,7 +81,41 @@ struct TestRecoveryPhaseState {
     terminal: Option<TestRecoveryTerminal>,
     target_terminals: Vec<TestRecoveryTerminal>,
     target_group_id: Option<GroupId>,
+    #[cfg(feature = "test-policy-overrides")]
+    target_transport_route: Option<[u8; 32]>,
     reconciliation_deadline: Option<tokio::time::Instant>,
+    #[cfg(feature = "test-policy-overrides")]
+    queue_loss_decisions: Vec<TestQueueLossOwnerDecision>,
+    #[cfg(feature = "test-policy-overrides")]
+    queue_loss_decisions_dropped: usize,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestQueueLossExclusion {
+    NotStandalone,
+    InvestigationOpen,
+    Outcome,
+    Refused,
+    DrainVerdict,
+    BaseEligibility,
+    ComparisonRoute,
+    FenceChanged,
+    NoRetainedCandidate,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestQueueLossOwnerDecision {
+    pub(crate) attempt_serial: u64,
+    pub(crate) verdict: DrainVerdict,
+    pub(crate) first_exclusion: Option<TestQueueLossExclusion>,
+    pub(crate) fence_stable: Option<bool>,
+    pub(crate) retained_any: Option<bool>,
+    pub(crate) proposed: storage_sqlite::RecoveryEligibility,
+    /// Raw result: Ok(true) qualified; Ok(false) may be stale or a written
+    /// incomplete checkpoint. Persistence is unknown without another read.
+    pub(crate) checkpoint_result: Option<Result<bool, ()>>,
 }
 
 /// Default-disabled witness for selected EpochGap work or an opted-in QueueLoss
@@ -139,8 +173,50 @@ impl TestRecoveryPhaseWitness {
         self.state.lock().unwrap().target_terminals.clone()
     }
 
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) fn queue_loss_decisions(&self) -> (Vec<TestQueueLossOwnerDecision>, usize) {
+        let state = self.state.lock().unwrap();
+        (
+            state.queue_loss_decisions.clone(),
+            state.queue_loss_decisions_dropped,
+        )
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    fn record_queue_loss_decision(&self, decision: TestQueueLossOwnerDecision) {
+        if !self.armed.load(Ordering::SeqCst) || !self.queue_loss.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.queue_loss_decisions.len() < 2 {
+            state.queue_loss_decisions.push(decision);
+        } else {
+            state.queue_loss_decisions_dropped += 1;
+        }
+    }
+
     pub(crate) fn set_target_group_id(&self, id: GroupId) {
         self.state.lock().unwrap().target_group_id = Some(id);
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) fn set_target_transport_route(&self, id: [u8; 32]) {
+        self.state.lock().unwrap().target_transport_route = Some(id);
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    fn is_target_queue_loss_obligation(
+        &self,
+        obligation: &super::recovery::GrantedObligation,
+    ) -> bool {
+        let state = self.state.lock().unwrap();
+        (obligation.group_id.is_some()
+            && obligation.group_id.as_ref() == state.target_group_id.as_ref())
+            || state.target_transport_route.is_some_and(|target| {
+                obligation.scopes.iter().any(|scope| {
+                    scope.goal.route_kind == 1 && scope.goal.transport_group_id == Some(target)
+                })
+            })
     }
 
     pub(crate) fn is_target_group(&self, id: &GroupId) -> bool {
@@ -5123,33 +5199,85 @@ impl AppClient {
                             counts.refused_groups.contains(group)
                         }),
                 );
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                let target_queue_loss = obligation.cause
+                    == storage_sqlite::RecoveryCause::QueueLoss
+                    && self
+                        .test_recovery_phase_witness
+                        .as_ref()
+                        .is_some_and(|witness| witness.is_target_queue_loss_obligation(obligation));
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                let mut first_exclusion = None;
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                let mut fence_stable = None;
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                let mut retained_any = None;
                 // A standalone queue-loss investigation may continue only
                 // when a clean, finite comparison suffix yielded a genuinely
                 // retained event in this selected scope after the drain.
                 // The ordinary outcome and endpoint coverage remain Unknown.
-                if obligation.cause == storage_sqlite::RecoveryCause::QueueLoss
-                    && grant.comparison_revision.is_none()
-                    && investigation_ended
-                    && matches!(
-                        outcome,
-                        storage_sqlite::RecoveryScopeOutcome::Unknown
-                            | storage_sqlite::RecoveryScopeOutcome::BudgetExhausted
-                    )
-                    && counts.refused == 0
-                    && matches!(
-                        verdict,
-                        DrainVerdict::Complete | DrainVerdict::NovelProgressQuantumYield
-                    )
-                    && eligibility == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
-                    && !comparison_outcomes.iter().any(|(route, observed)| {
+                let queue_loss_gate = if obligation.cause
+                    != storage_sqlite::RecoveryCause::QueueLoss
+                    || grant.comparison_revision.is_some()
+                {
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    {
+                        first_exclusion = Some(TestQueueLossExclusion::NotStandalone);
+                    }
+                    false
+                } else if !investigation_ended {
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    {
+                        first_exclusion = Some(TestQueueLossExclusion::InvestigationOpen);
+                    }
+                    false
+                } else if !matches!(
+                    outcome,
+                    storage_sqlite::RecoveryScopeOutcome::Unknown
+                        | storage_sqlite::RecoveryScopeOutcome::BudgetExhausted
+                ) {
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    {
+                        first_exclusion = Some(TestQueueLossExclusion::Outcome);
+                    }
+                    false
+                } else if counts.refused != 0 {
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    {
+                        first_exclusion = Some(TestQueueLossExclusion::Refused);
+                    }
+                    false
+                } else if !matches!(
+                    verdict,
+                    DrainVerdict::Complete | DrainVerdict::NovelProgressQuantumYield
+                ) {
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    {
+                        first_exclusion = Some(TestQueueLossExclusion::DrainVerdict);
+                    }
+                    false
+                } else if eligibility != storage_sqlite::RecoveryEligibility::NeedsDeepRepair {
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    {
+                        first_exclusion = Some(TestQueueLossExclusion::BaseEligibility);
+                    }
+                    false
+                } else {
+                    let blocked = comparison_outcomes.iter().any(|(route, observed)| {
                         *observed == storage_sqlite::RecoveryComparisonOutcome::Unsupported
                             || (*observed
                                 == storage_sqlite::RecoveryComparisonOutcome::TransientFailure
                                 && !positive_suffix
                                     .iter()
                                     .any(|evidence| evidence.route == *route))
-                    })
-                {
+                    });
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    if blocked {
+                        first_exclusion = Some(TestQueueLossExclusion::ComparisonRoute);
+                    }
+                    !blocked
+                };
+                if queue_loss_gate {
                     let current = storage.recovery_revision_fence()?;
                     let stable = current.loss_revision == grant.fence.loss_revision
                         && current.route_revision == grant.fence.route_revision
@@ -5159,6 +5287,10 @@ impl AppClient {
                             .obligations
                             .iter()
                             .all(|selected| current.obligations.contains(selected));
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    {
+                        fence_stable = Some(stable);
+                    }
                     if stable {
                         'evidence: for evidence in &positive_suffix {
                             for scope in &obligation.scopes {
@@ -5174,17 +5306,32 @@ impl AppClient {
                                     continue;
                                 }
                                 for id in &evidence.candidate_ids {
-                                    if storage.retained_recovery_event(
+                                    let retained = storage.retained_recovery_event(
                                         &evidence.route,
                                         id,
                                         scope.goal.since_seconds,
                                         scope.goal.until_seconds,
-                                    )? {
+                                    )?;
+                                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                                    {
+                                        retained_any =
+                                            Some(retained_any.unwrap_or(false) || retained);
+                                    }
+                                    if retained {
                                         eligibility = storage_sqlite::RecoveryEligibility::Retry;
                                         break 'evidence;
                                     }
                                 }
                             }
+                        }
+                        #[cfg(all(test, feature = "test-policy-overrides"))]
+                        if retained_any != Some(true) {
+                            first_exclusion = Some(TestQueueLossExclusion::NoRetainedCandidate);
+                        }
+                    } else {
+                        #[cfg(all(test, feature = "test-policy-overrides"))]
+                        {
+                            first_exclusion = Some(TestQueueLossExclusion::FenceChanged);
                         }
                     }
                 }
@@ -5251,13 +5398,31 @@ impl AppClient {
                         )
                     })
                     .collect::<cgka_traits::storage::StorageResult<Vec<_>>>()?;
-                storage.checkpoint_recovery_obligation(
+                let checkpoint_result = storage.checkpoint_recovery_obligation(
                     &grant.fence,
                     grant.reservation.attempt_serial,
                     obligation.id,
                     &checkpoints,
                     eligibility,
-                )?;
+                );
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                if target_queue_loss && let Some(witness) = &self.test_recovery_phase_witness {
+                    witness.record_queue_loss_decision(TestQueueLossOwnerDecision {
+                        attempt_serial: grant.reservation.attempt_serial,
+                        verdict,
+                        first_exclusion,
+                        fence_stable,
+                        retained_any,
+                        proposed: eligibility,
+                        checkpoint_result: Some(
+                            checkpoint_result
+                                .as_ref()
+                                .map(|qualified| *qualified)
+                                .map_err(|_| ()),
+                        ),
+                    });
+                }
+                checkpoint_result?;
             }
             Ok(())
         })();
@@ -6847,6 +7012,44 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
+
+    #[cfg(feature = "test-policy-overrides")]
+    #[test]
+    fn queue_loss_owner_witness_caps_attempts_and_preserves_unreached_guards() {
+        use super::{TestQueueLossExclusion, TestQueueLossOwnerDecision, TestRecoveryPhaseWitness};
+        let witness = TestRecoveryPhaseWitness::default();
+        witness.arm_queue_loss();
+        for serial in 1..=3 {
+            witness.record_queue_loss_decision(TestQueueLossOwnerDecision {
+                attempt_serial: serial,
+                verdict: DrainVerdict::EoseTimeout,
+                first_exclusion: Some(TestQueueLossExclusion::InvestigationOpen),
+                fence_stable: None,
+                retained_any: None,
+                proposed: storage_sqlite::RecoveryEligibility::NeedsDeepRepair,
+                checkpoint_result: Some(Ok(false)),
+            });
+        }
+        let (records, dropped) = witness.queue_loss_decisions();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.attempt_serial)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(dropped, 1);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.verdict == DrainVerdict::EoseTimeout
+                    && record.first_exclusion == Some(TestQueueLossExclusion::InvestigationOpen)
+                    && record.fence_stable.is_none()
+                    && record.retained_any.is_none()
+                    && record.proposed == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+                    && record.checkpoint_result == Some(Ok(false)))
+        );
+    }
 
     /// Contract fixture: provide exhaustive, durably admitted endpoint proof.
     /// Scripted SDK EOSE is deliberately insufficient to produce this proof.

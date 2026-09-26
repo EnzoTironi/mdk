@@ -136,6 +136,24 @@ fn exact_id_request_clean(
         && outcome.events.iter().all(|event| event.id == wanted_id)
 }
 
+#[cfg(feature = "test-policy-overrides")]
+fn exact_id_nonclean_reason(
+    end: NostrAcquisitionEnd,
+    claimed: bool,
+    has_wanted: bool,
+    has_wrong: bool,
+) -> Option<NostrComparisonNonclean> {
+    if end != NostrAcquisitionEnd::RequestPolicySatisfied {
+        Some(NostrComparisonNonclean::ExactEnd(end))
+    } else if claimed && !has_wanted {
+        Some(NostrComparisonNonclean::ClaimedIdAbsent)
+    } else if has_wrong {
+        Some(NostrComparisonNonclean::WrongId)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrReconciliationItem {
     pub event_id: [u8; 32],
@@ -162,6 +180,10 @@ pub struct NostrReconciliationSummary {
 #[cfg(feature = "test-policy-overrides")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NostrComparisonDiagnostics {
+    /// Last loop exit; a clean cap can follow an earlier non-clean request.
+    pub final_stop: Option<NostrComparisonStop>,
+    pub first_nonclean: Option<NostrComparisonNonclean>,
+    pub clean_requests: Option<bool>,
     pub relay_missing: usize,
     pub relay_lookup_error: usize,
     pub neg_error: usize,
@@ -189,6 +211,34 @@ pub struct NostrComparisonDiagnostics {
 }
 
 #[cfg(feature = "test-policy-overrides")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NostrComparisonStop {
+    Exhausted,
+    SelectionCap,
+    DeadlineBeforeItem,
+    CachedBudget,
+    LargeCachedObject,
+    RequestCap,
+    DeadlineBeforeRequest,
+    RequestBudget,
+    ExactByteLimit,
+    SpentBytes,
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NostrComparisonNonclean {
+    RelayMissing,
+    RelayLookupError,
+    NegTimeout,
+    NegOther,
+    ExactEnd(NostrAcquisitionEnd),
+    ClaimedIdAbsent,
+    WrongId,
+    IntrinsicOversize,
+}
+
+#[cfg(feature = "test-policy-overrides")]
 enum ComparisonDiagnostic {
     RelayMissing,
     RelayLookupError,
@@ -203,7 +253,16 @@ fn diagnostic_elapsed_ms(started: std::time::Instant) -> u64 {
 
 #[cfg(feature = "test-policy-overrides")]
 impl NostrComparisonDiagnostics {
-    fn record(&mut self, diagnostic: ComparisonDiagnostic, relay_lookup_ms: u64, neg_sync_ms: u64) {
+    fn note_nonclean(&mut self, reason: NostrComparisonNonclean) {
+        self.first_nonclean.get_or_insert(reason);
+    }
+
+    fn record(
+        &mut self,
+        diagnostic: &ComparisonDiagnostic,
+        relay_lookup_ms: u64,
+        neg_sync_ms: u64,
+    ) {
         self.relay_lookup_max_ms = self.relay_lookup_max_ms.max(relay_lookup_ms);
         self.neg_sync_max_ms = self.neg_sync_max_ms.max(neg_sync_ms);
         match diagnostic {
@@ -870,7 +929,23 @@ impl NostrSdkRelayClient {
             #[cfg(feature = "test-policy-overrides")]
             let (endpoint, result, diagnostic, relay_lookup_ms, neg_sync_ms) = outcome;
             #[cfg(feature = "test-policy-overrides")]
-            comparison_diagnostics.record(diagnostic, relay_lookup_ms, neg_sync_ms);
+            comparison_diagnostics.record(&diagnostic, relay_lookup_ms, neg_sync_ms);
+            #[cfg(feature = "test-policy-overrides")]
+            if comparison_diagnostics.first_nonclean.is_none() {
+                comparison_diagnostics.first_nonclean = match diagnostic {
+                    ComparisonDiagnostic::RelayMissing => {
+                        Some(NostrComparisonNonclean::RelayMissing)
+                    }
+                    ComparisonDiagnostic::RelayLookupError => {
+                        Some(NostrComparisonNonclean::RelayLookupError)
+                    }
+                    ComparisonDiagnostic::NegError(ErrorKind::Timeout) => {
+                        Some(NostrComparisonNonclean::NegTimeout)
+                    }
+                    ComparisonDiagnostic::NegError(_) => Some(NostrComparisonNonclean::NegOther),
+                    ComparisonDiagnostic::NegOk => None,
+                };
+            }
             #[cfg(not(feature = "test-policy-overrides"))]
             let (endpoint, result) = outcome;
             match result {
@@ -903,9 +978,19 @@ impl NostrSdkRelayClient {
         let mut returned_ids = HashSet::new();
         let mut requests = 0usize;
         let mut incomplete = remote_item_count > remote_ids.len();
+        #[cfg(feature = "test-policy-overrides")]
+        let mut final_stop = if incomplete {
+            NostrComparisonStop::SelectionCap
+        } else {
+            NostrComparisonStop::Exhausted
+        };
         for (index, event_id) in remote_ids.into_iter().enumerate() {
             if tokio::time::Instant::now() >= deadline {
                 incomplete = true;
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    final_stop = NostrComparisonStop::DeadlineBeforeItem;
+                }
                 break;
             }
             if let Some(event) = self
@@ -932,11 +1017,20 @@ impl NostrSdkRelayClient {
                     incomplete = true;
                     if event_bytes > SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES {
                         clean_requests = false;
+                        #[cfg(feature = "test-policy-overrides")]
+                        {
+                            comparison_diagnostics
+                                .note_nonclean(NostrComparisonNonclean::IntrinsicOversize);
+                        }
                         // This object can never fit the pass allowance. Rotate
                         // past it so smaller missing IDs remain reachable;
                         // durable inventory still keeps it eligible on wrap.
                         progress.save_cursor(Some(event_id.to_bytes()))?;
                         continue;
+                    }
+                    #[cfg(feature = "test-policy-overrides")]
+                    {
+                        final_stop = NostrComparisonStop::CachedBudget;
                     }
                     // A fitting object deferred by earlier results must be
                     // the first candidate on the next pass.
@@ -957,12 +1051,20 @@ impl NostrSdkRelayClient {
                 if event_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
                     // One large cached object is the entire returned batch.
                     incomplete |= index + 1 < selected_item_count;
+                    #[cfg(feature = "test-policy-overrides")]
+                    {
+                        final_stop = NostrComparisonStop::LargeCachedObject;
+                    }
                     break;
                 }
                 continue;
             }
             if requests >= SDK_RECONCILIATION_MAX_ID_REQUESTS {
                 incomplete = true;
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    final_stop = NostrComparisonStop::RequestCap;
+                }
                 break;
             }
             let remaining_items =
@@ -979,6 +1081,14 @@ impl NostrSdkRelayClient {
             let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining_items == 0 || remaining_bytes == 0 || remaining_time.is_zero() {
                 incomplete = true;
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    final_stop = if remaining_time.is_zero() {
+                        NostrComparisonStop::DeadlineBeforeRequest
+                    } else {
+                        NostrComparisonStop::RequestBudget
+                    };
+                }
                 break;
             }
             // Do not advance past an ID merely because this pass ran out of
@@ -1031,6 +1141,17 @@ impl NostrSdkRelayClient {
                 if !exact_id_request_clean(&outcome, &wanted_id, claimed_by_endpoint) {
                     failed_endpoints.insert(endpoint.clone());
                     clean_requests = false;
+                    #[cfg(feature = "test-policy-overrides")]
+                    {
+                        let reason = exact_id_nonclean_reason(
+                            outcome.end,
+                            claimed_by_endpoint,
+                            outcome.events.iter().any(|event| event.id == wanted_id),
+                            outcome.events.iter().any(|event| event.id != wanted_id),
+                        )
+                        .expect("non-clean exact request has a diagnostic reason");
+                        comparison_diagnostics.note_nonclean(reason);
+                    }
                 }
                 for event in outcome.events {
                     if event.id != wanted_id {
@@ -1061,6 +1182,10 @@ impl NostrSdkRelayClient {
                 // An object beyond the single-event ceiling still rotates.
                 progress.save_cursor(prior_cursor)?;
                 incomplete |= index + 1 < selected_item_count;
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    final_stop = NostrComparisonStop::ExactByteLimit;
+                }
                 break;
             }
             if spent_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
@@ -1068,6 +1193,10 @@ impl NostrSdkRelayClient {
                 // traffic, consumes this pass. Failed endpoints remain marked
                 // while the unattempted suffix stays retryable.
                 incomplete |= index + 1 < selected_item_count;
+                #[cfg(feature = "test-policy-overrides")]
+                {
+                    final_stop = NostrComparisonStop::SpentBytes;
+                }
                 break;
             }
         }
@@ -1099,6 +1228,8 @@ impl NostrSdkRelayClient {
             clean_bounded_suffix: incomplete && clean_requests,
             #[cfg(feature = "test-policy-overrides")]
             comparison_diagnostics: NostrComparisonDiagnostics {
+                final_stop: Some(final_stop),
+                clean_requests: Some(clean_requests),
                 account_lookup_ms,
                 preflight_ms,
                 comparison_join_ms,
@@ -3468,6 +3599,70 @@ mod tests {
         assert!(!summary.clean_bounded_suffix);
         assert_eq!(summary.comparison_diagnostics.relay_missing, 1);
         assert_eq!(summary.comparison_diagnostics.neg_error, 0);
+        assert_eq!(
+            summary.comparison_diagnostics.first_nonclean,
+            Some(NostrComparisonNonclean::RelayMissing)
+        );
+        assert_eq!(summary.comparison_diagnostics.clean_requests, Some(false));
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    #[test]
+    fn diagnostic_keeps_first_nonclean_when_later_loop_stop_is_clean() {
+        let mut diagnostics = NostrComparisonDiagnostics::default();
+        diagnostics.note_nonclean(NostrComparisonNonclean::ExactEnd(
+            NostrAcquisitionEnd::Deadline,
+        ));
+        diagnostics.note_nonclean(NostrComparisonNonclean::ClaimedIdAbsent);
+        diagnostics.final_stop = Some(NostrComparisonStop::RequestCap);
+        assert_eq!(
+            diagnostics.first_nonclean,
+            Some(NostrComparisonNonclean::ExactEnd(
+                NostrAcquisitionEnd::Deadline
+            ))
+        );
+        assert_eq!(
+            diagnostics.final_stop,
+            Some(NostrComparisonStop::RequestCap)
+        );
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    #[test]
+    fn diagnostic_maps_exact_request_failures_without_ids() {
+        assert_eq!(
+            exact_id_nonclean_reason(NostrAcquisitionEnd::Deadline, true, false, false),
+            Some(NostrComparisonNonclean::ExactEnd(
+                NostrAcquisitionEnd::Deadline
+            ))
+        );
+        assert_eq!(
+            exact_id_nonclean_reason(
+                NostrAcquisitionEnd::RequestPolicySatisfied,
+                true,
+                false,
+                false
+            ),
+            Some(NostrComparisonNonclean::ClaimedIdAbsent)
+        );
+        assert_eq!(
+            exact_id_nonclean_reason(
+                NostrAcquisitionEnd::RequestPolicySatisfied,
+                false,
+                true,
+                true
+            ),
+            Some(NostrComparisonNonclean::WrongId)
+        );
+        assert_eq!(
+            exact_id_nonclean_reason(
+                NostrAcquisitionEnd::RequestPolicySatisfied,
+                false,
+                false,
+                false
+            ),
+            None
+        );
     }
 
     /// A fresh explicit fetch and the SDK notification can legitimately carry
@@ -3652,6 +3847,15 @@ mod tests {
             .unwrap();
         assert_eq!(first.len(), SDK_RECONCILIATION_MAX_ID_REQUESTS);
         assert!(first_summary.clean_bounded_suffix);
+        #[cfg(feature = "test-policy-overrides")]
+        {
+            assert_eq!(
+                first_summary.comparison_diagnostics.clean_requests,
+                Some(true)
+            );
+            assert_eq!(first_summary.comparison_diagnostics.first_nonclean, None);
+            assert!(first_summary.comparison_diagnostics.final_stop.is_some());
+        }
         while let Some(notification) =
             tokio::time::timeout(Duration::from_millis(10), notifications.next())
                 .await

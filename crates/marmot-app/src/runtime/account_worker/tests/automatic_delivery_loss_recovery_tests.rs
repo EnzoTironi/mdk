@@ -663,6 +663,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     assert!(loss.observed_count > 0);
     selections.lock().unwrap().clear();
     activity.route_outcomes.lock().unwrap().clear();
+    *activity.target_decisions.lock().unwrap() = Default::default();
     gate.neg_started.store(0, Ordering::SeqCst);
     gate.neg_completed.store(0, Ordering::SeqCst);
     gate.neg_max_elapsed_ms.store(0, Ordering::SeqCst);
@@ -682,6 +683,8 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .unwrap()
         .clear();
     phases.arm_queue_loss();
+    phases.set_target_group_id(groups[0].clone());
+    phases.set_target_transport_route(route);
     *activity.network_deadline.lock().unwrap() = None;
 
     gate.hold.store(true, Ordering::SeqCst);
@@ -979,8 +982,10 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
             })
             .collect::<Vec<_>>();
         let health = app.relay_plane.relay_health().await;
+        let target_decisions = activity.target_decisions.lock().unwrap().clone();
+        let owner_decisions = phases.queue_loss_decisions();
         panic!(
-            "released replay incomplete: held={held}, relay_active={active_at_probe}, selections={selected:?}, probe_phases={probe_phases:?}, phase_now={:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}, retained={retained}, epoch={epoch:?}, expected_epoch={}, plaintext={plaintext:?}, dropped={}, queue_depth={}, marker={}, demands={:?}",
+            "released replay incomplete: held={held}, relay_active={active_at_probe}, selections={selected:?}, probe_phases={probe_phases:?}, phase_now={:?}, active_attempt={active_attempt_at_entry}, entry_remaining={deadline_remaining_at_entry:?}, release_remaining={deadline_remaining_at_release:?}, entry_jobs={active_jobs_at_entry}, entry_requests={active_requests_at_entry}, release_jobs={active_jobs_at_release}, release_requests={active_requests_at_release}, target_scope_includes_missing={selected_target_scope_includes_missing}, scopes={selected_scopes:?}, status_ok={status_ok}, send_ok={send_ok}, live_ok={live_ok}, retained={retained}, epoch={epoch:?}, expected_epoch={}, plaintext={plaintext:?}, dropped={}, queue_depth={}, marker={}, demands={:?}, target_decisions={target_decisions:?}, owner_decisions={owner_decisions:?}",
             phases.active(),
             pre_burst_epoch + 1,
             health.account_delivery_dropped,
