@@ -128,9 +128,36 @@ QueueLoss marker and demand satisfied the fixture. The full log is preserved
 at `/Volumes/Worktrees/codex/fdad/mdk-2060-linux-probe/logs/receive-live-boundaries-linux.log`.
 This pass is a nonreproduction of the preceding failure, not its cause or fix.
 Its target-route comparisons before the hold were clean request-cap prefixes;
-it does not integrate-qualify either new typed continuation. The 36 recorded
-x86_64 failed attempts across nine heads and the open CI blocker remain
-unresolved; this PR remains draft.
+it does not integrate-qualify either new typed continuation.
+
+The exact `62555076` CI still failed 40 x86_64 attempts across ten heads.
+Rust jobs 1 and 2 failed the Receive and Maintenance fixture variants;
+Rust jobs 3–5 passed. The
+Receive fixture saw hundreds of ordinary deliveries queued at 45 seconds, so
+its zero-queue stimulus could not run. The target route returned only a small
+prefix of a large remote-only set in the first attempts and timed out during
+NEG in later attempts. Bob published healthy-route traffic, but Alice did not
+observe its plaintext within two seconds. The target remained missing. Capped
+owner-decision witnesses do not establish why the terminal attempt parked.
+
+One test-only cost probe ran the unchanged Receive fixture once on offline
+Linux arm64. It passed in 68.08 seconds: the queue reached zero before the
+19,345 ms held target query, the healthy live message appeared, and the same
+grant returned and queued the target without a later grant. In the roughly
+19.4-second measured window, Alice's reconciliation-inventory calls totaled
+804,212 microseconds across 1,075 calls; scoped-admission checks totaled
+48,984 microseconds across 1,026 calls. The 286 direct Receive recovery
+follow-ups totaled 32,298 microseconds of elapsed time, including suspension.
+The direct Receive counters observed 335 dequeued deliveries, 49 duplicate
+skips, and 286 completed ingests; they exclude deliveries drained by online
+recovery. The runtime telemetry spans are shared across the runtime, nested,
+and rounded down to milliseconds per completion. Their sums cannot be added
+or subtracted to partition wall time, and completions may straddle the probe
+boundaries. The arm64 run did not reproduce the x86_64 backlog, so it does not
+identify the x86 cost. Inventory/projection transaction consolidation remains
+an unproven production hypothesis pending x86 measurement. The local log is
+preserved at `/Volumes/Worktrees/codex/fdad/mdk-2060-linux-probe/logs/receive-loss-cost-linux.log`.
+The open CI blocker remains unresolved; this PR remains draft.
 
 This is a focused local outcome, not proof for every account route shape,
 continuous traffic, relays without comparison support, process restart, or

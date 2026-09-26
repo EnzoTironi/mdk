@@ -352,6 +352,12 @@ pub(crate) struct RecoverySelectionWitnessTarget {
 }
 
 #[cfg(test)]
+pub(crate) struct QueueDrainCostProbeTarget {
+    pub(crate) account_label: String,
+    pub(crate) probe: Arc<crate::client::TestQueueDrainCostProbe>,
+}
+
+#[cfg(test)]
 pub(crate) struct WorkerLoopPause {
     pub(crate) account_label: String,
     pub(crate) entered: oneshot::Sender<()>,
@@ -375,6 +381,8 @@ pub struct RuntimeSharedServices {
     #[cfg(test)]
     pub(crate) comparison_activity_witness:
         Arc<StdMutex<Option<(String, crate::client::TestComparisonActivityWitness)>>>,
+    #[cfg(test)]
+    pub(crate) queue_drain_cost_probe: Arc<StdMutex<Option<QueueDrainCostProbeTarget>>>,
     #[cfg(test)]
     pub(crate) recovery_selection_witness: Arc<StdMutex<Option<RecoverySelectionWitnessTarget>>>,
     #[cfg(test)]
@@ -505,6 +513,8 @@ impl Default for RuntimeSharedServices {
             #[cfg(test)]
             comparison_activity_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
+            queue_drain_cost_probe: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             recovery_phase_witness: Arc::new(StdMutex::new(None)),
@@ -611,6 +621,8 @@ impl RuntimeSharedServices {
             comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
             #[cfg(test)]
             comparison_activity_witness: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            queue_drain_cost_probe: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]

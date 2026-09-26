@@ -40,6 +40,56 @@ use marmot_forensics::{
 use marmot_forensics::EpochBackfillCompletionKind;
 
 use super::AppClient;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestCostStage {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+#[cfg(test)]
+impl TestCostStage {
+    pub(crate) fn record(&self, elapsed: std::time::Duration) {
+        let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.count.load(Ordering::Relaxed),
+            self.total_us.load(Ordering::Relaxed),
+            self.max_us.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Fixture-armed, account-owned aggregate timings. The async follow-up elapsed
+/// includes suspension; the other two spans wrap synchronous calls only.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestQueueDrainCostProbe {
+    pub(crate) enabled: AtomicBool,
+    pub(crate) inventory: TestCostStage,
+    pub(crate) admission: TestCostStage,
+    pub(crate) followup_elapsed: TestCostStage,
+    pub(crate) dequeued: AtomicU64,
+    pub(crate) ingested: AtomicU64,
+    pub(crate) duplicates: AtomicU64,
+}
+
+#[cfg(test)]
+impl TestQueueDrainCostProbe {
+    pub(crate) fn active(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+}
 use super::audit::EpochBackfillTerminalAudit;
 use super::epoch_stall::BackfillDecision;
 use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
@@ -2337,8 +2387,24 @@ impl AppClient {
                     ));
                 }
             };
+            #[cfg(test)]
+            if let Some(probe) = self
+                .test_queue_drain_cost_probe
+                .as_ref()
+                .filter(|p| p.active())
+            {
+                probe.dequeued.fetch_add(1, Ordering::Relaxed);
+            }
             let event_id = hex::encode(delivery.message.id.as_slice());
             if self.transport_receipts()?.contains(&event_id) {
+                #[cfg(test)]
+                if let Some(probe) = self
+                    .test_queue_drain_cost_probe
+                    .as_ref()
+                    .filter(|p| p.active())
+                {
+                    probe.duplicates.fetch_add(1, Ordering::Relaxed);
+                }
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 continue;
             }
@@ -2477,6 +2543,14 @@ impl AppClient {
         }
         self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
         self.drain_epoch_stall_escalations(&mut summary);
+        #[cfg(test)]
+        if let Some(probe) = self
+            .test_queue_drain_cost_probe
+            .as_ref()
+            .filter(|p| p.active())
+        {
+            probe.ingested.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(summary)
     }
 
@@ -3192,6 +3266,13 @@ impl AppClient {
         route: &TransportReconciliationRoute,
         item: &TransportReconciliationItem,
     ) {
+        #[cfg(test)]
+        let cost_probe = self
+            .test_queue_drain_cost_probe
+            .as_ref()
+            .filter(|p| p.active());
+        #[cfg(test)]
+        let started = cost_probe.map(|_| std::time::Instant::now());
         let recorded = self
             .app
             .account_storage(&self.state.label)
@@ -3200,6 +3281,10 @@ impl AppClient {
                     .record_transport_reconciliation_item(route, item)
                     .map_err(AppError::from)
             });
+        #[cfg(test)]
+        if let (Some(probe), Some(started)) = (cost_probe, started) {
+            probe.inventory.record(started.elapsed());
+        }
         if recorded.is_err() {
             // The event remains absent from the advertised local set, so a
             // later reconciliation safely re-fetches it. Do not fail an
@@ -3431,6 +3516,13 @@ impl AppClient {
                     | IngestOutcome::TransportDeferred { .. }
                     | IngestOutcome::LocalState { .. }
             ) {
+                #[cfg(test)]
+                let cost_probe = client
+                    .test_queue_drain_cost_probe
+                    .as_ref()
+                    .filter(|p| p.active());
+                #[cfg(test)]
+                let started = cost_probe.map(|_| std::time::Instant::now());
                 let progress =
                     client
                         .app
@@ -3446,6 +3538,10 @@ impl AppClient {
                                 )
                                 .map_err(AppError::from)
                         });
+                #[cfg(test)]
+                if let (Some(probe), Some(started)) = (cost_probe, started) {
+                    probe.admission.record(started.elapsed());
+                }
                 if progress.is_err() {
                     // Retained input remains valid; a failed retry reset merely
                     // preserves conservative pacing and never authorizes early I/O.

@@ -867,6 +867,14 @@ async fn run_app_runtime_account_worker(
     client.runtime_telemetry = Some(shared.app_performance_telemetry());
     #[cfg(test)]
     {
+        client.test_queue_drain_cost_probe = shared
+            .queue_drain_cost_probe
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|target| {
+                (target.account_label == account_label).then(|| target.probe.clone())
+            });
         client.test_recovery_selection_witness = shared
             .recovery_selection_witness
             .lock()
@@ -2598,6 +2606,16 @@ async fn run_app_runtime_account_worker(
                         let retry_push_registration = !summary.joined_groups.is_empty();
                         if !overflow_recovery_incomplete {
                             if delivery_started.is_some() {
+                                #[cfg(test)]
+                                let cost_probe = client
+                                    .test_queue_drain_cost_probe
+                                    .as_ref()
+                                    .filter(|p| p.active())
+                                    .cloned();
+                                #[cfg(test)]
+                                let followup_started = cost_probe
+                                    .as_ref()
+                                    .map(|_| std::time::Instant::now());
                                 let backfill_armed = client.has_pending_epoch_backfill();
                                 let observation = backfill_armed.then(|| shared.product_analytics.begin(
                                     crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
@@ -2612,6 +2630,10 @@ async fn run_app_runtime_account_worker(
                                         &mut client, &shared, EpochBackfillExecutionSeam::Receive,
                                     ).await
                                 };
+                                #[cfg(test)]
+                                if let (Some(probe), Some(started)) = (cost_probe, followup_started) {
+                                    probe.followup_elapsed.record(started.elapsed());
+                                }
                                 match backfill_result {
                                     PendingComparisonExecution::Offloaded {
                                         grant, subscription_attempt, network,
@@ -2809,6 +2831,15 @@ async fn run_app_runtime_account_worker(
                                     reopened.runtime_telemetry = Some(shared.app_performance_telemetry());
                                     #[cfg(test)]
                                     {
+                                        reopened.test_queue_drain_cost_probe = shared
+                                            .queue_drain_cost_probe
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .and_then(|target| {
+                                                (target.account_label == account_label)
+                                                    .then(|| target.probe.clone())
+                                            });
                                         reopened.test_recovery_selection_witness = shared
                                             .recovery_selection_witness
                                             .lock()

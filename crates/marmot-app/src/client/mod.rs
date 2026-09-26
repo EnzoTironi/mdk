@@ -82,6 +82,8 @@ use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 #[cfg(test)]
 pub(crate) use sync::TestComparisonActivityWitness;
+#[cfg(test)]
+pub(crate) use sync::TestQueueDrainCostProbe;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use sync::TestRecoveryPhase;
 #[cfg(test)]
@@ -361,6 +363,8 @@ pub struct AppClient {
     pub(super) comparison_startup_requested: bool,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,
+    #[cfg(test)]
+    pub(crate) test_queue_drain_cost_probe: Option<Arc<TestQueueDrainCostProbe>>,
     pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,

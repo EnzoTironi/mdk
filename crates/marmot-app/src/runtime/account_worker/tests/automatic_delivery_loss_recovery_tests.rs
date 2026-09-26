@@ -397,6 +397,15 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     let app = MarmotApp::with_relay_and_config(dir.path(), target_url.clone(), config);
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &target_url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let cost_probe = Arc::new(crate::client::TestQueueDrainCostProbe::default());
+    *runtime
+        .shared_services()
+        .queue_drain_cost_probe
+        .lock()
+        .unwrap() = Some(crate::runtime::QueueDrainCostProbeTarget {
+        account_label: alice.label.clone(),
+        probe: cost_probe.clone(),
+    });
     runtime
         .shared_services()
         .use_private_recovery_credit_pool_for_test();
@@ -707,6 +716,12 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     let entered = gate.entered.notified();
     tokio::pin!(entered);
     entered.as_mut().enable();
+    let runtime_cost_before = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    let cost_window_started = std::time::Instant::now();
+    cost_probe.enabled.store(true, Ordering::SeqCst);
     pause_release_tx.send(true).unwrap();
     let mut stimulated_receive = false;
     let mut stimulus_checks = 0u64;
@@ -868,6 +883,47 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     let active_requests_at_release = activity.active_requests.load(Ordering::SeqCst);
     let wake_lag = wake_lag_probe.stop_and_snapshot();
     gate.release();
+    cost_probe.enabled.store(false, Ordering::SeqCst);
+    let cost_window_ms = cost_window_started
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let runtime_cost_after = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    let runtime_cost_delta = [
+        RuntimeOp::WorkerReceive,
+        RuntimeOp::Ingest,
+        RuntimeOp::IngestEngine,
+        RuntimeOp::IngestEffectPublish,
+        RuntimeOp::ProjectionCheckpoint,
+        RuntimeOp::StorageTransaction,
+        RuntimeOp::StorageConnectionWait,
+        RuntimeOp::StorageWriteBegin,
+    ]
+    .map(|operation| {
+        let before = runtime_cost_before
+            .runtime_operations
+            .iter()
+            .find(|sample| sample.operation == operation)
+            .unwrap();
+        let after = runtime_cost_after
+            .runtime_operations
+            .iter()
+            .find(|sample| sample.operation == operation)
+            .unwrap();
+        (
+            operation.as_str(),
+            after.completed.saturating_sub(before.completed),
+            after
+                .duration_ms
+                .sum_ms
+                .saturating_sub(before.duration_ms.sum_ms),
+            before.in_flight,
+            after.in_flight,
+        )
+    });
     let selected = selections.lock().unwrap().clone();
     let route_outcomes = activity
         .route_outcomes
@@ -964,6 +1020,16 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     );
     eprintln!(
         "loss_timing: target_gate_entry_ms={target_gate_entry_ms:?}, observer_entry_ms={observer_entry_ms:?}, stimulus_checks={stimulus_checks}, stimulus_first={stimulus_first:?}, stimulus_last={stimulus_last:?}, stimulus_zero_queue={stimulus_zero_queue}, stimulus_idle_jobs={stimulus_idle_jobs}, live_publish_started={live_publish_started:?}, live_publish_completed={live_publish_completed:?}, live_alice_observed={live_alice_observed:?}"
+    );
+    eprintln!(
+        "loss_cost: window_ms={}, alice_direct_receive_dequeued={}, alice_direct_receive_completed_ingest={}, alice_direct_receive_duplicate_skips={}, inventory_count_total_us_max_us={:?}, scoped_admission_count_total_us_max_us={:?}, direct_receive_followup_elapsed_including_suspension_count_total_us_max_us={:?}, runtime_wide_completed_sum_ms_inflight_before_after={runtime_cost_delta:?}; online recovery drain deliveries are absent from direct receive counts; nested/runtime-wide ms are separately rounded and cannot be added or subtracted into a wall-time partition; boundary-straddling operations may be absent from deltas",
+        cost_window_ms,
+        cost_probe.dequeued.load(Ordering::SeqCst),
+        cost_probe.ingested.load(Ordering::SeqCst),
+        cost_probe.duplicates.load(Ordering::SeqCst),
+        cost_probe.inventory.snapshot(),
+        cost_probe.admission.snapshot(),
+        cost_probe.followup_elapsed.snapshot(),
     );
     if status_timed_out {
         timeout(Duration::from_secs(30), status_rx)

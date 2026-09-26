@@ -1773,6 +1773,8 @@ impl MarmotApp {
             comparison_startup_requested: false,
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
+            #[cfg(test)]
+            test_queue_drain_cost_probe: None,
             send_telemetry: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
