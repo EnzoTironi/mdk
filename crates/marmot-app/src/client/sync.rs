@@ -915,22 +915,49 @@ impl DrainCounts {
     }
 }
 
-/// Exact candidate IDs from a clean, finite reconciliation suffix. These are
-/// only proposals until the account owner confirms post-drain retention.
-pub(super) struct PositiveSuffixEvidence {
-    route: TransportReconciliationRoute,
-    candidate_ids: Vec<[u8; 32]>,
+/// Exact remote-only candidates are proposals until the owner confirms
+/// post-drain retention. A deadline prefix carries no clean-suffix claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ContinuationEvidenceKind {
+    CleanSuffix,
+    DeadlineInterruptedPrefix,
 }
 
-fn positive_suffix_evidence(
+pub(super) struct PositiveContinuationEvidence {
+    route: TransportReconciliationRoute,
+    candidate_ids: Vec<[u8; 32]>,
+    kind: ContinuationEvidenceKind,
+}
+
+impl PositiveContinuationEvidence {
+    fn supported_by(
+        &self,
+        outcomes: &[(
+            TransportReconciliationRoute,
+            storage_sqlite::RecoveryComparisonOutcome,
+        )],
+    ) -> bool {
+        self.kind == ContinuationEvidenceKind::CleanSuffix
+            || outcomes.iter().any(|(route, outcome)| {
+                *route == self.route
+                    && *outcome == storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+            })
+    }
+}
+
+fn positive_continuation_evidence(
     route: &TransportReconciliationRoute,
     frozen_items: &[transport_nostr_adapter::NostrReconciliationItem],
     summary: &transport_nostr_adapter::NostrReconciliationSummary,
     events: &[transport_nostr_adapter::NostrRelayEvent],
-) -> Option<PositiveSuffixEvidence> {
-    if !summary.clean_bounded_suffix {
+) -> Option<PositiveContinuationEvidence> {
+    let kind = if summary.clean_bounded_suffix {
+        ContinuationEvidenceKind::CleanSuffix
+    } else if summary.deadline_interrupted_prefix {
+        ContinuationEvidenceKind::DeadlineInterruptedPrefix
+    } else {
         return None;
-    }
+    };
     let frozen = frozen_items
         .iter()
         .map(|item| item.event_id)
@@ -942,9 +969,10 @@ fn positive_suffix_evidence(
         .filter(|id| !frozen.contains(id))
         .take(16)
         .collect::<Vec<_>>();
-    (!candidate_ids.is_empty()).then(|| PositiveSuffixEvidence {
+    (!candidate_ids.is_empty()).then(|| PositiveContinuationEvidence {
         route: route.clone(),
         candidate_ids,
+        kind,
     })
 }
 
@@ -1459,7 +1487,8 @@ impl AppClient {
                 TransportReconciliationRoute,
                 storage_sqlite::RecoveryComparisonOutcome,
             )>,
-            Vec<PositiveSuffixEvidence>,
+            Vec<PositiveContinuationEvidence>,
+            Vec<TransportReconciliationRoute>,
         ),
         AppError,
     > {
@@ -1470,7 +1499,8 @@ impl AppClient {
             witness.record_reconciliation_deadline(deadline);
         }
         let mut outcomes = Vec::new();
-        let mut positive_suffix = Vec::new();
+        let mut continuation_evidence = Vec::new();
+        let mut unavailable_routes = Vec::new();
         let storage = self.app.account_storage(&self.state.label)?;
         let mut attempted_routes = 0usize;
         let mut routes_failed = 0usize;
@@ -1536,8 +1566,12 @@ impl AppClient {
                 let Some((summary, events)) = owned else {
                     return Ok::<_, cgka_traits::TransportAdapterError>(None);
                 };
-                let evidence =
-                    positive_suffix_evidence(&inventory.route, &inventory.items, &summary, &events);
+                let evidence = positive_continuation_evidence(
+                    &inventory.route,
+                    &inventory.items,
+                    &summary,
+                    &events,
+                );
                 // This is still an inline worker phase. Keep queue submission
                 // inside the original per-route deadline and error boundary:
                 // a full queue or closed adapter remains a transient route
@@ -1566,12 +1600,15 @@ impl AppClient {
             .await;
             let outcome = match result {
                 Ok(Ok(Some((summary, evidence)))) => {
+                    if summary.neg_timeout_unavailable {
+                        unavailable_routes.push(inventory.route.clone());
+                    }
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
                     remote_items += summary.remote_items;
                     received_items += summary.received_items;
                     if let Some(evidence) = evidence {
-                        positive_suffix.push(evidence);
+                        continuation_evidence.push(evidence);
                     }
                     if summary.relays_failed > 0 {
                         Outcome::TransientFailure
@@ -1606,7 +1643,7 @@ impl AppClient {
             received_items,
             "completed transport set reconciliation"
         );
-        Ok((outcomes, positive_suffix))
+        Ok((outcomes, continuation_evidence, unavailable_routes))
     }
 
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
@@ -4680,9 +4717,13 @@ impl AppClient {
         drop(recovery.phase.take());
         let result = match drain {
             Ok((summary, verdict)) => {
-                let positive_suffix = submissions
+                let continuation_evidence = submissions
                     .iter_mut()
-                    .filter_map(|route| route.positive_suffix.take())
+                    .filter_map(|route| route.continuation_evidence.take())
+                    .collect();
+                let unavailable_routes = submissions
+                    .iter_mut()
+                    .filter_map(|route| route.unavailable_route.take())
                     .collect();
                 let outcomes = self
                     .app
@@ -4706,7 +4747,7 @@ impl AppClient {
                             &recovery.grant,
                             &mut recovery.execution.counts,
                             &mut recovery.execution.drain_verdict,
-                            (outcomes, positive_suffix),
+                            (outcomes, continuation_evidence, unavailable_routes),
                             summary,
                             verdict,
                         )
@@ -4854,7 +4895,7 @@ impl AppClient {
                             | storage_sqlite::RecoveryCause::Maintenance
                     )
                 });
-        let (comparison_outcomes, positive_suffix) =
+        let (comparison_outcomes, continuation_evidence, unavailable_routes) =
             if grant.comparison_revision.is_some() || !quiet_prerequisites {
                 #[cfg(test)]
                 let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Reconciliation);
@@ -4868,7 +4909,7 @@ impl AppClient {
                         )
                     })?
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new())
             };
         #[cfg(test)]
         let _phase = self.recovery_phase_guard(grant, TestRecoveryPhase::Completion);
@@ -4877,8 +4918,11 @@ impl AppClient {
             repair,
             counts,
             drain_verdict,
-            comparison_outcomes,
-            positive_suffix,
+            (
+                comparison_outcomes,
+                continuation_evidence,
+                unavailable_routes,
+            ),
         )
         .await
     }
@@ -5024,11 +5068,14 @@ impl AppClient {
         repair: Option<&FullHistoryRepairControl<'_>>,
         counts: &mut DrainCounts,
         drain_verdict: &mut Option<DrainVerdict>,
-        comparison_outcomes: Vec<(
-            TransportReconciliationRoute,
-            storage_sqlite::RecoveryComparisonOutcome,
-        )>,
-        positive_suffix: Vec<PositiveSuffixEvidence>,
+        comparison: (
+            Vec<(
+                TransportReconciliationRoute,
+                storage_sqlite::RecoveryComparisonOutcome,
+            )>,
+            Vec<PositiveContinuationEvidence>,
+            Vec<TransportReconciliationRoute>,
+        ),
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let quiet_prerequisites =
             grant
@@ -5060,7 +5107,7 @@ impl AppClient {
             grant,
             counts,
             drain_verdict,
-            (comparison_outcomes, positive_suffix),
+            comparison,
             summary,
             verdict,
         )
@@ -5077,12 +5124,13 @@ impl AppClient {
                 TransportReconciliationRoute,
                 storage_sqlite::RecoveryComparisonOutcome,
             )>,
-            Vec<PositiveSuffixEvidence>,
+            Vec<PositiveContinuationEvidence>,
+            Vec<TransportReconciliationRoute>,
         ),
         mut summary: SyncSummary,
         verdict: DrainVerdict,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        let (comparison_outcomes, positive_suffix) = comparison;
+        let (comparison_outcomes, continuation_evidence, unavailable_routes) = comparison;
         *drain_verdict = Some(verdict);
         let local = self.drain_pending_session_events().await.map_err(|error| {
             ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::Unknown)
@@ -5212,10 +5260,11 @@ impl AppClient {
                 let mut fence_stable = None;
                 #[cfg(all(test, feature = "test-policy-overrides"))]
                 let mut retained_any = None;
+                let mut selected_unavailable_routes = Vec::new();
                 // A standalone queue-loss investigation may continue only
-                // when a clean, finite comparison suffix yielded a genuinely
-                // retained event in this selected scope after the drain.
-                // The ordinary outcome and endpoint coverage remain Unknown.
+                // after retained remote-only input, or when an attempted
+                // required route was unavailable due to a typed NEG timeout.
+                // Neither path changes endpoint coverage from Unknown.
                 let queue_loss_gate = if obligation.cause
                     != storage_sqlite::RecoveryCause::QueueLoss
                     || grant.comparison_revision.is_some()
@@ -5263,13 +5312,33 @@ impl AppClient {
                     }
                     false
                 } else {
+                    selected_unavailable_routes = unavailable_routes
+                        .iter()
+                        .filter(|route| {
+                            comparison_outcomes.iter().any(|(observed, outcome)| {
+                                observed == *route
+                                    && *outcome
+                                        == storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+                            }) && obligation.scopes.iter().any(|scope| {
+                                !scope.goal.admitted_endpoints.is_empty()
+                                    && match (scope.goal.route_kind, scope.goal.transport_group_id) {
+                                        (0, _) => *route == &TransportReconciliationRoute::Inbox,
+                                        (1, Some(id)) => *route == &TransportReconciliationRoute::Group(id),
+                                        _ => false,
+                                    }
+                            })
+                        })
+                        .cloned()
+                        .collect();
                     let blocked = comparison_outcomes.iter().any(|(route, observed)| {
                         *observed == storage_sqlite::RecoveryComparisonOutcome::Unsupported
                             || (*observed
                                 == storage_sqlite::RecoveryComparisonOutcome::TransientFailure
-                                && !positive_suffix
-                                    .iter()
-                                    .any(|evidence| evidence.route == *route))
+                                && !continuation_evidence.iter().any(|evidence| {
+                                    evidence.route == *route
+                                        && evidence.supported_by(&comparison_outcomes)
+                                })
+                                && !selected_unavailable_routes.contains(route))
                     });
                     #[cfg(all(test, feature = "test-policy-overrides"))]
                     if blocked {
@@ -5292,7 +5361,10 @@ impl AppClient {
                         fence_stable = Some(stable);
                     }
                     if stable {
-                        'evidence: for evidence in &positive_suffix {
+                        'evidence: for evidence in &continuation_evidence {
+                            if !evidence.supported_by(&comparison_outcomes) {
+                                continue;
+                            }
                             for scope in &obligation.scopes {
                                 let selected_route =
                                     match (scope.goal.route_kind, scope.goal.transport_group_id) {
@@ -5325,8 +5397,11 @@ impl AppClient {
                             }
                         }
                         #[cfg(all(test, feature = "test-policy-overrides"))]
-                        if retained_any != Some(true) {
+                        if retained_any != Some(true) && selected_unavailable_routes.is_empty() {
                             first_exclusion = Some(TestQueueLossExclusion::NoRetainedCandidate);
+                        }
+                        if !selected_unavailable_routes.is_empty() {
+                            eligibility = storage_sqlite::RecoveryEligibility::Retry;
                         }
                     } else {
                         #[cfg(all(test, feature = "test-policy-overrides"))]

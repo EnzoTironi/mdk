@@ -14,7 +14,6 @@ use cgka_traits::{
 };
 use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
-#[cfg(feature = "test-policy-overrides")]
 use nostr_sdk::error::ErrorKind;
 use nostr_sdk::prelude::{
     AcquisitionEnd as SdkAcquisitionEnd, AcquisitionLimits as SdkAcquisitionLimits, Client,
@@ -173,8 +172,82 @@ pub struct NostrReconciliationSummary {
     /// attempted comparisons and exact requests completed without failure.
     /// This is continuation evidence, never endpoint coverage or admission.
     pub clean_bounded_suffix: bool,
+    /// An otherwise valid remote-only prefix was interrupted by an exact-ID
+    /// request deadline after successful NEG comparison. This is a proposal
+    /// for post-drain retention checks, not request completion or coverage.
+    pub deadline_interrupted_prefix: bool,
+    /// At least one attempted NEG comparison timed out, every failed endpoint
+    /// timed out, and no remote difference or event was returned. The route
+    /// remains uninvestigated; this is not coverage or backend incapability.
+    pub neg_timeout_unavailable: bool,
     #[cfg(feature = "test-policy-overrides")]
     pub comparison_diagnostics: NostrComparisonDiagnostics,
+}
+
+struct DeadlinePrefixState {
+    eligible: bool,
+    saw_deadline: bool,
+}
+
+struct NegTimeoutState {
+    saw_timeout: bool,
+    only_timeouts: bool,
+}
+
+impl NegTimeoutState {
+    fn new() -> Self {
+        Self {
+            saw_timeout: false,
+            only_timeouts: true,
+        }
+    }
+
+    fn failed(&mut self, kind: Option<ErrorKind>) {
+        if kind == Some(ErrorKind::Timeout) {
+            self.saw_timeout = true;
+        } else {
+            self.only_timeouts = false;
+        }
+    }
+
+    fn qualifies(&self, remote_items: usize, received_items: usize) -> bool {
+        self.saw_timeout && self.only_timeouts && remote_items == 0 && received_items == 0
+    }
+}
+
+impl DeadlinePrefixState {
+    fn new() -> Self {
+        Self {
+            eligible: true,
+            saw_deadline: false,
+        }
+    }
+
+    fn observe_exact(
+        &mut self,
+        outcome: &NostrAcquisitionEndpoint,
+        wanted_id: &str,
+        claimed: bool,
+    ) {
+        if exact_id_request_clean(outcome, wanted_id, claimed) {
+            return;
+        }
+        if outcome.end == NostrAcquisitionEnd::Deadline
+            && outcome.events.iter().all(|event| event.id == wanted_id)
+        {
+            self.saw_deadline = true;
+        } else {
+            self.eligible = false;
+        }
+    }
+
+    fn reject(&mut self) {
+        self.eligible = false;
+    }
+
+    fn qualifies(&self) -> bool {
+        self.eligible && self.saw_deadline
+    }
 }
 
 #[cfg(feature = "test-policy-overrides")]
@@ -923,6 +996,8 @@ impl NostrSdkRelayClient {
         let mut remote_by_endpoint = HashMap::new();
         let mut failed_endpoints = HashSet::new();
         let mut clean_requests = true;
+        let mut deadline_prefix = DeadlinePrefixState::new();
+        let mut neg_timeout = NegTimeoutState::new();
         #[cfg(feature = "test-policy-overrides")]
         let mut comparison_diagnostics = NostrComparisonDiagnostics::default();
         for outcome in outcomes {
@@ -953,9 +1028,17 @@ impl NostrSdkRelayClient {
                     remote.extend(summary.remote.iter().copied());
                     remote_by_endpoint.insert(endpoint, summary.remote);
                 }
-                Some(Err(_)) | None => {
+                Some(Err(error)) => {
+                    neg_timeout.failed(Some(error.kind()));
                     failed_endpoints.insert(endpoint);
                     clean_requests = false;
+                    deadline_prefix.reject();
+                }
+                None => {
+                    neg_timeout.failed(None);
+                    failed_endpoints.insert(endpoint);
+                    clean_requests = false;
+                    deadline_prefix.reject();
                 }
             }
         }
@@ -1017,6 +1100,7 @@ impl NostrSdkRelayClient {
                     incomplete = true;
                     if event_bytes > SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES {
                         clean_requests = false;
+                        deadline_prefix.reject();
                         #[cfg(feature = "test-policy-overrides")]
                         {
                             comparison_diagnostics
@@ -1138,6 +1222,7 @@ impl NostrSdkRelayClient {
                 let claimed_by_endpoint = remote_by_endpoint
                     .get(endpoint)
                     .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id));
+                deadline_prefix.observe_exact(&outcome, &wanted_id, claimed_by_endpoint);
                 if !exact_id_request_clean(&outcome, &wanted_id, claimed_by_endpoint) {
                     failed_endpoints.insert(endpoint.clone());
                     clean_requests = false;
@@ -1156,6 +1241,7 @@ impl NostrSdkRelayClient {
                 for event in outcome.events {
                     if event.id != wanted_id {
                         failed_endpoints.insert(endpoint.clone());
+                        deadline_prefix.reject();
                         continue;
                     }
                     if returned_ids.contains(&event.id) {
@@ -1226,6 +1312,8 @@ impl NostrSdkRelayClient {
             remote_items: remote_item_count,
             received_items: remote_events.len(),
             clean_bounded_suffix: incomplete && clean_requests,
+            deadline_interrupted_prefix: deadline_prefix.qualifies() && !remote_events.is_empty(),
+            neg_timeout_unavailable: neg_timeout.qualifies(remote_item_count, remote_events.len()),
             #[cfg(feature = "test-policy-overrides")]
             comparison_diagnostics: NostrComparisonDiagnostics {
                 final_stop: Some(final_stop),
@@ -2975,6 +3063,27 @@ mod tests {
     use tokio::time::{Duration, advance, timeout};
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
 
+    #[test]
+    fn neg_timeout_unavailable_requires_only_typed_timeout_and_empty_results() {
+        let mut timeout = NegTimeoutState::new();
+        assert!(!timeout.qualifies(0, 0));
+        timeout.failed(Some(ErrorKind::Timeout));
+        assert!(timeout.qualifies(0, 0));
+        assert!(!timeout.qualifies(1, 0));
+        assert!(!timeout.qualifies(0, 1));
+        timeout.failed(Some(ErrorKind::Protocol));
+        assert!(!timeout.qualifies(0, 0));
+
+        let mut missing = NegTimeoutState::new();
+        missing.failed(Some(ErrorKind::Timeout));
+        missing.failed(None);
+        assert!(!missing.qualifies(0, 0));
+
+        let mut rejected = NegTimeoutState::new();
+        rejected.failed(Some(ErrorKind::Rejected));
+        assert!(!rejected.qualifies(0, 0));
+    }
+
     fn acquisition_request(
         account_id: MemberId,
         endpoint: RelayUrl,
@@ -3034,6 +3143,25 @@ mod tests {
         completed.events.truncate(1);
         assert!(exact_id_request_clean(&completed, &returned_id, true));
         assert!(!exact_id_request_clean(&completed, "wrong-id", true));
+        let mut prefix = DeadlinePrefixState::new();
+        prefix.observe_exact(&completed, &returned_id, true);
+        assert!(!prefix.qualifies());
+        let mut deadline = completed.clone();
+        deadline.end = NostrAcquisitionEnd::Deadline;
+        prefix.observe_exact(&deadline, &returned_id, true);
+        assert!(prefix.qualifies());
+        let mut wrong_id = deadline.clone();
+        wrong_id.events[0].id = "wrong-id".into();
+        prefix.observe_exact(&wrong_id, &returned_id, true);
+        assert!(!prefix.qualifies());
+        let mut neg_failed = DeadlinePrefixState::new();
+        neg_failed.reject();
+        neg_failed.observe_exact(&deadline, &returned_id, true);
+        assert!(!neg_failed.qualifies());
+        let mut item_limited = DeadlinePrefixState::new();
+        item_limited.observe_exact(partial, &returned_id, true);
+        item_limited.observe_exact(&deadline, &returned_id, true);
+        assert!(!item_limited.qualifies());
 
         let one_id = vec![events[0].id.to_bytes()];
         let report = sdk
@@ -3060,6 +3188,10 @@ mod tests {
             &events[0].id.to_hex(),
             true,
         ));
+        let mut invalid = DeadlinePrefixState::new();
+        invalid.observe_exact(&claimed_but_missing, &events[0].id.to_hex(), true);
+        invalid.observe_exact(&deadline, &returned_id, true);
+        assert!(!invalid.qualifies());
         relay.shutdown();
     }
 

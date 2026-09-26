@@ -41,6 +41,8 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
                             remote_items: 17,
                             received_items: 16,
                             clean_bounded_suffix: false,
+                            deadline_interrupted_prefix: false,
+                            neg_timeout_unavailable: false,
                             #[cfg(feature = "test-policy-overrides")]
                             comparison_diagnostics: Default::default(),
                         }

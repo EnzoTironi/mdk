@@ -1,7 +1,7 @@
 ---
 title: Automatic account QueueLoss recovery qualification
 created: 2026-09-26
-updated: 2026-09-26
+updated: 2026-09-27
 status: Focused local qualification
 ---
 
@@ -80,6 +80,57 @@ runs failed, and the previously observed GitHub x86_64 failures remain open;
 this local result does not classify or close them. Temporary CPU, scheduler,
 target-rank, and cursor probes used during diagnosis were removed from the
 review patch.
+
+The follow-up adds two narrowly typed reasons to continue an unfinished
+standalone QueueLoss investigation. After successful NEG comparison, a valid
+remote-only prefix interrupted solely by an exact-ID `Deadline` may propose
+up to 16 returned candidate IDs. It does not become a clean suffix: the owner
+requires full queue handoff, a selected scope, a stable fence, no refusal or
+unsupported route, and actual post-drain retention before paced `Retry`.
+Separately, a completed route with an actual NEG `Timeout`, only timed-out
+failed endpoints, and zero remote IDs and returned events may report that its
+selected, admitted, required route was unavailable. This permits paced
+`Retry` without a retained candidate only after the same owner guards; lookup
+failure, other NEG errors, and an outer route timeout do not qualify. The
+ordinary comparison remains a transient failure and stored endpoint coverage
+remains `Unknown`, nonexhaustive, and admission-incomplete. Existing durable
+backoff is 15/30/60/120/240/300 seconds, capped at 300 seconds without an
+attempt-count cutoff for transient unavailability. A later completed empty
+investigation without either typed reason parks at `NeedsDeepRepair`.
+
+Focused SDK classifier tests use constructed `ErrorKind` outcomes. The
+deadline-prefix test constructs a `Deadline` from an endpoint returned by a
+real acquisition; it is not an end-to-end timed acquisition proof. Inline and
+owned handoff and owner checkpoint tests pass, including refusal, unsupported,
+stale-fence, unrelated-route, pacing, and later-empty exclusions. The SDK's
+two-second route pass and the separate ten-second account job are cooperative
+deadlines, not guaranteed wall-time, CPU, or byte bounds.
+
+One composed offline Linux arm64 Receive run failed its strict fixture check
+after 68.30 seconds. Receive attempt 7 entered the held target query with an
+active job and request, but the request and reconciliation phase ended during
+the concurrent probes; healthy live observation missed its two-second bound.
+The intended new Receive stimulus was not sent. The target route returned 14
+events with an exact-request `Deadline`; a separate inbox route had a typed
+NEG timeout. Useful retention, epoch advance, and both dependent plaintexts
+occurred later, but one later grant prevents attribution to the held grant.
+The full log is preserved locally at
+`/Volumes/Worktrees/codex/fdad/mdk-2060-linux-probe/logs/receive-typed-continuation-linux.log`.
+
+A single diagnostic-only follow-up passed in 68.70 seconds. The natural
+Receive stimulus was sent, and attempt 8 held the target query from fixture
+time 19,860 ms. Bob's healthy live publish started at 19,861 ms and completed
+successfully at 19,907 ms; Alice's plaintext appeared at 19,949 ms. The same
+job and request remained active through the probes, no later grant was
+selected, and that grant returned and queued the target event. Durable target
+retention, MLS epoch advance, both dependent plaintexts, and the still-pending
+QueueLoss marker and demand satisfied the fixture. The full log is preserved
+at `/Volumes/Worktrees/codex/fdad/mdk-2060-linux-probe/logs/receive-live-boundaries-linux.log`.
+This pass is a nonreproduction of the preceding failure, not its cause or fix.
+Its target-route comparisons before the hold were clean request-cap prefixes;
+it does not integrate-qualify either new typed continuation. The 36 recorded
+x86_64 failed attempts across nine heads and the open CI blocker remain
+unresolved; this PR remains draft.
 
 This is a focused local outcome, not proof for every account route shape,
 continuous traffic, relays without comparison support, process restart, or

@@ -149,7 +149,7 @@ pub(crate) struct ComparisonRouteResult {
     initial_cursor: Option<[u8; 32]>,
     cursor: Option<[u8; 32]>,
     result: ComparisonRouteWorkResult,
-    positive_suffix: Option<PositiveSuffixEvidence>,
+    continuation_evidence: Option<PositiveContinuationEvidence>,
 }
 
 pub(crate) struct ComparisonNetworkResult {
@@ -162,7 +162,8 @@ pub(crate) struct RouteSubmission {
     cursor: Option<[u8; 32]>,
     cursor_safe: bool,
     outcome: storage_sqlite::RecoveryComparisonOutcome,
-    pub(super) positive_suffix: Option<PositiveSuffixEvidence>,
+    pub(super) continuation_evidence: Option<PositiveContinuationEvidence>,
+    pub(super) unavailable_route: Option<TransportReconciliationRoute>,
     #[cfg(test)]
     attempted: usize,
     #[cfg(test)]
@@ -370,7 +371,7 @@ impl ComparisonNetworkJob {
                         initial_cursor,
                         cursor: initial_cursor,
                         result: ComparisonRouteWorkResult::Skipped,
-                        positive_suffix: None,
+                        continuation_evidence: None,
                     });
                     continue;
                 }
@@ -429,9 +430,9 @@ impl ComparisonNetworkJob {
                     }
                 }
                 let cursor = *progress.cursor.lock().expect("comparison progress mutex");
-                let positive_suffix = match &result {
+                let continuation_evidence = match &result {
                     ComparisonRouteWorkResult::Returned(Ok(Some((summary, events)))) => {
-                        positive_suffix_evidence(
+                        positive_continuation_evidence(
                             &inventory.route,
                             &inventory.items,
                             summary,
@@ -537,7 +538,7 @@ impl ComparisonNetworkJob {
                     initial_cursor,
                     cursor,
                     result,
-                    positive_suffix,
+                    continuation_evidence,
                 });
             }
             (credit, ComparisonNetworkResult { routes: results })
@@ -870,8 +871,7 @@ impl AppClient {
                 None,
                 &mut counts,
                 &mut verdict,
-                outcomes,
-                Vec::new(),
+                (outcomes, Vec::new(), Vec::new()),
             )
             .await
             .map_err(|failure| {
@@ -940,6 +940,7 @@ async fn submit_reconciliation_route(
     #[cfg(test)]
     let mut delivered = 0usize;
     let mut fully_submitted = false;
+    let mut unavailable = false;
     let outcome = match route.result {
         ComparisonRouteWorkResult::Skipped => {
             storage_sqlite::RecoveryComparisonOutcome::ServicedPartial
@@ -1011,6 +1012,7 @@ async fn submit_reconciliation_route(
             if !submitted || summary.relays_failed > 0 {
                 cursor_safe = submitted;
                 fully_submitted = submitted;
+                unavailable = submitted && summary.neg_timeout_unavailable;
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure
             } else {
                 fully_submitted = true;
@@ -1031,7 +1033,7 @@ async fn submit_reconciliation_route(
             record.full_queue_handoff = Some(fully_submitted);
             record.handed_off_candidates = Some(if fully_submitted {
                 route
-                    .positive_suffix
+                    .continuation_evidence
                     .as_ref()
                     .map_or(0, |evidence| evidence.candidate_ids.len())
             } else {
@@ -1039,13 +1041,17 @@ async fn submit_reconciliation_route(
             });
         }
     }
+    let unavailable_route = unavailable.then(|| route.route.clone());
     RouteSubmission {
         route: route.route,
         initial_cursor: route.initial_cursor,
         cursor: route.cursor,
         cursor_safe,
         outcome,
-        positive_suffix: fully_submitted.then_some(route.positive_suffix).flatten(),
+        continuation_evidence: fully_submitted
+            .then_some(route.continuation_evidence)
+            .flatten(),
+        unavailable_route,
         #[cfg(test)]
         attempted,
         #[cfg(test)]
@@ -1100,11 +1106,24 @@ mod tests {
             clean_bounded_suffix: true,
             ..Default::default()
         };
-        let evidence = positive_suffix_evidence(&route, &frozen, &summary, &events).unwrap();
+        let evidence = positive_continuation_evidence(&route, &frozen, &summary, &events).unwrap();
+        assert_eq!(evidence.kind, ContinuationEvidenceKind::CleanSuffix);
         assert_eq!(evidence.candidate_ids.len(), 16);
         assert!(!evidence.candidate_ids.contains(&frozen_id));
+        let interrupted = transport_nostr_adapter::NostrReconciliationSummary {
+            clean_bounded_suffix: false,
+            deadline_interrupted_prefix: true,
+            ..summary.clone()
+        };
+        let evidence =
+            positive_continuation_evidence(&route, &frozen, &interrupted, &events).unwrap();
+        assert_eq!(
+            evidence.kind,
+            ContinuationEvidenceKind::DeadlineInterruptedPrefix
+        );
+        assert_eq!(evidence.candidate_ids.len(), 16);
         assert!(
-            positive_suffix_evidence(
+            positive_continuation_evidence(
                 &route,
                 &frozen,
                 &transport_nostr_adapter::NostrReconciliationSummary {
@@ -1118,7 +1137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_suffix_evidence_requires_full_queue_handoff() {
+    async fn owned_continuation_evidence_requires_full_queue_handoff() {
         let fixture = fixture().await;
         let group = fixture
             .client
@@ -1132,95 +1151,167 @@ mod tests {
             .unwrap();
         let route = TransportReconciliationRoute::Group(route_id);
         let event = candidate_for_route(route_id);
-        let summary = transport_nostr_adapter::NostrReconciliationSummary {
-            relays_failed: 1,
-            clean_bounded_suffix: true,
-            ..Default::default()
-        };
-        let make_result = || ComparisonRouteResult {
+        for kind in [
+            ContinuationEvidenceKind::CleanSuffix,
+            ContinuationEvidenceKind::DeadlineInterruptedPrefix,
+        ] {
+            let summary = transport_nostr_adapter::NostrReconciliationSummary {
+                relays_failed: 1,
+                clean_bounded_suffix: kind == ContinuationEvidenceKind::CleanSuffix,
+                deadline_interrupted_prefix: kind
+                    == ContinuationEvidenceKind::DeadlineInterruptedPrefix,
+                ..Default::default()
+            };
+            let make_result = || ComparisonRouteResult {
+                #[cfg(feature = "test-policy-overrides")]
+                attempt_serial: 0,
+                route: route.clone(),
+                initial_cursor: None,
+                cursor: Some([8; 32]),
+                continuation_evidence: positive_continuation_evidence(
+                    &route,
+                    &[],
+                    &summary,
+                    std::slice::from_ref(&event),
+                ),
+                result: ComparisonRouteWorkResult::Returned(Ok(Some((
+                    summary.clone(),
+                    vec![event.clone()],
+                )))),
+            };
+            #[cfg(feature = "test-policy-overrides")]
+            let witness = {
+                let witness = TestComparisonActivityWitness::default();
+                *witness.target_route.lock().unwrap() = Some(route.clone());
+                witness
+                    .target_decisions
+                    .lock()
+                    .unwrap()
+                    .record(TestComparisonDecision {
+                        attempt_serial: 0,
+                        comparison_diagnostics: None,
+                        clean_suffix: Some(kind == ContinuationEvidenceKind::CleanSuffix),
+                        candidate_count: Some(1),
+                        full_queue_handoff: None,
+                        handed_off_candidates: None,
+                    });
+                witness
+            };
+            let admitted = submit_reconciliation_route(
+                &fixture.client.adapter,
+                make_result(),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                #[cfg(feature = "test-policy-overrides")]
+                Some(&witness),
+                #[cfg(not(feature = "test-policy-overrides"))]
+                None,
+            )
+            .await;
+            assert_eq!(
+                admitted
+                    .continuation_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.kind),
+                Some(kind)
+            );
+            #[cfg(feature = "test-policy-overrides")]
+            {
+                let record = witness.target_decisions.lock().unwrap().records[0].clone();
+                assert_eq!(record.full_queue_handoff, Some(true));
+                assert_eq!(record.handed_off_candidates, Some(1));
+                *witness.target_decisions.lock().unwrap() = TestComparisonDecisionWindow::default();
+                witness
+                    .target_decisions
+                    .lock()
+                    .unwrap()
+                    .record(TestComparisonDecision {
+                        full_queue_handoff: None,
+                        handed_off_candidates: None,
+                        ..record
+                    });
+            }
+            let refused = TEST_COMPARISON_QUEUE_ACTIONS
+                .scope(
+                    RefCell::new([TestComparisonQueueAction::Fail].into()),
+                    submit_reconciliation_route(
+                        &fixture.client.adapter,
+                        make_result(),
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                        #[cfg(feature = "test-policy-overrides")]
+                        Some(&witness),
+                        #[cfg(not(feature = "test-policy-overrides"))]
+                        None,
+                    ),
+                )
+                .await;
+            assert!(refused.continuation_evidence.is_none());
+            assert!(!refused.cursor_safe);
+            #[cfg(feature = "test-policy-overrides")]
+            {
+                let record = witness.target_decisions.lock().unwrap().records[0].clone();
+                assert_eq!(record.full_queue_handoff, Some(false));
+                assert_eq!(record.handed_off_candidates, Some(0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_neg_timeout_is_distinct_from_outer_route_timeout() {
+        let fixture = fixture().await;
+        let route = TransportReconciliationRoute::Inbox;
+        let make_result = |result| ComparisonRouteResult {
             #[cfg(feature = "test-policy-overrides")]
             attempt_serial: 0,
             route: route.clone(),
             initial_cursor: None,
-            cursor: Some([8; 32]),
-            positive_suffix: positive_suffix_evidence(
-                &route,
-                &[],
-                &summary,
-                std::slice::from_ref(&event),
-            ),
-            result: ComparisonRouteWorkResult::Returned(Ok(Some((
-                summary.clone(),
-                vec![event.clone()],
-            )))),
+            cursor: None,
+            result,
+            continuation_evidence: None,
         };
-        #[cfg(feature = "test-policy-overrides")]
-        let witness = {
-            let witness = TestComparisonActivityWitness::default();
-            *witness.target_route.lock().unwrap() = Some(route.clone());
-            witness
-                .target_decisions
-                .lock()
-                .unwrap()
-                .record(TestComparisonDecision {
-                    attempt_serial: 0,
-                    comparison_diagnostics: None,
-                    clean_suffix: Some(true),
-                    candidate_count: Some(1),
-                    full_queue_handoff: None,
-                    handed_off_candidates: None,
-                });
-            witness
-        };
-        let admitted = submit_reconciliation_route(
+        let unavailable = submit_reconciliation_route(
             &fixture.client.adapter,
-            make_result(),
+            make_result(ComparisonRouteWorkResult::Returned(Ok(Some((
+                transport_nostr_adapter::NostrReconciliationSummary {
+                    relays_failed: 1,
+                    neg_timeout_unavailable: true,
+                    ..Default::default()
+                },
+                Vec::new(),
+            ))))),
             tokio::time::Instant::now() + Duration::from_secs(5),
-            #[cfg(feature = "test-policy-overrides")]
-            Some(&witness),
-            #[cfg(not(feature = "test-policy-overrides"))]
             None,
         )
         .await;
-        assert!(admitted.positive_suffix.is_some());
-        #[cfg(feature = "test-policy-overrides")]
-        {
-            let record = witness.target_decisions.lock().unwrap().records[0].clone();
-            assert_eq!(record.full_queue_handoff, Some(true));
-            assert_eq!(record.handed_off_candidates, Some(1));
-            *witness.target_decisions.lock().unwrap() = TestComparisonDecisionWindow::default();
-            witness
-                .target_decisions
-                .lock()
-                .unwrap()
-                .record(TestComparisonDecision {
-                    full_queue_handoff: None,
-                    handed_off_candidates: None,
-                    ..record
-                });
-        }
-        let refused = TEST_COMPARISON_QUEUE_ACTIONS
+        assert!(unavailable.outcome == storage_sqlite::RecoveryComparisonOutcome::TransientFailure);
+        assert_eq!(unavailable.unavailable_route, Some(route.clone()));
+        assert!(unavailable.continuation_evidence.is_none());
+        let failed_handoff = TEST_COMPARISON_QUEUE_ACTIONS
             .scope(
                 RefCell::new([TestComparisonQueueAction::Fail].into()),
                 submit_reconciliation_route(
                     &fixture.client.adapter,
-                    make_result(),
+                    make_result(ComparisonRouteWorkResult::Returned(Ok(Some((
+                        transport_nostr_adapter::NostrReconciliationSummary {
+                            relays_failed: 1,
+                            neg_timeout_unavailable: true,
+                            ..Default::default()
+                        },
+                        vec![candidate()],
+                    ))))),
                     tokio::time::Instant::now() + Duration::from_secs(5),
-                    #[cfg(feature = "test-policy-overrides")]
-                    Some(&witness),
-                    #[cfg(not(feature = "test-policy-overrides"))]
                     None,
                 ),
             )
             .await;
-        assert!(refused.positive_suffix.is_none());
-        assert!(!refused.cursor_safe);
-        #[cfg(feature = "test-policy-overrides")]
-        {
-            let record = witness.target_decisions.lock().unwrap().records[0].clone();
-            assert_eq!(record.full_queue_handoff, Some(false));
-            assert_eq!(record.handed_off_candidates, Some(0));
-        }
+        assert!(failed_handoff.unavailable_route.is_none());
+        let outer_timeout = submit_reconciliation_route(
+            &fixture.client.adapter,
+            make_result(ComparisonRouteWorkResult::TimedOut),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            None,
+        )
+        .await;
+        assert!(outer_timeout.unavailable_route.is_none());
     }
 
     #[cfg(feature = "test-policy-overrides")]
@@ -1259,8 +1350,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inline_suffix_evidence_requires_full_queue_handoff() {
-        for queue_failure in [false, true] {
+    async fn inline_continuation_evidence_requires_full_queue_handoff() {
+        for (queue_failure, kind) in [false, true].into_iter().flat_map(|failure| {
+            [
+                ContinuationEvidenceKind::CleanSuffix,
+                ContinuationEvidenceKind::DeadlineInterruptedPrefix,
+            ]
+            .into_iter()
+            .map(move |kind| (failure, kind))
+        }) {
             let mut fixture = fixture().await;
             let grant = fixture
                 .client
@@ -1281,7 +1379,10 @@ mod tests {
                         Ok(Some((
                             transport_nostr_adapter::NostrReconciliationSummary {
                                 relays_failed: usize::from(!events.is_empty()),
-                                clean_bounded_suffix: !events.is_empty(),
+                                clean_bounded_suffix: !events.is_empty()
+                                    && kind == ContinuationEvidenceKind::CleanSuffix,
+                                deadline_interrupted_prefix: !events.is_empty()
+                                    && kind == ContinuationEvidenceKind::DeadlineInterruptedPrefix,
                                 ..Default::default()
                             },
                             events,
@@ -1290,7 +1391,7 @@ mod tests {
                     .collect(),
             );
             let run = fixture.client.reconcile_transport_history(&grant.inventory);
-            let (outcomes, evidence) = if queue_failure {
+            let (outcomes, evidence, unavailable) = if queue_failure {
                 TEST_COMPARISON_QUEUE_ACTIONS
                     .scope(RefCell::new([TestComparisonQueueAction::Fail].into()), run)
                     .await
@@ -1301,6 +1402,73 @@ mod tests {
             assert!(outcomes.iter().any(|(_, outcome)| *outcome
                 == storage_sqlite::RecoveryComparisonOutcome::TransientFailure));
             assert_eq!(evidence.len(), usize::from(!queue_failure));
+            assert!(unavailable.is_empty());
+            if let Some(evidence) = evidence.first() {
+                assert_eq!(evidence.kind, kind);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_neg_timeout_propagates_only_a_completed_typed_result() {
+        for queue_failure in [false, true] {
+            let mut fixture = fixture().await;
+            let grant = fixture
+                .client
+                .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+                .unwrap()
+                .unwrap();
+            fixture.client.test_comparison_results = Some(
+                grant
+                    .inventory
+                    .iter()
+                    .map(|inventory| {
+                        // A real timeout marker has no events. The injected
+                        // inconsistent result also checks the handoff gate.
+                        let events = match (&inventory.route, queue_failure) {
+                            (TransportReconciliationRoute::Group(id), true) => {
+                                vec![candidate_for_route(*id)]
+                            }
+                            _ => Vec::new(),
+                        };
+                        Ok(Some((
+                            transport_nostr_adapter::NostrReconciliationSummary {
+                                relays_failed: usize::from(matches!(
+                                    inventory.route,
+                                    TransportReconciliationRoute::Group(_)
+                                )),
+                                neg_timeout_unavailable: matches!(
+                                    inventory.route,
+                                    TransportReconciliationRoute::Group(_)
+                                ),
+                                ..Default::default()
+                            },
+                            events,
+                        )))
+                    })
+                    .collect(),
+            );
+            let run = fixture.client.reconcile_transport_history(&grant.inventory);
+            let (outcomes, evidence, unavailable) = if queue_failure {
+                TEST_COMPARISON_QUEUE_ACTIONS
+                    .scope(RefCell::new([TestComparisonQueueAction::Fail].into()), run)
+                    .await
+                    .unwrap()
+            } else {
+                run.await.unwrap()
+            };
+            assert!(evidence.is_empty());
+            assert_eq!(unavailable.len(), usize::from(!queue_failure));
+            if !queue_failure {
+                assert!(matches!(
+                    unavailable[0],
+                    TransportReconciliationRoute::Group(_)
+                ));
+                assert!(outcomes.iter().any(|(route, outcome)| {
+                    route == &unavailable[0]
+                        && *outcome == storage_sqlite::RecoveryComparisonOutcome::TransientFailure
+                }));
+            }
         }
     }
 
@@ -1651,7 +1819,7 @@ mod tests {
                     },
                     Vec::new(),
                 )))),
-                positive_suffix: None,
+                continuation_evidence: None,
             }],
         }
     }
@@ -2161,8 +2329,7 @@ mod tests {
                 None,
                 &mut counts,
                 &mut verdict,
-                vec![(route_key, outcome)],
-                Vec::new(),
+                (vec![(route_key, outcome)], Vec::new(), Vec::new()),
             ),
         )
         .await
@@ -2260,13 +2427,14 @@ mod tests {
 
     #[tokio::test]
     async fn queue_loss_clean_suffix_requires_post_drain_retention_for_retry() {
-        for (retained, end, route_outcome, stale_fence, has_candidate) in [
+        for (retained, end, route_outcome, stale_fence, has_candidate, kind) in [
             (
                 false,
                 DrainVerdict::Complete,
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 false,
                 true,
+                ContinuationEvidenceKind::CleanSuffix,
             ),
             (
                 true,
@@ -2274,6 +2442,7 @@ mod tests {
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 false,
                 true,
+                ContinuationEvidenceKind::CleanSuffix,
             ),
             (
                 true,
@@ -2281,6 +2450,7 @@ mod tests {
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 false,
                 true,
+                ContinuationEvidenceKind::CleanSuffix,
             ),
             (
                 true,
@@ -2288,6 +2458,7 @@ mod tests {
                 storage_sqlite::RecoveryComparisonOutcome::Unsupported,
                 false,
                 true,
+                ContinuationEvidenceKind::CleanSuffix,
             ),
             (
                 true,
@@ -2295,6 +2466,7 @@ mod tests {
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 true,
                 true,
+                ContinuationEvidenceKind::CleanSuffix,
             ),
             (
                 true,
@@ -2302,6 +2474,39 @@ mod tests {
                 storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
                 false,
                 false,
+                ContinuationEvidenceKind::CleanSuffix,
+            ),
+            (
+                true,
+                DrainVerdict::Complete,
+                storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
+                false,
+                true,
+                ContinuationEvidenceKind::DeadlineInterruptedPrefix,
+            ),
+            (
+                false,
+                DrainVerdict::Complete,
+                storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
+                false,
+                true,
+                ContinuationEvidenceKind::DeadlineInterruptedPrefix,
+            ),
+            (
+                true,
+                DrainVerdict::Complete,
+                storage_sqlite::RecoveryComparisonOutcome::Unsupported,
+                false,
+                true,
+                ContinuationEvidenceKind::DeadlineInterruptedPrefix,
+            ),
+            (
+                true,
+                DrainVerdict::Complete,
+                storage_sqlite::RecoveryComparisonOutcome::TransientFailure,
+                true,
+                true,
+                ContinuationEvidenceKind::DeadlineInterruptedPrefix,
             ),
         ] {
             let mut fixture = fixture_with_group_relays_and_comparison(None, false).await;
@@ -2364,10 +2569,12 @@ mod tests {
                     &mut verdict,
                     (
                         vec![(route.clone(), route_outcome)],
-                        vec![PositiveSuffixEvidence {
+                        vec![PositiveContinuationEvidence {
                             route,
                             candidate_ids: if has_candidate { vec![id] } else { Vec::new() },
+                            kind,
                         }],
+                        Vec::new(),
                     ),
                     SyncSummary::default(),
                     end,
@@ -2470,6 +2677,215 @@ mod tests {
                         .is_none()
                 );
                 assert_eq!(fixture.storage.recovery_retry_state().unwrap(), before);
+            }
+        }
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    #[tokio::test]
+    async fn queue_loss_typed_neg_timeout_retries_only_selected_unavailable_route() {
+        use super::super::TestQueueLossExclusion as Exclusion;
+        use storage_sqlite::{
+            RecoveryComparisonOutcome as Comparison, RecoveryEligibility as Eligibility,
+        };
+
+        for (route_outcome, stale_fence, refused, unrelated, expected, exclusion) in [
+            (
+                Comparison::TransientFailure,
+                false,
+                false,
+                false,
+                Eligibility::Retry,
+                None,
+            ),
+            (
+                Comparison::TransientFailure,
+                true,
+                false,
+                false,
+                Eligibility::Ready,
+                Some(Exclusion::FenceChanged),
+            ),
+            (
+                Comparison::TransientFailure,
+                false,
+                true,
+                false,
+                Eligibility::WaitingCapacity,
+                Some(Exclusion::Refused),
+            ),
+            (
+                Comparison::Unsupported,
+                false,
+                false,
+                false,
+                Eligibility::NeedsDeepRepair,
+                Some(Exclusion::ComparisonRoute),
+            ),
+            (
+                Comparison::TransientFailure,
+                false,
+                false,
+                true,
+                Eligibility::NeedsDeepRepair,
+                Some(Exclusion::ComparisonRoute),
+            ),
+            (
+                Comparison::ServicedUnknown,
+                false,
+                false,
+                false,
+                Eligibility::NeedsDeepRepair,
+                Some(Exclusion::NoRetainedCandidate),
+            ),
+        ] {
+            let mut fixture = fixture_with_group_relays_and_comparison(None, false).await;
+            arm_test_queue_loss(&mut fixture).await;
+            let witness = super::super::TestRecoveryPhaseWitness::default();
+            witness.arm_queue_loss();
+            witness.set_target_group_id(fixture.group_id.clone());
+            fixture.client.test_recovery_phase_witness = Some(witness.clone());
+            fixture
+                .client
+                .recovery_owner
+                .test_advance_clock(Duration::from_secs(300));
+            let mut grant = fixture
+                .client
+                .authorize_account_recovery(None, EpochBackfillExecutionSeam::Receive)
+                .unwrap()
+                .unwrap();
+            let obligation = grant
+                .plan()
+                .unwrap()
+                .iter()
+                .find(|obligation| obligation.cause == storage_sqlite::RecoveryCause::QueueLoss)
+                .unwrap();
+            let scope = obligation
+                .scopes
+                .iter()
+                .find(|scope| scope.goal.route_kind == 1)
+                .unwrap();
+            let route = TransportReconciliationRoute::Group(scope.goal.transport_group_id.unwrap());
+            witness.set_target_transport_route(scope.goal.transport_group_id.unwrap());
+            let obligation_id = obligation.id;
+            let reserved_retry = fixture.storage.recovery_retry_state().unwrap();
+            if stale_fence {
+                grant.fence.inventory_revision += 1;
+            }
+            let mut counts = DrainCounts::default();
+            if refused {
+                counts.refused = 1;
+            }
+            let mut verdict = None;
+            fixture
+                .client
+                .finish_recovery_grant_after_drain(
+                    &grant,
+                    &mut counts,
+                    &mut verdict,
+                    (
+                        vec![(route.clone(), route_outcome)],
+                        Vec::new(),
+                        vec![if unrelated {
+                            TransportReconciliationRoute::Group([0xee; 32])
+                        } else {
+                            route.clone()
+                        }],
+                    ),
+                    SyncSummary::default(),
+                    DrainVerdict::Complete,
+                )
+                .await
+                .unwrap();
+            let (records, dropped) = witness.queue_loss_decisions();
+            assert_eq!(dropped, 0);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].first_exclusion, exclusion);
+            assert_eq!(
+                records[0].proposed,
+                if stale_fence {
+                    Eligibility::NeedsDeepRepair
+                } else {
+                    expected
+                }
+            );
+            let demand = fixture
+                .storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+                .unwrap();
+            assert_eq!(demand.eligibility, expected);
+            if expected == Eligibility::Retry {
+                assert_eq!(
+                    fixture.storage.recovery_retry_state().unwrap().ordinal,
+                    reserved_retry.ordinal,
+                    "a timeout must not reset the account-wide retry ordinal"
+                );
+                let scopes = fixture
+                    .storage
+                    .recovery_scope_snapshots(obligation_id)
+                    .unwrap();
+                let selected = scopes
+                    .iter()
+                    .find(|snapshot| snapshot.plan.route_kind == 1)
+                    .unwrap();
+                assert!(!selected.checkpoints.is_empty());
+                assert!(selected.checkpoints.iter().all(|checkpoint| {
+                    checkpoint.outcome == storage_sqlite::RecoveryScopeOutcome::Unknown
+                        && !checkpoint.exhaustive
+                        && !checkpoint.admission_complete
+                }));
+                let retry = fixture.storage.recovery_retry_state().unwrap();
+                drop(grant);
+                assert!(
+                    fixture
+                        .client
+                        .authorize_account_recovery(None, EpochBackfillExecutionSeam::Receive,)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(fixture.storage.recovery_retry_state().unwrap(), retry);
+                fixture
+                    .client
+                    .recovery_owner
+                    .test_advance_clock(Duration::from_secs(300));
+                let due = fixture
+                    .client
+                    .authorize_account_recovery(None, EpochBackfillExecutionSeam::Receive)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fixture.storage.recovery_retry_state().unwrap().ordinal,
+                    retry.ordinal + 1
+                );
+                let mut counts = DrainCounts::default();
+                let mut verdict = None;
+                fixture
+                    .client
+                    .finish_recovery_grant_after_drain(
+                        &due,
+                        &mut counts,
+                        &mut verdict,
+                        (
+                            vec![(route, Comparison::ServicedUnknown)],
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                        SyncSummary::default(),
+                        DrainVerdict::Complete,
+                    )
+                    .await
+                    .unwrap();
+                let demand = fixture
+                    .storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .into_iter()
+                    .find(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+                    .unwrap();
+                assert_eq!(demand.eligibility, Eligibility::NeedsDeepRepair);
             }
         }
     }

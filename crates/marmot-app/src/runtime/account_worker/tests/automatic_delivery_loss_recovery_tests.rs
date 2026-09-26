@@ -34,12 +34,20 @@ struct HeldLossReplay {
     diagnostic_origin: Arc<Mutex<Option<std::time::Instant>>>,
     diagnostic_timeline: Arc<Mutex<RelayTimeline>>,
     diagnostic_dropped: Arc<AtomicUsize>,
+    target_gate_entry_ms: Arc<Mutex<Option<u64>>>,
 }
 
 const RELAY_TIMELINE_LIMIT: usize = 64;
 const WAKE_LAG_RECORD_LIMIT: usize = 64;
 const WAKE_LAG_CADENCE: Duration = Duration::from_millis(50);
 const WAKE_LAG_RECORD_THRESHOLD: Duration = Duration::from_millis(200);
+
+fn fixture_elapsed_ms(origin: std::time::Instant) -> u64 {
+    std::time::Instant::now()
+        .saturating_duration_since(origin)
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // The diagnostic output reads these fields through derived Debug.
@@ -304,6 +312,13 @@ impl nostr_relay_builder::prelude::QueryPolicy for HeldLossReplay {
                     query.ids.as_ref().is_some_and(|ids| ids.contains(&target))
                 })
             {
+                let origin = *self.diagnostic_origin.lock().unwrap();
+                {
+                    let mut entry = self.target_gate_entry_ms.lock().unwrap();
+                    if entry.is_none() {
+                        *entry = origin.map(fixture_elapsed_ms);
+                    }
+                }
                 let released = self.release.notified();
                 tokio::pin!(released);
                 released.as_mut().enable();
@@ -670,6 +685,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     gate.neg_max_items.store(0, Ordering::SeqCst);
     gate.diagnostic_timeline.lock().unwrap().clear();
     gate.diagnostic_dropped.store(0, Ordering::SeqCst);
+    *gate.target_gate_entry_ms.lock().unwrap() = None;
     let diagnostic_origin = std::time::Instant::now();
     *gate.diagnostic_origin.lock().unwrap() = Some(diagnostic_origin);
     *activity.diagnostic_origin.lock().unwrap() = Some(diagnostic_origin);
@@ -693,6 +709,11 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     entered.as_mut().enable();
     pause_release_tx.send(true).unwrap();
     let mut stimulated_receive = false;
+    let mut stimulus_checks = 0u64;
+    let mut stimulus_first = None;
+    let mut stimulus_last = None;
+    let mut stimulus_zero_queue = 0u64;
+    let mut stimulus_idle_jobs = 0u64;
     let held = timeout(Duration::from_secs(45), async {
         loop {
             tokio::select! {
@@ -703,21 +724,27 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
                     // Once the ordinary queue has capacity and no network job
                     // is active, enqueue a real event; the worker chooses its
                     // Receive seam when that delivery is actually claimed.
-                    if stimulate_receive
-                        && !stimulated_receive
-                        && app.relay_plane.relay_health().await.account_delivery_queue_depth == 0
-                        && activity.active_jobs.load(Ordering::SeqCst) == 0
-                    {
-                        bob_client
-                            .send_custom_event(
-                                &groups[1],
-                                22_227,
-                                Vec::new(),
-                                "ordinary Receive wake after loss".into(),
-                            )
-                            .await
-                            .unwrap();
-                        stimulated_receive = true;
+                    if stimulate_receive && !stimulated_receive {
+                        let queue_depth = app.relay_plane.relay_health().await.account_delivery_queue_depth;
+                        let active_jobs = activity.active_jobs.load(Ordering::SeqCst);
+                        let check = (fixture_elapsed_ms(diagnostic_origin), queue_depth, active_jobs);
+                        stimulus_checks += 1;
+                        stimulus_first.get_or_insert(check);
+                        stimulus_last = Some(check);
+                        stimulus_zero_queue += u64::from(queue_depth == 0);
+                        stimulus_idle_jobs += u64::from(active_jobs == 0);
+                        if queue_depth == 0 && active_jobs == 0 {
+                            bob_client
+                                .send_custom_event(
+                                    &groups[1],
+                                    22_227,
+                                    Vec::new(),
+                                    "ordinary Receive wake after loss".into(),
+                                )
+                                .await
+                                .unwrap();
+                            stimulated_receive = true;
+                        }
                     }
                 }
             }
@@ -725,6 +752,8 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     })
     .await
     .unwrap_or(false);
+    let observer_entry_ms = held.then(|| fixture_elapsed_ms(diagnostic_origin));
+    let target_gate_entry_ms = *gate.target_gate_entry_ms.lock().unwrap();
     activity.matching_events.store(0, Ordering::SeqCst);
     activity
         .matching_queued_deliveries
@@ -767,31 +796,53 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         let probe = timeout(Duration::from_secs(2), &mut healthy_send).await;
         (probe, phases.active())
     };
+    let live_boundary = || {
+        (
+            fixture_elapsed_ms(diagnostic_origin),
+            phases.active(),
+            activity.active_jobs.load(Ordering::SeqCst),
+            activity.active_requests.load(Ordering::SeqCst),
+        )
+    };
     let live_work = async {
+        let publish_started = Some(live_boundary());
+        let mut publish_completed = None;
+        let mut alice_observed = None;
         let probe = timeout(Duration::from_secs(2), async {
-            bob_client
+            let send = bob_client
                 .send_custom_event(
                     &groups[1],
                     22_226,
                     Vec::new(),
                     "healthy live during loss".into(),
                 )
-                .await
-                .unwrap();
+                .await;
+            publish_completed = Some((live_boundary(), send.is_ok()));
+            send.unwrap();
             loop {
                 if app.messages(&alice.label).unwrap().iter().any(|message| {
                     message.kind == 22_226 && message.plaintext == "healthy live during loss"
                 }) {
+                    alice_observed = Some(live_boundary());
                     break;
                 }
                 sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
-        (probe.is_ok(), phases.active())
+        (
+            probe.is_ok(),
+            phases.active(),
+            publish_started,
+            publish_completed,
+            alice_observed,
+        )
     };
-    let ((status_probe, status_after), (send_probe, send_after), (live_ok, live_after)) =
-        tokio::join!(status_work, send_work, live_work);
+    let (
+        (status_probe, status_after),
+        (send_probe, send_after),
+        (live_ok, live_after, live_publish_started, live_publish_completed, live_alice_observed),
+    ) = tokio::join!(status_work, send_work, live_work);
     let status_ok = matches!(&status_probe, Ok(Ok(Ok(_))));
     let status_timed_out = status_probe.is_err();
     let send_ok = matches!(&send_probe, Ok(Ok(_)));
@@ -910,6 +961,9 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         gate.neg_active.load(Ordering::SeqCst),
         gate.neg_max_elapsed_ms.load(Ordering::SeqCst),
         gate.neg_max_items.load(Ordering::SeqCst),
+    );
+    eprintln!(
+        "loss_timing: target_gate_entry_ms={target_gate_entry_ms:?}, observer_entry_ms={observer_entry_ms:?}, stimulus_checks={stimulus_checks}, stimulus_first={stimulus_first:?}, stimulus_last={stimulus_last:?}, stimulus_zero_queue={stimulus_zero_queue}, stimulus_idle_jobs={stimulus_idle_jobs}, live_publish_started={live_publish_started:?}, live_publish_completed={live_publish_completed:?}, live_alice_observed={live_alice_observed:?}"
     );
     if status_timed_out {
         timeout(Duration::from_secs(30), status_rx)
