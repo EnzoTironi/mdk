@@ -147,14 +147,16 @@ impl TestQueueDrainCostProbe {
             app_projection_unfinished_us,
             app_projection_stage_unfinished_us,
             secure_prune_unfinished_us,
+            route_refresh_unfinished_us,
         ) = match timing.phase {
-            TestDirectReceivePhase::Idle => (None, None, None, [None; 6], None),
+            TestDirectReceivePhase::Idle => (None, None, None, [None; 6], None, None),
             TestDirectReceivePhase::Ingest {
                 since,
                 runtime_since,
                 app_projection_since,
                 app_projection_stage_since,
                 secure_prune_since,
+                route_refresh_since,
                 ..
             } => (
                 Some(("claim_to_ingest", elapsed_us(since, now))),
@@ -162,6 +164,7 @@ impl TestQueueDrainCostProbe {
                 app_projection_since.map(|started| elapsed_us(started, now)),
                 app_projection_stage_since.map(|started| started.map(|at| elapsed_us(at, now))),
                 secure_prune_since.map(|started| elapsed_us(started, now)),
+                route_refresh_since.map(|started| elapsed_us(started, now)),
             ),
             TestDirectReceivePhase::PostIngest { since, .. } => (
                 Some(("ingest_to_tail", elapsed_us(since, now))),
@@ -169,12 +172,14 @@ impl TestQueueDrainCostProbe {
                 None,
                 [None; 6],
                 None,
+                None,
             ),
             TestDirectReceivePhase::Between { since } => (
                 Some(("between_claims", elapsed_us(since, now))),
                 None,
                 None,
                 [None; 6],
+                None,
                 None,
             ),
         };
@@ -192,6 +197,8 @@ impl TestQueueDrainCostProbe {
             app_projection_closure_not_entered: timing.app_projection_closure_not_entered,
             secure_prune_call_inclusive: timing.secure_prune_call_inclusive.snapshot(),
             secure_prune_error_exits: timing.secure_prune_error_exits,
+            route_refresh_call_inclusive: timing.route_refresh_call_inclusive.snapshot(),
+            route_refresh_error_exits: timing.route_refresh_error_exits,
             handoff_excluded: timing.handoff_excluded,
             join_excluded: timing.join_excluded,
             discard_excluded: timing.discard_excluded,
@@ -202,6 +209,7 @@ impl TestQueueDrainCostProbe {
             app_projection_unfinished_us,
             app_projection_stage_unfinished_us,
             secure_prune_unfinished_us,
+            route_refresh_unfinished_us,
         };
         timing.phase = TestDirectReceivePhase::Idle;
         timing.frozen = Some(frozen);
@@ -233,6 +241,7 @@ impl TestQueueDrainCostProbe {
             app_projection_since: None,
             app_projection_stage_since: [None; 6],
             secure_prune_since: None,
+            route_refresh_since: None,
         };
         Some(id)
     }
@@ -253,6 +262,7 @@ impl TestQueueDrainCostProbe {
             app_projection_since,
             app_projection_stage_since,
             secure_prune_since,
+            route_refresh_since,
         } = timing.phase
             && current == id
         {
@@ -261,6 +271,7 @@ impl TestQueueDrainCostProbe {
                 && app_projection_since.is_none()
                 && app_projection_stage_since.iter().all(Option::is_none)
                 && secure_prune_since.is_none()
+                && route_refresh_since.is_none()
             {
                 timing.claim_to_ingest.record(since, now);
                 timing.phase = TestDirectReceivePhase::PostIngest { id, since: now };
@@ -520,6 +531,50 @@ impl TestQueueDrainCostProbe {
             timing.secure_prune_error_exits += u64::from(!success);
         }
     }
+
+    pub(crate) fn direct_route_refresh_started(&self) -> Option<u64> {
+        self.direct_route_refresh_started_at(Instant::now())
+    }
+
+    fn direct_route_refresh_started_at(&self, now: Instant) -> Option<u64> {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if !timing.enabled {
+            return None;
+        }
+        if let TestDirectReceivePhase::Ingest {
+            id,
+            route_refresh_since,
+            ..
+        } = &mut timing.phase
+            && route_refresh_since.is_none()
+        {
+            *route_refresh_since = Some(now);
+            return Some(*id);
+        }
+        None
+    }
+
+    pub(crate) fn direct_route_refresh_finished(&self, id: u64, success: bool) {
+        self.direct_route_refresh_finished_at(id, success, Instant::now());
+    }
+
+    fn direct_route_refresh_finished_at(&self, id: u64, success: bool, now: Instant) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if !timing.enabled {
+            return;
+        }
+        if let TestDirectReceivePhase::Ingest {
+            id: current,
+            route_refresh_since,
+            ..
+        } = &mut timing.phase
+            && *current == id
+            && let Some(since) = route_refresh_since.take()
+        {
+            timing.route_refresh_call_inclusive.record(since, now);
+            timing.route_refresh_error_exits += u64::from(!success);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -574,6 +629,7 @@ enum TestDirectReceivePhase {
         app_projection_since: Option<Instant>,
         app_projection_stage_since: [Option<Instant>; 6],
         secure_prune_since: Option<Instant>,
+        route_refresh_since: Option<Instant>,
     },
     PostIngest {
         id: u64,
@@ -601,6 +657,8 @@ struct TestDirectReceiveTiming {
     app_projection_closure_not_entered: u64,
     secure_prune_call_inclusive: TestDirectTimingStage,
     secure_prune_error_exits: u64,
+    route_refresh_call_inclusive: TestDirectTimingStage,
+    route_refresh_error_exits: u64,
     handoff_excluded: u64,
     join_excluded: u64,
     discard_excluded: u64,
@@ -623,6 +681,8 @@ pub(crate) struct TestDirectReceiveTimingSnapshot {
     pub(crate) app_projection_closure_not_entered: u64,
     pub(crate) secure_prune_call_inclusive: (u64, u64, u64),
     pub(crate) secure_prune_error_exits: u64,
+    pub(crate) route_refresh_call_inclusive: (u64, u64, u64),
+    pub(crate) route_refresh_error_exits: u64,
     pub(crate) handoff_excluded: u64,
     pub(crate) join_excluded: u64,
     pub(crate) discard_excluded: u64,
@@ -633,6 +693,7 @@ pub(crate) struct TestDirectReceiveTimingSnapshot {
     pub(crate) app_projection_unfinished_us: Option<u64>,
     pub(crate) app_projection_stage_unfinished_us: [Option<u64>; 6],
     pub(crate) secure_prune_unfinished_us: Option<u64>,
+    pub(crate) route_refresh_unfinished_us: Option<u64>,
 }
 use super::audit::EpochBackfillTerminalAudit;
 use super::epoch_stall::BackfillDecision;
@@ -3138,7 +3199,18 @@ impl AppClient {
                 SyncFailureStage::StatePersist,
             ));
         }
-        let refresh = match self.refresh_group_routes() {
+        #[cfg(test)]
+        let direct_probe = self.test_queue_drain_cost_probe.clone();
+        #[cfg(test)]
+        let direct_route_refresh_id = direct_probe
+            .as_ref()
+            .and_then(|probe| probe.direct_route_refresh_started());
+        let refresh_result = self.refresh_group_routes();
+        #[cfg(test)]
+        if let (Some(probe), Some(id)) = (direct_probe.as_ref(), direct_route_refresh_id) {
+            probe.direct_route_refresh_finished(id, refresh_result.is_ok());
+        }
+        let refresh = match refresh_result {
             Ok(refresh) => refresh,
             Err(error) => {
                 return Err((
@@ -7994,6 +8066,11 @@ mod tests {
                 .direct_secure_prune_started_at(Instant::now())
                 .is_none()
         );
+        assert!(
+            probe
+                .direct_route_refresh_started_at(Instant::now())
+                .is_none()
+        );
         assert!(target.for_account("bob").is_none());
         assert!(Arc::ptr_eq(&target.for_account("alice").unwrap(), &probe));
         assert_eq!(probe.stop_direct_receive_timing().claim_to_ingest.0, 0);
@@ -8020,6 +8097,11 @@ mod tests {
             Some(first)
         );
         probe.direct_secure_prune_finished_at(first, true, t + Duration::from_millis(4));
+        assert_eq!(
+            probe.direct_route_refresh_started_at(t + Duration::from_millis(4)),
+            Some(first)
+        );
+        probe.direct_route_refresh_finished_at(first, true, t + Duration::from_micros(4_500));
         probe.direct_receive_ingested_at(first, true, t + Duration::from_millis(5));
         probe.direct_receive_tail_finished_at(first, t + Duration::from_millis(7));
         let second = probe
@@ -8038,6 +8120,9 @@ mod tests {
         assert_eq!(frozen.secure_prune_call_inclusive, (1, 500, 500));
         assert_eq!(frozen.secure_prune_error_exits, 0);
         assert_eq!(frozen.secure_prune_unfinished_us, None);
+        assert_eq!(frozen.route_refresh_call_inclusive, (1, 500, 500));
+        assert_eq!(frozen.route_refresh_error_exits, 0);
+        assert_eq!(frozen.route_refresh_unfinished_us, None);
         assert_eq!(frozen.unfinished, Some(("between_claims", 3_000)));
         assert!(
             probe
@@ -8046,6 +8131,39 @@ mod tests {
         );
         assert_eq!(
             probe.stop_direct_receive_timing_at(t + Duration::from_millis(30)),
+            frozen
+        );
+    }
+
+    #[test]
+    fn direct_route_refresh_counts_error_and_freezes_mid_call() {
+        let probe = TestQueueDrainCostProbe::default();
+        let t = Instant::now();
+        probe.start_direct_receive_timing();
+        let failed = probe.direct_receive_claim_at(t).unwrap();
+        assert_eq!(
+            probe.direct_route_refresh_started_at(t + Duration::from_millis(1)),
+            Some(failed)
+        );
+        probe.direct_route_refresh_finished_at(failed, false, t + Duration::from_millis(3));
+        probe.direct_receive_ingested_at(failed, false, t + Duration::from_millis(4));
+        let interrupted = probe
+            .direct_receive_claim_at(t + Duration::from_millis(5))
+            .unwrap();
+        assert_eq!(
+            probe.direct_route_refresh_started_at(t + Duration::from_millis(6)),
+            Some(interrupted)
+        );
+        probe.direct_route_refresh_finished_at(failed, true, t + Duration::from_micros(6_500));
+        let frozen = probe.stop_direct_receive_timing_at(t + Duration::from_millis(7));
+        probe.direct_route_refresh_finished_at(interrupted, true, t + Duration::from_millis(8));
+        assert_eq!(frozen.route_refresh_call_inclusive, (1, 2_000, 2_000));
+        assert_eq!(frozen.route_refresh_error_exits, 1);
+        assert_eq!(frozen.route_refresh_unfinished_us, Some(1_000));
+        assert_eq!(frozen.claim_to_ingest, (0, 0, 0));
+        assert_eq!(frozen.unfinished, Some(("claim_to_ingest", 2_000)));
+        assert_eq!(
+            probe.stop_direct_receive_timing_at(t + Duration::from_millis(9)),
             frozen
         );
     }

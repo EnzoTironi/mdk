@@ -528,3 +528,33 @@ no measured contribution to the source/timeline envelope, and it does not
 account for chat-list work or the unassigned claim-to-ingest time. No x86_64
 strict fixture result exists for this change yet; speedup and strict recovery
 qualification remain unmeasured. The PR stays draft.
+
+Exact `57614779` CI then added four more failed x86_64 QueueLoss attempts,
+bringing the record to **86 across 22 heads**. Receive and
+Maintenance-required each failed the unchanged active-acquisition assertion
+on the first attempt and configured retry; Rust jobs 3–5 passed. All four
+deferred 468–743 selections and held no selected grant, active NEG, network
+job, or request during the probe. Status, send, and healthy live delivery
+passed. Both Receive wakes were accepted, dequeued, and ingested. One later
+grant returned and queued the target; durable retention, epoch advance, and
+both dependent plaintext messages followed with QueueLoss debt still pending.
+That later progress does not satisfy the same-held-grant assertion. Earlier
+startup and online epoch-gap failure causes remain unresolved despite their
+first-pass successes on this head. The modified storage path has no controlled
+speedup result.
+
+The next test-only Alice direct-cycle child times the existing
+`refresh_group_routes()` call after ingest and before the projection
+checkpoint. It adds no route read or state change. The call scans every
+projected group and can retire terminal or prior routes even when the current
+delivery did not set `routes_dirty`; the existing error and subscription
+behavior stay intact. The probe reports completed count, inclusive elapsed
+total and maximum, result errors, and an unfinished call at the frozen stop.
+A completed child can belong to an excluded or unfinished parent, so its
+aggregate is not an exclusive partition of claim-to-ingest time. At
+`57614779`, matching Receive parents spent 43.512 and 43.299 seconds, with
+runtime ingest 15.749 and 15.790 seconds, app projection 17.085 and 16.698
+seconds, and secure prune about 0.296 seconds per run; the remaining time
+contains several operations and does not yet identify route refresh cost.
+The new measurement has no x86_64 result yet. Strict recovery, same-held-grant
+progress, and platform qualification remain open; the PR stays draft.

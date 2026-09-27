@@ -1097,7 +1097,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         cost_probe.directory_write_attempts.snapshot(),
     );
     eprintln!(
-        "loss_direct_cycle: alice_claim_to_ingest_count_total_us_max_us={:?}, alice_ingest_to_tail_count_total_us_max_us={:?}, alice_between_claims_count_total_us_max_us={:?}, nested_alice_runtime_ingest_count_total_us_max_us={:?}, nested_alice_app_projection_call_inclusive_count_total_us_max_us={:?}, app_projection_error_exits={}, nested_alice_secure_prune_app_call_inclusive_count_total_us_max_us={:?}, secure_prune_error_exits={}, handoff_excluded={}, join_excluded={}, discard_excluded={}, error_excluded={}, reset_excluded={}, unfinished_at_stop={:?}, nested_runtime_unfinished_us={:?}, app_projection_unfinished_us={:?}, secure_prune_unfinished_us={:?}; parent stages are disjoint completed spans, runtime ingest, app projection, secure prune and the existing follow-up are nested; the frozen stop reports boundary-straddling work separately. App projection includes account storage setup, atomic raw/timeline/chat-list work and the returned update, not SQL-only or CPU time",
+        "loss_direct_cycle: alice_claim_to_ingest_count_total_us_max_us={:?}, alice_ingest_to_tail_count_total_us_max_us={:?}, alice_between_claims_count_total_us_max_us={:?}, nested_alice_runtime_ingest_count_total_us_max_us={:?}, nested_alice_app_projection_call_inclusive_count_total_us_max_us={:?}, app_projection_error_exits={}, nested_alice_secure_prune_app_call_inclusive_count_total_us_max_us={:?}, secure_prune_error_exits={}, nested_alice_route_refresh_call_inclusive_count_total_us_max_us={:?}, route_refresh_error_exits={}, handoff_excluded={}, join_excluded={}, discard_excluded={}, error_excluded={}, reset_excluded={}, unfinished_at_stop={:?}, nested_runtime_unfinished_us={:?}, app_projection_unfinished_us={:?}, secure_prune_unfinished_us={:?}, route_refresh_unfinished_us={:?}; parent stages are disjoint completed spans; child calls are inclusive elapsed, not SQL/CPU time, and a completed child may belong to an excluded or unfinished parent. The frozen stop reports boundary-straddling work separately. App projection includes account storage setup, atomic raw/timeline/chat-list work and the returned update",
         direct_timing.claim_to_ingest,
         direct_timing.ingest_to_tail,
         direct_timing.between_claims,
@@ -1106,6 +1106,8 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         direct_timing.app_projection_error_exits,
         direct_timing.secure_prune_call_inclusive,
         direct_timing.secure_prune_error_exits,
+        direct_timing.route_refresh_call_inclusive,
+        direct_timing.route_refresh_error_exits,
         direct_timing.handoff_excluded,
         direct_timing.join_excluded,
         direct_timing.discard_excluded,
@@ -1115,6 +1117,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         direct_timing.nested_runtime_unfinished_us,
         direct_timing.app_projection_unfinished_us,
         direct_timing.secure_prune_unfinished_us,
+        direct_timing.route_refresh_unfinished_us,
     );
     eprintln!(
         "loss_app_projection_boundaries: order=[account_storage_setup, transaction_call_entry_to_closure_entry, source_timeline_call, chat_list_refresh_call_inclusive, presentation_hydration_nested_in_refresh, closure_exit_to_transaction_return], completed_count_total_us_max_us={:?}, result_error_exits={:?}, closure_not_entered={}, unfinished_at_frozen_stop_us={:?}; transaction entry includes owner wait/begin, return includes commit/rollback, callbacks and owner release; neither is SQL-only, fsync-only, or an additive partition",
