@@ -12,7 +12,9 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             metadata BLOB NOT NULL CHECK(typeof(metadata)='blob'),
             format INTEGER NOT NULL CHECK(format=1),
             bytes INTEGER NOT NULL CHECK(typeof(bytes)='integer' AND bytes>=0),
-            spilled_at INTEGER NOT NULL CHECK(typeof(spilled_at)='integer' AND spilled_at>=0)
+            spilled_at INTEGER NOT NULL CHECK(typeof(spilled_at)='integer' AND spilled_at>=0),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK(typeof(attempts)='integer' AND attempts>=0),
+            not_before INTEGER NOT NULL DEFAULT 0 CHECK(typeof(not_before)='integer' AND not_before>=0)
         );",
     )
     .storage()

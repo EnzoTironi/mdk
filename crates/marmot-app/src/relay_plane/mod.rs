@@ -165,8 +165,6 @@ pub struct MarmotRelayPlaneAccountAdapter {
     publish_client: Arc<dyn NostrRelayClient>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<AccountDeliveryEvent>>>,
     delivery_overflow: Arc<AccountDeliveryOverflowState>,
-    /// Notified by the spill writer after spilled rows become durable.
-    spill_ready: Arc<Notify>,
     incremental_activation: Arc<Mutex<Option<IncrementalActivation>>>,
 }
 
@@ -226,6 +224,10 @@ pub(crate) enum AccountDeliveryWait {
 struct AccountDeliveryOverflowState {
     inner: std::sync::Mutex<AccountDeliveryOverflowInner>,
     metrics: Arc<AccountDeliveryMetrics>,
+    /// Notified by the spill writer after spilled rows become durable. Lives
+    /// here, not on the adapter, so a replaced adapter still hears a writer
+    /// that started under its predecessor.
+    spill_ready: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -868,9 +870,9 @@ impl MarmotRelayPlane {
                 Arc::new(AccountDeliveryOverflowState {
                     inner: std::sync::Mutex::new(AccountDeliveryOverflowInner::default()),
                     metrics: self.inner.transport.account_delivery_metrics.clone(),
+                    spill_ready: Arc::default(),
                 })
             });
-        let spill_ready = Arc::new(Notify::new());
         routes.insert(
             account_id.clone(),
             AccountDeliveryRoute {
@@ -878,7 +880,12 @@ impl MarmotRelayPlane {
                 overflow: delivery_overflow.clone(),
                 recovery_marker,
                 spill: spill_store.map(|store| {
-                    delivery_spill::AccountDeliverySpill::new(store, spill_ready.clone())
+                    delivery_spill::AccountDeliverySpill::new(
+                        store,
+                        account_id.clone(),
+                        Arc::downgrade(&self.inner.transport),
+                        delivery_overflow.clone(),
+                    )
                 }),
             },
         );
@@ -888,7 +895,6 @@ impl MarmotRelayPlane {
             publish_client,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             delivery_overflow,
-            spill_ready,
             incremental_activation: Arc::new(Mutex::new(None)),
         }
     }
@@ -1617,7 +1623,7 @@ impl MarmotRelayPlane {
                         let spilled = route
                             .spill
                             .as_ref()
-                            .is_some_and(|spill| spill.offer(delivery, &route));
+                            .is_some_and(|spill| spill.offer(delivery));
                         if !spilled {
                             omit_account_delivery(&route);
                         }
@@ -2705,7 +2711,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 Some(event) => AccountDeliveryWait::Received(self.account_delivery_receive(event)),
                 None => AccountDeliveryWait::Closed,
             },
-            () = self.spill_ready.notified() => AccountDeliveryWait::SpillReady,
+            () = self.delivery_overflow.spill_ready.notified() => AccountDeliveryWait::SpillReady,
         }
     }
 

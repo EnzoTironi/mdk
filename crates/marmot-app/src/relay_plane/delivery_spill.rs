@@ -5,20 +5,24 @@
 //! spill instead of dropping it. One writer task per account stores hand-offs
 //! in the account database; the account worker later admits spilled rows
 //! through its ordinary ingest path. A delivery is lost, and becomes a
-//! queue-loss generation, only when the hand-off or the durable spill is full.
+//! queue-loss generation, only when the hand-off or the durable spill is full,
+//! or the store keeps failing.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use cgka_traits::TransportDelivery;
+use cgka_traits::{MemberId, TransportDelivery};
 use storage_sqlite::{DeliverySpillDisposition, DeliverySpillLimits};
-use tokio::sync::Notify;
 
-use super::{AccountDeliveryRecoveryMarkerError, AccountDeliveryRoute, omit_account_delivery};
+use super::{
+    AccountDeliveryOverflowState, AccountDeliveryRecoveryMarkerError, RelayPlaneTransport,
+    account_deliveries_read, omit_account_delivery,
+};
 
 pub(crate) type AccountDeliverySpillStore = Arc<
     dyn Fn(
-            Vec<TransportDelivery>,
+            &[TransportDelivery],
         ) -> Result<Vec<DeliverySpillDisposition>, AccountDeliveryRecoveryMarkerError>
         + Send
         + Sync
@@ -33,12 +37,21 @@ pub(crate) const ACCOUNT_DELIVERY_SPILL_LIMITS: DeliverySpillLimits = DeliverySp
 /// Payload bytes the router may hand off before the writer catches up.
 const SPILL_HANDOFF_MAX_BYTES: usize = 4 * 1024 * 1024;
 const SPILL_WRITE_BATCH: usize = 128;
+/// Retryable store failures are retried for about two seconds before the
+/// batch falls back to loss; the cursor stays fenced meanwhile.
+const SPILL_WRITE_RETRIES: u32 = 20;
+const SPILL_WRITE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub(super) struct AccountDeliverySpill {
     store: AccountDeliverySpillStore,
     handoff: std::sync::Mutex<Handoff>,
-    /// Wakes the account worker after rows become durable.
-    ready: Arc<Notify>,
+    account_id: MemberId,
+    /// Loss recorded after an adapter replacement must reach the account's
+    /// current route, not the one this writer started under.
+    transport: Weak<RelayPlaneTransport>,
+    /// Shared by every adapter of this account, so fences and wakeups survive
+    /// replacement.
+    overflow: Arc<AccountDeliveryOverflowState>,
 }
 
 #[derive(Default)]
@@ -49,11 +62,18 @@ struct Handoff {
 }
 
 impl AccountDeliverySpill {
-    pub(super) fn new(store: AccountDeliverySpillStore, ready: Arc<Notify>) -> Arc<Self> {
+    pub(super) fn new(
+        store: AccountDeliverySpillStore,
+        account_id: MemberId,
+        transport: Weak<RelayPlaneTransport>,
+        overflow: Arc<AccountDeliveryOverflowState>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             handoff: std::sync::Mutex::new(Handoff::default()),
-            ready,
+            account_id,
+            transport,
+            overflow,
         })
     }
 
@@ -61,27 +81,23 @@ impl AccountDeliverySpill {
     /// router. Returns false when the hand-off itself is full. Until the
     /// writer settles it, an accepted delivery fences the account's transport
     /// cursor.
-    pub(super) fn offer(
-        self: &Arc<Self>,
-        delivery: TransportDelivery,
-        route: &AccountDeliveryRoute,
-    ) -> bool {
+    pub(super) fn offer(self: &Arc<Self>, delivery: TransportDelivery) -> bool {
         let size = delivery.message.payload.len();
         let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
         if handoff.bytes.saturating_add(size) > SPILL_HANDOFF_MAX_BYTES {
             return false;
         }
-        route.overflow.begin_spill();
+        self.overflow.begin_spill();
         handoff.bytes += size;
         handoff.items.push_back(delivery);
         if !handoff.writing {
             handoff.writing = true;
-            tokio::spawn(self.clone().write(route.clone()));
+            tokio::spawn(self.clone().write());
         }
         true
     }
 
-    async fn write(self: Arc<Self>, route: AccountDeliveryRoute) {
+    async fn write(self: Arc<Self>) {
         loop {
             let batch: Vec<_> = {
                 let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
@@ -96,22 +112,61 @@ impl AccountDeliverySpill {
                 batch
             };
             let count = batch.len() as u64;
-            let store = self.store.clone();
-            let dispositions = tokio::task::spawn_blocking(move || store(batch))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default();
+            let dispositions = self.store_with_retry(batch).await;
             let stored = count_of(&dispositions, DeliverySpillDisposition::Stored);
             let seen = count_of(&dispositions, DeliverySpillDisposition::AlreadySeen);
             // Record loss before releasing the spill fence, so the cursor
             // stays fenced throughout.
             for _ in stored + seen..count {
-                omit_account_delivery(&route);
+                self.omit();
             }
-            route.overflow.finish_spill(count, stored, seen);
+            self.overflow.finish_spill(count, stored, seen);
             if stored > 0 {
-                self.ready.notify_one();
+                self.overflow.spill_ready.notify_one();
+            }
+        }
+    }
+
+    /// An empty result means the whole batch must fall back to loss.
+    async fn store_with_retry(
+        &self,
+        batch: Vec<TransportDelivery>,
+    ) -> Vec<DeliverySpillDisposition> {
+        let batch = Arc::new(batch);
+        for attempt in 0..=SPILL_WRITE_RETRIES {
+            let store = self.store.clone();
+            let items = batch.clone();
+            match tokio::task::spawn_blocking(move || store(&items)).await {
+                Ok(Ok(dispositions)) => return dispositions,
+                Ok(Err(AccountDeliveryRecoveryMarkerError::Retryable))
+                    if attempt < SPILL_WRITE_RETRIES =>
+                {
+                    tokio::time::sleep(SPILL_WRITE_RETRY_DELAY).await;
+                }
+                _ => break,
+            }
+        }
+        tracing::warn!(
+            target: "marmot_app::relay_plane",
+            method = "store_with_retry",
+            error_kind = "spill_write_failed",
+            count = batch.len(),
+            "account delivery spill write failed; omitting the batch into queue loss",
+        );
+        Vec::new()
+    }
+
+    fn omit(&self) {
+        let route = self.transport.upgrade().and_then(|transport| {
+            account_deliveries_read(&transport.account_deliveries)
+                .get(&self.account_id)
+                .cloned()
+        });
+        match route {
+            Some(route) => omit_account_delivery(&route),
+            // The account is gone; its loss fence has no consumer left.
+            None => {
+                self.overflow.record_drop(0);
             }
         }
     }

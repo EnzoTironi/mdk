@@ -2058,10 +2058,10 @@ async fn full_account_queue_spills_before_it_omits() {
     let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
         let mut spill = spill.lock().unwrap();
         Ok(deliveries
-            .into_iter()
+            .iter()
             .map(|delivery| {
                 if spill.len() < 2 {
-                    spill.push(delivery);
+                    spill.push(delivery.clone());
                     storage_sqlite::DeliverySpillDisposition::Stored
                 } else {
                     storage_sqlite::DeliverySpillDisposition::Full
@@ -2132,6 +2132,130 @@ async fn full_account_queue_spills_before_it_omits() {
         adapter.delivery_loss_blocks_cursor(),
         "only the delivery the full spill could not keep becomes loss"
     );
+}
+
+async fn fill_account_queue(
+    relay_plane: &MarmotRelayPlane,
+    adapter: &MarmotRelayPlaneAccountAdapter,
+    account: &MemberId,
+    extra: usize,
+) {
+    let transport_group_id = vec![0xD3; 32];
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_699_999_900)),
+        })
+        .await
+        .unwrap();
+    for index in 0..ACCOUNT_DELIVERY_BUFFER + extra {
+        let mut event = group_event(&format!("fill-{index}"), &transport_group_id);
+        event.created_at = 1_700_100_000_u64.saturating_sub(index as u64);
+        event.id = event.computed_id();
+        relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("fill-group".into()),
+                event,
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn transient_spill_store_failures_are_retried_instead_of_lost() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let attempts = calls.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+            return Err(AccountDeliveryRecoveryMarkerError::Retryable);
+        }
+        Ok(vec![
+            storage_sqlite::DeliverySpillDisposition::Stored;
+            deliveries.len()
+        ])
+    });
+    let adapter = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store),
+    );
+    fill_account_queue(&relay_plane, &adapter, &alice, 1).await;
+
+    let health = timeout(Duration::from_secs(5), async {
+        loop {
+            let health = relay_plane.relay_health().await;
+            if health.account_delivery_spilled == 1 {
+                break health;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retried write stores the delivery");
+    assert_eq!(health.account_delivery_dropped, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(!adapter.delivery_loss_blocks_cursor());
+}
+
+#[tokio::test]
+async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    // The first writer's store waits until the adapter has been replaced.
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        while !gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(vec![
+            storage_sqlite::DeliverySpillDisposition::Stored;
+            deliveries.len()
+        ])
+    });
+    let first = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store.clone()),
+    );
+    fill_account_queue(&relay_plane, &first, &alice, 1).await;
+    timeout(Duration::from_secs(5), async {
+        while !first.delivery_loss_blocks_cursor() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the overflowed delivery is handed to the spill writer");
+
+    let replacement = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store),
+    );
+    release.store(true, Ordering::SeqCst);
+    let woke = timeout(
+        Duration::from_secs(5),
+        replacement.receive_account_delivery_or_spill(),
+    )
+    .await
+    .expect("the replacement hears the earlier writer");
+    assert!(matches!(woke, AccountDeliveryWait::SpillReady));
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ use crate::connection::{CachedSql, retry_on_busy};
 use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::TransportDelivery;
 use cgka_traits::storage::StorageResult;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Upper bounds on the spill table. A delivery that would exceed either one is
 /// reported [`DeliverySpillDisposition::Full`] and left to the loss path.
@@ -36,8 +36,32 @@ pub struct SpilledDelivery {
     pub delivery: TransportDelivery,
 }
 
+/// One read of due spilled rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpilledDeliveryBatch {
+    pub deliveries: Vec<SpilledDelivery>,
+    /// The read filled its limit, so more due rows may remain.
+    pub more: bool,
+    /// Rows removed because their metadata no longer decodes. Their content is
+    /// unknown, so the caller must record them as delivery loss.
+    pub discarded: u64,
+    /// Earliest retry time of a deferred row that is not yet due.
+    pub next_retry_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpilledDeliveryRetry {
+    Deferred {
+        not_before: u64,
+    },
+    /// The row reached its attempt limit and was removed.
+    Abandoned,
+}
+
 /// Artifact-local version of the `metadata` encoding.
 const SPILL_FORMAT: i64 = 1;
+const SPILL_RETRY_BASE_SECS: u64 = 60;
+const SPILL_RETRY_CAP_SECS: u64 = 60 * 60;
 
 /// The payload keeps its own column. JSON would inflate raw ciphertext about
 /// threefold, so only the small remaining metadata is serialized.
@@ -49,11 +73,12 @@ struct EncodedDelivery {
 }
 
 impl EncodedDelivery {
-    fn encode(mut delivery: TransportDelivery) -> StorageResult<Self> {
-        let payload = std::mem::take(&mut delivery.message.payload);
-        let metadata = crate::codec::serialize(&delivery)?;
+    fn encode(delivery: &TransportDelivery) -> StorageResult<Self> {
+        let mut metadata = delivery.clone();
+        let payload = std::mem::take(&mut metadata.message.payload);
+        let metadata = crate::codec::serialize(&metadata)?;
         Ok(Self {
-            event_id: delivery.message.id.into_bytes(),
+            event_id: delivery.message.id.as_slice().to_vec(),
             bytes: (payload.len() + metadata.len()) as u64,
             payload,
             metadata,
@@ -73,16 +98,25 @@ fn already_seen(conn: &Connection, event_id: &[u8]) -> StorageResult<bool> {
     .storage()
 }
 
+fn already_spilled(conn: &Connection, event_id: &[u8]) -> StorageResult<bool> {
+    conn.query_row_cached(
+        "SELECT EXISTS(SELECT 1 FROM account_delivery_spill WHERE event_id=?1)",
+        [event_id],
+        |row| row.get(0),
+    )
+    .storage()
+}
+
 impl SqliteAccountStorage {
     /// Spill deliveries in order and report one disposition per input.
     pub fn spill_account_deliveries(
         &self,
-        deliveries: Vec<TransportDelivery>,
+        deliveries: &[TransportDelivery],
         limits: DeliverySpillLimits,
         now_secs: u64,
     ) -> StorageResult<Vec<DeliverySpillDisposition>> {
         let encoded = deliveries
-            .into_iter()
+            .iter()
             .map(EncodedDelivery::encode)
             .collect::<StorageResult<Vec<_>>>()?;
         let spilled_at = u64_to_i64(now_secs)?;
@@ -99,19 +133,17 @@ impl SqliteAccountStorage {
                 let (mut rows, mut bytes) = (i64_to_u64(rows)?, i64_to_u64(bytes)?);
                 let mut dispositions = Vec::with_capacity(encoded.len());
                 for delivery in &encoded {
-                    if already_seen(&conn, &delivery.event_id)? {
-                        dispositions.push(DeliverySpillDisposition::AlreadySeen);
-                        continue;
-                    }
-                    if rows >= limits.max_rows
+                    let disposition = if already_seen(&conn, &delivery.event_id)? {
+                        DeliverySpillDisposition::AlreadySeen
+                    } else if already_spilled(&conn, &delivery.event_id)? {
+                        DeliverySpillDisposition::Stored
+                    } else if rows >= limits.max_rows
                         || bytes.saturating_add(delivery.bytes) > limits.max_bytes
                     {
-                        dispositions.push(DeliverySpillDisposition::Full);
-                        continue;
-                    }
-                    let inserted = conn
-                        .execute_cached(
-                            "INSERT OR IGNORE INTO account_delivery_spill
+                        DeliverySpillDisposition::Full
+                    } else {
+                        conn.execute_cached(
+                            "INSERT INTO account_delivery_spill
                                 (event_id, payload, metadata, format, bytes, spilled_at)
                              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             params![
@@ -124,27 +156,33 @@ impl SqliteAccountStorage {
                             ],
                         )
                         .storage()?;
-                    if inserted > 0 {
                         rows += 1;
                         bytes = bytes.saturating_add(delivery.bytes);
-                    }
-                    dispositions.push(DeliverySpillDisposition::Stored);
+                        DeliverySpillDisposition::Stored
+                    };
+                    dispositions.push(disposition);
                 }
                 Ok(dispositions)
             })
         })
     }
 
-    /// Oldest spilled deliveries first. A row whose metadata no longer decodes
-    /// is removed rather than blocking every later row.
-    pub fn spilled_account_deliveries(&self, limit: usize) -> StorageResult<Vec<SpilledDelivery>> {
+    /// Oldest due rows first. A row whose metadata no longer decodes is
+    /// removed, counted in `discarded`, and does not end the read early.
+    pub fn spilled_account_deliveries(
+        &self,
+        limit: usize,
+        now_secs: u64,
+    ) -> StorageResult<SpilledDeliveryBatch> {
+        let now = u64_to_i64(now_secs)?;
         let conn = self.lock()?;
         let rows = conn
             .prepare_cached(
-                "SELECT seq, payload, metadata FROM account_delivery_spill ORDER BY seq LIMIT ?1",
+                "SELECT seq, payload, metadata FROM account_delivery_spill
+                 WHERE not_before <= ?1 ORDER BY seq LIMIT ?2",
             )
             .storage()?
-            .query_map([u64_to_i64(limit as u64)?], |row| {
+            .query_map(params![now, u64_to_i64(limit as u64)?], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
@@ -154,20 +192,32 @@ impl SqliteAccountStorage {
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
-        let mut spilled = Vec::with_capacity(rows.len());
+        let mut batch = SpilledDeliveryBatch {
+            more: rows.len() == limit,
+            ..SpilledDeliveryBatch::default()
+        };
         for (seq, payload, metadata) in rows {
             match crate::codec::deserialize::<TransportDelivery>(&metadata) {
                 Ok(mut delivery) => {
                     delivery.message.payload = payload;
-                    spilled.push(SpilledDelivery { seq, delivery });
+                    batch.deliveries.push(SpilledDelivery { seq, delivery });
                 }
                 Err(_) => {
                     conn.execute_cached("DELETE FROM account_delivery_spill WHERE seq=?1", [seq])
                         .storage()?;
+                    batch.discarded += 1;
                 }
             }
         }
-        Ok(spilled)
+        let next: Option<i64> = conn
+            .query_row_cached(
+                "SELECT MIN(not_before) FROM account_delivery_spill WHERE not_before > ?1",
+                [now],
+                |row| row.get(0),
+            )
+            .storage()?;
+        batch.next_retry_at = next.map(i64_to_u64).transpose()?;
+        Ok(batch)
     }
 
     pub fn remove_spilled_account_delivery(&self, seq: i64) -> StorageResult<()> {
@@ -175,6 +225,46 @@ impl SqliteAccountStorage {
             .execute_cached("DELETE FROM account_delivery_spill WHERE seq=?1", [seq])
             .storage()?;
         Ok(())
+    }
+
+    /// Keep a spilled row whose ingest left no durable trace and retry it
+    /// after a doubling delay (one minute up to an hour). The row is removed
+    /// once it has been attempted `max_attempts` times.
+    pub fn defer_spilled_account_delivery(
+        &self,
+        seq: i64,
+        now_secs: u64,
+        max_attempts: u32,
+    ) -> StorageResult<SpilledDeliveryRetry> {
+        let conn = self.lock()?;
+        let Some(attempts) = conn
+            .query_row_cached(
+                "UPDATE account_delivery_spill SET attempts = attempts + 1 WHERE seq=?1
+                 RETURNING attempts",
+                [seq],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .storage()?
+        else {
+            return Ok(SpilledDeliveryRetry::Abandoned);
+        };
+        let attempts = i64_to_u64(attempts)?;
+        if attempts >= u64::from(max_attempts) {
+            conn.execute_cached("DELETE FROM account_delivery_spill WHERE seq=?1", [seq])
+                .storage()?;
+            return Ok(SpilledDeliveryRetry::Abandoned);
+        }
+        let delay = SPILL_RETRY_BASE_SECS
+            .saturating_mul(1_u64 << (attempts - 1).min(16))
+            .min(SPILL_RETRY_CAP_SECS);
+        let not_before = now_secs.saturating_add(delay);
+        conn.execute_cached(
+            "UPDATE account_delivery_spill SET not_before=?2 WHERE seq=?1",
+            params![seq, u64_to_i64(not_before)?],
+        )
+        .storage()?;
+        Ok(SpilledDeliveryRetry::Deferred { not_before })
     }
 }
 
@@ -227,22 +317,26 @@ mod tests {
             .unwrap();
     }
 
+    fn due(store: &SqliteAccountStorage, now: u64) -> SpilledDeliveryBatch {
+        store.spilled_account_deliveries(10, now).unwrap()
+    }
+
     #[test]
     fn spill_round_trips_in_order_and_removes_rows() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let outcome = store
-            .spill_account_deliveries(vec![delivery(2), delivery(1)], LIMITS, 9)
+            .spill_account_deliveries(&[delivery(2), delivery(1)], LIMITS, 9)
             .unwrap();
         assert_eq!(outcome, vec![DeliverySpillDisposition::Stored; 2]);
 
-        let spilled = store.spilled_account_deliveries(10).unwrap();
+        let spilled = due(&store, 9).deliveries;
         let deliveries: Vec<_> = spilled.iter().map(|row| row.delivery.clone()).collect();
         assert_eq!(deliveries, vec![delivery(2), delivery(1)]);
 
         store
             .remove_spilled_account_delivery(spilled[0].seq)
             .unwrap();
-        let remaining = store.spilled_account_deliveries(10).unwrap();
+        let remaining = due(&store, 9).deliveries;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].delivery, delivery(1));
     }
@@ -264,7 +358,7 @@ mod tests {
             .unwrap();
 
         let outcome = store
-            .spill_account_deliveries(vec![delivery(1), delivery(2), delivery(3)], LIMITS, 9)
+            .spill_account_deliveries(&[delivery(1), delivery(2), delivery(3)], LIMITS, 9)
             .unwrap();
         assert_eq!(
             outcome,
@@ -277,24 +371,23 @@ mod tests {
     }
 
     #[test]
-    fn spill_reports_full_at_row_and_byte_limits_and_dedups_copies() {
+    fn spill_reports_full_at_limits_but_keeps_rows_it_already_holds() {
+        use DeliverySpillDisposition::{Full, Stored};
         let store = SqliteAccountStorage::in_memory().unwrap();
         let outcome = store
             .spill_account_deliveries(
-                vec![
-                    delivery(1),
-                    delivery(1),
-                    delivery(2),
-                    delivery(3),
-                    delivery(4),
-                ],
+                &[delivery(1), delivery(1), delivery(2), delivery(3)],
                 LIMITS,
                 9,
             )
             .unwrap();
-        use DeliverySpillDisposition::{Full, Stored};
-        assert_eq!(outcome, vec![Stored, Stored, Stored, Stored, Full]);
-        assert_eq!(store.spilled_account_deliveries(10).unwrap().len(), 3);
+        assert_eq!(outcome, vec![Stored; 4]);
+        // At the row cap, a copy of a held row is still stored; a new one is not.
+        let outcome = store
+            .spill_account_deliveries(&[delivery(3), delivery(4)], LIMITS, 9)
+            .unwrap();
+        assert_eq!(outcome, vec![Stored, Full]);
+        assert_eq!(due(&store, 9).deliveries.len(), 3);
 
         let tight = DeliverySpillLimits {
             max_rows: u64::MAX,
@@ -303,17 +396,17 @@ mod tests {
         let empty = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(
             empty
-                .spill_account_deliveries(vec![delivery(5)], tight, 9)
+                .spill_account_deliveries(&[delivery(5)], tight, 9)
                 .unwrap(),
             vec![Full]
         );
     }
 
     #[test]
-    fn undecodable_rows_are_dropped_instead_of_blocking_the_spill() {
+    fn undecodable_rows_are_counted_and_do_not_end_the_read_early() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
-            .spill_account_deliveries(vec![delivery(1), delivery(2)], LIMITS, 9)
+            .spill_account_deliveries(&[delivery(1), delivery(2), delivery(3)], LIMITS, 9)
             .unwrap();
         store
             .lock()
@@ -323,9 +416,53 @@ mod tests {
                 [vec![1_u8; 32]],
             )
             .unwrap();
-        let spilled = store.spilled_account_deliveries(10).unwrap();
-        assert_eq!(spilled.len(), 1);
-        assert_eq!(spilled[0].delivery, delivery(2));
-        assert_eq!(store.spilled_account_deliveries(10).unwrap().len(), 1);
+        let first = store.spilled_account_deliveries(2, 9).unwrap();
+        assert_eq!(first.discarded, 1);
+        assert!(first.more, "a full read continues past the removed row");
+        assert_eq!(first.deliveries.len(), 1);
+        assert_eq!(first.deliveries[0].delivery, delivery(2));
+        let second = store.spilled_account_deliveries(2, 9).unwrap();
+        let rest: Vec<_> = second
+            .deliveries
+            .iter()
+            .map(|row| row.delivery.clone())
+            .collect();
+        assert_eq!(rest, vec![delivery(2), delivery(3)]);
+        assert_eq!(second.discarded, 0);
+    }
+
+    #[test]
+    fn deferred_rows_wait_with_doubling_delay_and_are_abandoned_at_the_limit() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .spill_account_deliveries(&[delivery(1)], LIMITS, 100)
+            .unwrap();
+        let seq = due(&store, 100).deliveries[0].seq;
+
+        assert_eq!(
+            store.defer_spilled_account_delivery(seq, 100, 3).unwrap(),
+            SpilledDeliveryRetry::Deferred { not_before: 160 }
+        );
+        let waiting = due(&store, 159);
+        assert!(waiting.deliveries.is_empty());
+        assert_eq!(waiting.next_retry_at, Some(160));
+        assert_eq!(due(&store, 160).deliveries.len(), 1);
+
+        assert_eq!(
+            store.defer_spilled_account_delivery(seq, 160, 3).unwrap(),
+            SpilledDeliveryRetry::Deferred { not_before: 280 }
+        );
+        assert_eq!(
+            store.defer_spilled_account_delivery(seq, 280, 3).unwrap(),
+            SpilledDeliveryRetry::Abandoned
+        );
+        let gone = due(&store, u64::from(u32::MAX));
+        assert!(gone.deliveries.is_empty());
+        assert_eq!(gone.next_retry_at, None);
+        assert_eq!(
+            store.defer_spilled_account_delivery(seq, 300, 3).unwrap(),
+            SpilledDeliveryRetry::Abandoned,
+            "deferring a removed row is a no-op"
+        );
     }
 }

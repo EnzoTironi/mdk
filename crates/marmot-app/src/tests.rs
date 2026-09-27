@@ -12870,7 +12870,11 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
                 .is_none()
         );
         assert_eq!(
-            storage.spilled_account_deliveries(1_000).unwrap().len(),
+            storage
+                .spilled_account_deliveries(1_000, crate::unix_now_seconds())
+                .unwrap()
+                .deliveries
+                .len(),
             NEW
         );
 
@@ -12883,7 +12887,11 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
             };
             client.ingest_received_delivery(*delivery).await.unwrap();
         }
-        let spilled_before_reopen = storage.spilled_account_deliveries(1_000).unwrap().len();
+        let spilled_before_reopen = storage
+            .spilled_account_deliveries(1_000, crate::unix_now_seconds())
+            .unwrap()
+            .deliveries
+            .len();
         drop(client);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         for _ in 0..spilled_before_reopen {
@@ -12899,8 +12907,9 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         }
         assert!(
             storage
-                .spilled_account_deliveries(1_000)
+                .spilled_account_deliveries(1_000, crate::unix_now_seconds())
                 .unwrap()
+                .deliveries
                 .is_empty()
         );
         // The queue kept the oldest injections; every later one was spilled.

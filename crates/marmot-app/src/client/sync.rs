@@ -2165,7 +2165,7 @@ impl AppClient {
             let event_id = hex::encode(delivery.message.id.as_slice());
             if self.transport_receipts()?.contains(&event_id) {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
-                self.release_spilled_delivery();
+                self.settle_spilled_delivery();
                 continue;
             }
             return Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(
@@ -2219,7 +2219,7 @@ impl AppClient {
     ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {
         // A spilled delivery gets exactly the live path's one ingest attempt.
         let result = self.ingest_received_delivery_once(delivery).await;
-        self.release_spilled_delivery();
+        self.settle_spilled_delivery();
         result
     }
 
