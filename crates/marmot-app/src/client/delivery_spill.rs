@@ -49,6 +49,11 @@ impl Default for DeliverySpillReader {
 
 impl DeliverySpillReader {
     pub(super) fn pending(&mut self) -> bool {
+        // A hand-off that was never settled, after an early error or a
+        // cancelled ingest, left its row stored. Read it again.
+        if self.in_flight.take().is_some() {
+            self.maybe_rows = true;
+        }
         if self
             .next_retry_at
             .is_some_and(|at| at <= unix_now_seconds())
@@ -279,6 +284,49 @@ mod tests {
                 .deliveries
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn unsettled_hand_off_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .spill_account_deliveries(
+                &[delivery(5)],
+                ACCOUNT_DELIVERY_SPILL_LIMITS,
+                unix_now_seconds(),
+            )
+            .unwrap();
+        client.delivery_spill.maybe_rows = true;
+        assert_eq!(client.next_spilled_delivery().unwrap(), Some(delivery(5)));
+        assert!(
+            !client.delivery_spill.maybe_rows,
+            "the batch held every row"
+        );
+
+        // The receive returned early or its ingest was cancelled, so the row
+        // was never settled. The next receive must find it without new
+        // relay traffic.
+        let mut received = None;
+        for _ in 0..2 {
+            received = client.take_ready_delivery().unwrap();
+            if received.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(
+            received,
+            Some(crate::relay_plane::AccountDeliveryReceive::Delivery(d)) if *d == delivery(5)
+        ));
     }
 
     #[tokio::test]
