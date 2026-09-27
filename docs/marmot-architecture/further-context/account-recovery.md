@@ -215,10 +215,12 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 - Spill write latency under a burst, and cursor safety while writes are pending (covered by
   tests).
-- Whether the fork reports a per-relay NIP-77 outcome with a truncation flag. If not, that
-  needs a small fork change.
-- The NIP-77 match-set cap on the whitenoise relays is 5,000,000 on both relays, far above
-  the inventory cap (16,384 per route), so comparisons there are not truncated.
+- Truncated comparisons. The adapter asks for at most 16,384 items per NIP-77 request, the
+  inventory cap. The whitenoise relays' own match-set cap is 5,000,000, so the adapter limit
+  is the binding one. `NostrReconciliationSummary` reports only aggregate relay success and
+  failure, with no truncation outcome. Until the fork reports one, step 2 counts an endpoint
+  whose relay-side set reaches the adapter limit as failed, so a possibly truncated
+  comparison never certifies a route.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.
