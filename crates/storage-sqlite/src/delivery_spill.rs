@@ -257,8 +257,9 @@ impl SqliteAccountStorage {
         }))
     }
 
-    /// Remove rows the account cannot admit and record them as queue loss in
-    /// the same transaction, so recovery keeps an obligation for them.
+    /// Remove rows the account cannot admit, record them as queue loss and
+    /// import that loss into a recovery obligation, all in one transaction.
+    /// Any failure leaves the rows in place.
     pub fn discard_spilled_account_deliveries(
         &self,
         seqs: &[i64],
@@ -289,6 +290,7 @@ impl SqliteAccountStorage {
                         removed,
                         now_secs,
                     )?;
+                    self.synchronize_account_delivery_loss(account_label)?;
                 }
                 Ok(())
             })
@@ -519,10 +521,29 @@ mod tests {
             })
         );
 
+        assert!(
+            store
+                .discard_spilled_account_deliveries(&[seq], "unknown-account", 5, 5_000)
+                .is_err(),
+            "the loss record references a missing account"
+        );
+        assert_eq!(
+            due(&store, u64::MAX >> 2).deliveries.len(),
+            1,
+            "a failed discard keeps the row"
+        );
         store
             .discard_spilled_account_deliveries(&[seq], "alice", 5, 5_000)
             .unwrap();
         assert!(due(&store, u64::MAX >> 2).deliveries.is_empty());
+        assert!(
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.cause == crate::RecoveryCause::QueueLoss),
+            "the loss is already an obligation when the row goes"
+        );
         assert_eq!(
             loss_evidence(&store),
             vec![(RecoveryLossCause::Queue as i64, 1)]

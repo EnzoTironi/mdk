@@ -2259,6 +2259,36 @@ async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
 }
 
 #[tokio::test]
+async fn pending_spill_wakeup_wins_over_a_ready_live_queue() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let store: AccountDeliverySpillStore = Arc::new(|deliveries| {
+        Ok(vec![
+            storage_sqlite::DeliverySpillDisposition::Stored;
+            deliveries.len()
+        ])
+    });
+    let adapter = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store),
+    );
+    // Live input is queued and ready when a spill write commits.
+    fill_account_queue(&relay_plane, &adapter, &alice, 0).await;
+    adapter.delivery_overflow.spill_ready.notify_one();
+    assert!(matches!(
+        adapter.receive_account_delivery_or_spill().await,
+        AccountDeliveryWait::SpillReady
+    ));
+    assert!(matches!(
+        adapter.receive_account_delivery_or_spill().await,
+        AccountDeliveryWait::Received(AccountDeliveryReceive::Delivery(_))
+    ));
+}
+
+#[tokio::test]
 async fn spill_hand_off_bounds_deliveries_with_empty_payloads() {
     let release = Arc::new(AtomicBool::new(false));
     let gate = release.clone();

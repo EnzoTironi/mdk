@@ -159,8 +159,9 @@ impl AppClient {
         *next = (*next).min(at);
     }
 
-    /// Remove rows and record them as queue loss in one transaction.
-    fn discard_spilled_deliveries(&self, seqs: &[i64]) -> Result<(), AppError> {
+    /// Remove rows and turn them into a queue-loss obligation in one
+    /// transaction, then fence the cursor until recovery settles that loss.
+    fn discard_spilled_deliveries(&mut self, seqs: &[i64]) -> Result<(), AppError> {
         use rand::RngCore;
         let storage = self.app.account_storage(&self.state.label)?;
         let token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
@@ -170,7 +171,9 @@ impl AppClient {
             token,
             unix_now_seconds(),
         )?;
-        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        self.delivery_overflow_recovery_pending = true;
+        self.delivery_overflow_recovery_marker_token
+            .get_or_insert(token);
         Ok(())
     }
 
@@ -325,6 +328,21 @@ mod tests {
         assert!(
             queue_loss(&storage),
             "the discarded row leaves a recovery obligation"
+        );
+        assert!(
+            client.delivery_overflow_recovery_pending,
+            "the cursor stays fenced until recovery settles the loss"
+        );
+        assert!(
+            matches!(
+                client
+                    .select_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Receive
+                    )
+                    .unwrap(),
+                crate::client::PendingRecoverySelection::Grant(_)
+            ),
+            "the owner selects the loss for recovery"
         );
     }
 }

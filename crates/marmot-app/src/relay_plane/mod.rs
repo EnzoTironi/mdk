@@ -2702,16 +2702,18 @@ impl MarmotRelayPlaneAccountAdapter {
         Some(self.account_delivery_receive(event))
     }
 
-    /// Wait for a queued item, or for spilled rows to become durable.
+    /// Wait for a queued item, or for spilled rows to become durable. A
+    /// pending spill wakeup wins, so a continuously ready live queue cannot
+    /// hide it; it fires once per writer batch, so live input is not starved.
     pub(crate) async fn receive_account_delivery_or_spill(&self) -> AccountDeliveryWait {
         let mut delivery_rx = self.delivery_rx.lock().await;
         tokio::select! {
             biased;
+            () = self.delivery_overflow.spill_ready.notified() => AccountDeliveryWait::SpillReady,
             event = delivery_rx.recv() => match event {
                 Some(event) => AccountDeliveryWait::Received(self.account_delivery_receive(event)),
                 None => AccountDeliveryWait::Closed,
             },
-            () = self.delivery_overflow.spill_ready.notified() => AccountDeliveryWait::SpillReady,
         }
     }
 
