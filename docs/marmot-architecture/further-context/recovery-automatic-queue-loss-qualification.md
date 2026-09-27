@@ -603,3 +603,65 @@ costs remain unmeasured. Existing schema guards cause binaries that know only
 through migration 0095 to refuse an upgraded database; no downgrade
 compatibility is claimed. Strict x86_64 recovery, device, and platform
 qualification remain open; PR #2060 stays draft.
+
+Exact-head Core CI for signed `276203dcb99b283d2d2e81cb29dc155b4a3d285b`
+failed both strict QueueLoss fixtures twice, bringing the preserved x86_64
+record to **93 failed attempts across 24 heads**. The two Receive attempts
+held a real target acquisition on a Maintenance grant despite accepted,
+dequeued, successfully ingested ordinary wakes; the fixture required Receive.
+The two Maintenance-required attempts also failed strict active acquisition,
+though all four eventually recovered useful target, epoch, and plaintext
+state. The five full Rust logs and retry classifications remain in the
+[exact-head PR evidence](https://github.com/marmot-protocol/mdk/pull/2060#issuecomment-5857916019).
+Positive eventual recovery and prior first-pass results do not close those
+failed assertions.
+
+The next local candidate lets a qualified different-group ordinary delivery
+cross only its current durable, ready, disjoint QueueLoss control. The
+adapter returns a queue-identity/generation/token receipt with the delivery;
+the successful ordinary Receive may retain its original control deferral
+proof across unchanged prefix deliveries. The exact control must complete and
+run its original Receive tail once before a completed hint is eligible. In the
+biased worker select, this one-shot continuation now precedes a simultaneously
+due Maintenance tick, while shutdown, completions, commands, ordinary Receive,
+due convergence, and bounded admission keep their earlier positions. A caller
+or mutation invalidates the hint; snapshot reads do not. Dispatch takes the
+hint before awaiting, and the owner rechecks the original proof against the
+current eligible demand, retry serial, and loss/route/inventory fence before
+reservation. Once dispatched, stale receipt, no-credit, or generic Deferred
+selection spends the opportunity and leaves normal scheduling and durable
+debt intact. Earlier due work can keep the hint waiting until the next turn. The
+periodic tick body, policy budgets, schema, fixture stimulus, and assertions
+are unchanged.
+
+One unchanged full local macOS Receive run of this candidate failed in 32.31
+test seconds (Cargo exit 101; 33.087 seconds including its wrapper). The exact
+ordinary wake was accepted at 120 ms, dequeued at 125 ms, and ingested at 133
+ms, but the sole QueueLoss grant used Maintenance attempt 5. Its full log is
+`/tmp/mdk-2060-deferred-control-receive-20260927T182448Z.log`. That run had
+no hint-lifecycle witness: it does not prove whether the crossing receipt,
+proof, completed control, or ready deferred branch existed. The existing
+fixture-owned, default-disabled Alice probe now freezes fixed aggregate counts
+at the diagnostic stop for actual receipt return, hint arm/retention/discard,
+control completion, and one-shot dispatch/result. It records no identities;
+`retained` counts present-to-present transitions, not proof of identity
+equality. Focused readiness, probe freeze/isolation, and real-adapter owner
+composition tests pass in default and feature builds. The composed test does
+not exercise simultaneous readiness in the full worker.
+
+One subsequent **unchanged** full local macOS Receive run passed in 46.56
+test seconds (Cargo exit 0; wrapper exit 0). Its complete separate log is
+`/tmp/mdk-2060-arbitration-receive-20260927T190328Z.log`. The sole selected
+grant was Receive attempt 5 with one QueueLoss obligation. The lifecycle
+snapshot recorded one returned crossing, one arm, 1,015 present-to-present
+retentions, one exact-control completion, one dispatch attempt, and one job;
+all discard and stale categories were zero. The active target job and request
+each remained at one through entry and release with about 9.91 and 9.86
+seconds left on the deadline. That grant returned and queued the missing
+commit; no later grant ran. The fixture passed durable retention, MLS epoch
+advance, both dependent plaintexts, and status/send/live bounds while the
+QueueLoss marker and demand remained pending without exhaustive admission
+evidence. This qualifies the current candidate in one local macOS run. The
+earlier failed run's hint readiness remains unknown, and this result does not
+qualify x86_64, explain all previous failures, or authorize merge, device
+activation, or release. PR #2060 remains draft for fresh exact-head CI review.

@@ -85,6 +85,8 @@ pub(crate) use sync::TestAppProjectionStage;
 #[cfg(test)]
 pub(crate) use sync::TestComparisonActivityWitness;
 #[cfg(test)]
+pub(crate) use sync::TestDeferredReceiveEvent;
+#[cfg(test)]
 pub(crate) use sync::TestQueueDrainCostProbe;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use sync::TestRecoveryPhase;

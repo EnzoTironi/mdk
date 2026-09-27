@@ -198,6 +198,19 @@ pub(crate) struct AttemptGrant {
     admission: Option<Arc<RecoveryAdmissionSnapshot>>,
 }
 
+/// A scheduling witness from the exact sole-QueueLoss control gate. It is
+/// never a reservation or completion certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ControlDeferralProof {
+    pub(crate) marker_token: u64,
+    pub(crate) demand_id: [u8; 16],
+    pub(crate) demand_revision: u64,
+    pub(crate) loss_revision: u64,
+    pub(crate) route_revision: u64,
+    pub(crate) inventory_revision: u64,
+    pub(crate) retry_attempt_serial: u64,
+}
+
 /// Admission scope survives exactly as long as its grant. The owner holds only
 /// a weak reference, so cancellation/quiescence cannot retain a finished plan.
 struct RecoveryAdmissionSnapshot {
@@ -386,6 +399,7 @@ impl AccountRecoveryOwner {
         )
     }
 
+    #[cfg(test)]
     fn select_authorized_attempt_for_with_queue_loss_gate(
         &mut self,
         storage: &SqliteAccountStorage,
@@ -395,6 +409,32 @@ impl AccountRecoveryOwner {
         required: Option<[u8; 16]>,
         deferred_control_tokens: &[u64],
     ) -> StorageResult<Option<AttemptGrant>> {
+        let mut control_deferral = None;
+        self.select_authorized_attempt_for_with_queue_loss_gate_and_proof(
+            storage,
+            readiness,
+            now,
+            explicit,
+            required,
+            deferred_control_tokens,
+            None,
+            &mut control_deferral,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Preserve the existing selector inputs while passing one volatile proof through it.
+    pub(super) fn select_authorized_attempt_for_with_queue_loss_gate_and_proof(
+        &mut self,
+        storage: &SqliteAccountStorage,
+        readiness: RecoveryReadiness,
+        now: Instant,
+        explicit: Option<&mut ExplicitRecoveryPermit>,
+        required: Option<[u8; 16]>,
+        deferred_control_tokens: &[u64],
+        expected: Option<ControlDeferralProof>,
+        control_deferral: &mut Option<ControlDeferralProof>,
+    ) -> StorageResult<Option<AttemptGrant>> {
+        *control_deferral = None;
         if self.active.upgrade().is_some() {
             return Ok(None);
         }
@@ -539,6 +579,48 @@ impl AccountRecoveryOwner {
                                 .is_some_and(|token| deferred_control_tokens.contains(&token))
                     })
                 {
+                    let demand = demands
+                        .iter()
+                        .find(|demand| {
+                            demand.ticket.id == fence.obligations[0].0
+                                && demand.ticket.revision == fence.obligations[0].1
+                        })
+                        .expect("eligible QueueLoss demand exists");
+                    *control_deferral = Some(ControlDeferralProof {
+                        marker_token: demand.marker_token.expect("matched control token"),
+                        demand_id: demand.ticket.id,
+                        demand_revision: demand.ticket.revision,
+                        loss_revision: fence.loss_revision,
+                        route_revision: fence.route_revision,
+                        inventory_revision: fence.inventory_revision,
+                        retry_attempt_serial: prior.attempt_serial,
+                    });
+                    return Ok(None);
+                }
+            }
+            if let Some(expected) = expected {
+                let matches_expected = !immediate
+                    && required.is_none()
+                    && comparison_revision.is_none()
+                    && !storage.recovery_comparison()?.pending()
+                    && fence.obligations.as_slice()
+                        == [(expected.demand_id, expected.demand_revision)]
+                    && eligible_before_single_winner.as_slice() == fence.obligations.as_slice()
+                    && fence.loss_revision == expected.loss_revision
+                    && fence.route_revision == expected.route_revision
+                    && fence.inventory_revision == expected.inventory_revision
+                    && prior.attempt_serial == expected.retry_attempt_serial
+                    && !storage.pending_recovery_demands()?.iter().any(|demand| {
+                        demand.caller_waiting
+                            || self
+                                .maintenance_observations
+                                .values()
+                                .any(|observation| observation.id == demand.ticket.id)
+                            || (demand.ticket.id == expected.demand_id
+                                && (demand.cause != storage_sqlite::RecoveryCause::QueueLoss
+                                    || demand.marker_token != Some(expected.marker_token)))
+                    });
+                if !matches_expected {
                     return Ok(None);
                 }
             }
@@ -1225,10 +1307,30 @@ impl AppClient {
 
     pub(crate) fn authorize_account_recovery_for_with_control_skip(
         &mut self,
+        explicit: Option<&mut ExplicitRecoveryPermit>,
+        seam: marmot_forensics::EpochBackfillExecutionSeam,
+        required: Option<[u8; 16]>,
+        consumed_control: Option<(u64, u64)>,
+    ) -> Result<Option<AttemptGrant>, AppError> {
+        let mut control_deferral = None;
+        self.authorize_account_recovery_for_with_control_proof(
+            explicit,
+            seam,
+            required,
+            consumed_control,
+            None,
+            &mut control_deferral,
+        )
+    }
+
+    pub(crate) fn authorize_account_recovery_for_with_control_proof(
+        &mut self,
         mut explicit: Option<&mut ExplicitRecoveryPermit>,
         seam: marmot_forensics::EpochBackfillExecutionSeam,
         required: Option<[u8; 16]>,
         consumed_control: Option<(u64, u64)>,
+        expected: Option<ControlDeferralProof>,
+        control_deferral: &mut Option<ControlDeferralProof>,
     ) -> Result<Option<AttemptGrant>, AppError> {
         // Wake collection retains the loaded live floor and leaves recovery
         // debt/pacing to an Advance runtime. Only the separate full-history
@@ -1309,13 +1411,15 @@ impl AppClient {
         }
         let selected = self
             .recovery_owner
-            .select_authorized_attempt_for_with_queue_loss_gate(
+            .select_authorized_attempt_for_with_queue_loss_gate_and_proof(
                 &storage,
                 readiness,
                 Instant::now(),
                 explicit.as_deref_mut(),
                 required,
                 &deferred_control_tokens,
+                expected,
+                control_deferral,
             )?;
         self.record_unavailable_epoch_observation(&storage)?;
         let Some(mut grant) = selected else {
@@ -1839,6 +1943,83 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "notification-only debt has no queue prefix"
+        );
+    }
+
+    #[test]
+    fn exact_control_deferral_rechecks_fence_before_one_reservation() {
+        let (storage, mut owner, now) = fixture();
+        let retry = storage.recovery_retry_state().unwrap();
+        let mut proof = None;
+        assert!(
+            owner
+                .select_authorized_attempt_for_with_queue_loss_gate_and_proof(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    now,
+                    None,
+                    None,
+                    &[1],
+                    None,
+                    &mut proof,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let proof = proof.expect("the exact sole QueueLoss control caused deferral");
+        assert_eq!(proof.marker_token, 1);
+        assert_eq!(proof.retry_attempt_serial, retry.attempt_serial);
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        let mut irrelevant = None;
+        let grant = owner
+            .select_authorized_attempt_for_with_queue_loss_gate_and_proof(
+                &storage,
+                RecoveryReadiness::Ready,
+                now,
+                None,
+                None,
+                &[],
+                Some(proof),
+                &mut irrelevant,
+            )
+            .unwrap()
+            .expect("unchanged eligible demand may reserve once");
+        assert_eq!(
+            grant.fence.obligations,
+            vec![(proof.demand_id, proof.demand_revision)]
+        );
+        assert!(irrelevant.is_none());
+
+        let (storage, mut owner, now) = fixture();
+        let mut old = None;
+        owner
+            .select_authorized_attempt_for_with_queue_loss_gate_and_proof(
+                &storage,
+                RecoveryReadiness::Ready,
+                now,
+                None,
+                None,
+                &[1],
+                None,
+                &mut old,
+            )
+            .unwrap();
+        storage.observe_recovery_route_snapshot([7; 32]).unwrap();
+        assert!(storage.observe_recovery_route_snapshot([8; 32]).unwrap());
+        assert!(
+            owner
+                .select_authorized_attempt_for_with_queue_loss_gate_and_proof(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    now,
+                    None,
+                    None,
+                    &[],
+                    old,
+                    &mut None,
+                )
+                .unwrap()
+                .is_none()
         );
     }
 

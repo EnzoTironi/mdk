@@ -4009,7 +4009,24 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
     );
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    client.create_group("local route", &[]).await.unwrap();
+    let local_group = client.create_group("local route", &[]).await.unwrap();
+    let local_route = hex::decode(
+        app.group("alice", &hex::encode(local_group.as_slice()))
+            .unwrap()
+            .unwrap()
+            .nostr_routing
+            .nostr_group_id_hex,
+    )
+    .unwrap();
+    let independent_group = client.create_group("independent route", &[]).await.unwrap();
+    let independent_route = hex::decode(
+        app.group("alice", &hex::encode(independent_group.as_slice()))
+            .unwrap()
+            .unwrap()
+            .nostr_routing
+            .nostr_group_id_hex,
+    )
+    .unwrap();
     assert!(matches!(
         client
             .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
@@ -4034,22 +4051,40 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
         .get(&account)
         .unwrap()
         .clone();
-    route.sender.install_routes(
-        [(1, 11), (2, 22)]
-            .into_iter()
-            .map(|(group, transport_route)| TransportGroupSubscription {
-                group_id: GroupId::new(vec![group; 16]),
-                transport_group_id: vec![transport_route; 32],
-                endpoints: vec![TransportEndpoint("wss://relay.example".into())],
-            })
-            .collect(),
-    );
-    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+    route.sender.install_routes(vec![
+        TransportGroupSubscription {
+            group_id: local_group.clone(),
+            transport_group_id: local_route.clone(),
+            endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        },
+        TransportGroupSubscription {
+            group_id: independent_group.clone(),
+            transport_group_id: independent_route.clone(),
+            endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        },
+    ]);
+    let qualify_local = |mut delivery: TransportDelivery| {
+        delivery.group_id_hint = Some(local_group.clone());
+        delivery.message.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: local_route.clone(),
+        };
+        delivery
+    };
+    for index in 0..ACCOUNT_DELIVERY_BUFFER {
+        let mut delivery = qualify_local(qualified_queued_delivery(&account, 1, 11, 1));
+        if index == 2 {
+            let created_at = crate::unix_now_seconds();
+            delivery.message = crate::tests::epoch_gap_probe(
+                &hex::encode(&local_route),
+                created_at,
+                "deferred-receive-prefix",
+            )
+            .to_transport_message()
+            .unwrap();
+            delivery.received_at = cgka_traits::transport::Timestamp(created_at);
+        }
         assert!(matches!(
-            route.sender.route_delivery(
-                qualified_queued_delivery(&account, 1, 11, 1),
-                &route.overflow
-            ),
+            route.sender.route_delivery(delivery, &route.overflow),
             RouteAdmission::Accepted
         ));
     }
@@ -4057,7 +4092,7 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
         signal_generation: Some(generation),
         ..
     } = route.sender.route_delivery(
-        qualified_queued_delivery(&account, 1, 11, 2),
+        qualify_local(qualified_queued_delivery(&account, 1, 11, 2)),
         &route.overflow,
     )
     else {
@@ -4141,29 +4176,67 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
             Some(AccountDeliveryReceive::Delivery(_))
         ));
     }
+    let created_at = crate::unix_now_seconds();
+    let mut independent_delivery = qualified_queued_delivery(&account, 2, 22, 3);
+    independent_delivery.group_id_hint = Some(independent_group.clone());
+    independent_delivery.message = crate::tests::epoch_gap_probe(
+        &hex::encode(&independent_route),
+        created_at,
+        "deferred-receive-crossing",
+    )
+    .to_transport_message()
+    .unwrap();
+    independent_delivery.received_at = cgka_traits::transport::Timestamp(created_at);
     assert!(matches!(
-        route.sender.route_delivery(
-            qualified_queued_delivery(&account, 2, 22, 3),
-            &route.overflow,
-        ),
+        route
+            .sender
+            .route_delivery(independent_delivery, &route.overflow),
         RouteAdmission::Accepted
     ));
-    let Some(AccountDeliveryReceive::Delivery(independent)) =
-        client.adapter.receive_account_delivery().await.unwrap()
+    let Some((AccountDeliveryReceive::Delivery(independent), Some(crossing))) = client
+        .adapter
+        .receive_account_delivery_with_crossing()
+        .await
+        .unwrap()
     else {
         panic!("independent group must receive its alternate turn across the durable control");
     };
-    assert_eq!(independent.message.payload, [3]);
+    assert_eq!(independent.group_id_hint.as_ref(), Some(&independent_group));
+    assert_eq!(crossing.marker_token, marker_token);
+    assert!(client.adapter.crossing_still_current(crossing));
+    let independent_id = hex::encode(independent.message.id.as_slice());
+    client.ingest_received_delivery(*independent).await.unwrap();
+    assert!(
+        app.load_state("alice")
+            .unwrap()
+            .seen_events
+            .contains(&independent_id),
+        "the crossed delivery completed durable ingest before deferred selection"
+    );
     assert_eq!(
         client.adapter.queued_overflow_marker_token(),
         Some(marker_token)
     );
-    assert!(matches!(
-        client
-            .select_pending_epoch_backfill(EpochBackfillExecutionSeam::Receive)
-            .unwrap(),
-        PendingRecoverySelection::Deferred
-    ));
+    let proof = match client
+        .select_pending_epoch_backfill_with_control_proof(
+            EpochBackfillExecutionSeam::Receive,
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        PendingRecoverySelection::ControlDeferred(proof) => proof,
+        _ => panic!("exact crossed control must defer selection"),
+    };
+    assert_eq!(proof.marker_token, crossing.marker_token);
+    let mut deferred_receive =
+        crate::runtime::account_worker::DeferredControlReceive::arm_or_retain(
+            None,
+            &client,
+            Some(crossing),
+            proof,
+        );
+    assert!(deferred_receive.is_some());
     assert_eq!(storage.recovery_retry_state().unwrap(), retry);
     assert_eq!(
         storage
@@ -4176,7 +4249,53 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
             .revision,
         loss.ticket.revision
     );
-    for _ in 2..ACCOUNT_DELIVERY_BUFFER {
+    let (prefix, prefix_crossing) = client.receive_next_delivery_with_crossing().await.unwrap();
+    let AccountDeliveryReceive::Delivery(prefix) = prefix else {
+        panic!("the admitted local prefix must precede the control");
+    };
+    assert!(prefix_crossing.is_none());
+    let prefix_id = hex::encode(prefix.message.id.as_slice());
+    client.ingest_received_delivery(*prefix).await.unwrap();
+    assert!(
+        app.load_state("alice")
+            .unwrap()
+            .seen_events
+            .contains(&prefix_id)
+    );
+    let prefix_proof = match client
+        .select_pending_epoch_backfill_with_control_proof(
+            EpochBackfillExecutionSeam::Receive,
+            None,
+            None,
+        )
+        .unwrap()
+    {
+        PendingRecoverySelection::ControlDeferred(proof) => proof,
+        _ => panic!("the unchanged prefix must still defer on the same control"),
+    };
+    deferred_receive = crate::runtime::account_worker::DeferredControlReceive::arm_or_retain(
+        deferred_receive,
+        &client,
+        prefix_crossing,
+        prefix_proof,
+    );
+    assert!(
+        deferred_receive.is_some(),
+        "unchanged prefix must retain the crossed Receive"
+    );
+    let mut changed_proof = prefix_proof;
+    changed_proof.retry_attempt_serial += 1;
+    assert!(
+        crate::runtime::account_worker::DeferredControlReceive::arm_or_retain(
+            deferred_receive,
+            &client,
+            None,
+            changed_proof,
+        )
+        .is_none(),
+        "a changed owner fence cannot inherit the old crossing"
+    );
+    for _ in 3..ACCOUNT_DELIVERY_BUFFER {
         assert!(matches!(
             client.adapter.receive_account_delivery().await.unwrap(),
             Some(AccountDeliveryReceive::Delivery(_))
@@ -4191,14 +4310,18 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
         panic!("current control follows the admitted queue prefix");
     };
     assert!(control.consumed_current_control);
-    let (summary, incomplete) =
+    assert_eq!(control.generation, crossing.overflow_generation);
+    assert_eq!(control.marker_token, crossing.marker_token);
+    let (summary, incomplete, dispatched) =
         crate::runtime::account_worker::exercise_direct_overflow_receive_for_test(
             &mut client,
             &runtime,
             control,
+            deferred_receive,
         )
         .await;
     assert!(incomplete);
+    assert!(dispatched);
     assert_eq!(summary, crate::SyncSummary::default());
     assert!(
         runtime
@@ -4208,15 +4331,7 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
             .unwrap()
             .contains(&"selection_deferred")
     );
-    assert_eq!(storage.recovery_retry_state().unwrap(), retry);
-    let grant = client
-        .select_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
-        .unwrap();
-    let PendingRecoverySelection::Grant(grant) = grant else {
-        panic!("existing Maintenance seam claims the post-control QueueLoss");
-    };
-    assert_eq!(grant.plan().unwrap().len(), 1);
-    assert_eq!(grant.plan().unwrap()[0].cause, RecoveryCause::QueueLoss);
+    assert!(storage.recovery_retry_state().unwrap().attempt_serial > retry.attempt_serial);
     let final_bootstrap = storage
         .pending_recovery_demands()
         .unwrap()
@@ -4228,7 +4343,8 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
         bootstrap[0].ticket.revision
     );
     assert_eq!(final_bootstrap.eligibility, bootstrap[0].eligibility);
-    drop(grant);
+    route.sender.invalidate_routes();
+    assert!(!client.adapter.crossing_still_current(crossing));
     relay.shutdown();
 }
 

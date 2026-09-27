@@ -41,6 +41,7 @@ use crate::directory::DirectorySyncPlan;
 
 mod account_queue;
 mod directory;
+pub(crate) use account_queue::ControlCrossingReceipt;
 use account_queue::{AccountDeliveryReceiver, AccountDeliverySender, RouteAdmission, TrySendError};
 #[cfg(test)]
 pub(crate) mod publish_accounting_tests;
@@ -2801,21 +2802,35 @@ impl MarmotRelayPlaneAccountAdapter {
     pub(crate) async fn receive_account_delivery(
         &self,
     ) -> Result<Option<AccountDeliveryReceive>, TransportAdapterError> {
+        Ok(self
+            .receive_account_delivery_with_crossing()
+            .await?
+            .map(|(event, _)| event))
+    }
+
+    pub(crate) async fn receive_account_delivery_with_crossing(
+        &self,
+    ) -> Result<
+        Option<(AccountDeliveryReceive, Option<ControlCrossingReceipt>)>,
+        TransportAdapterError,
+    > {
         let event = self
             .delivery_rx
             .lock()
             .await
-            .recv(&self.delivery_overflow)
+            .recv_with_crossing(&self.delivery_overflow)
             .await;
         #[cfg(test)]
-        if let Some(AccountDeliveryEvent::Delivery(delivery)) = &event
+        if let Some((AccountDeliveryEvent::Delivery(delivery), _)) = &event
             && let Some(id) = self.relay_plane.live_path_id(delivery)
         {
             self.relay_plane
                 .record_live_path_id(id, TestLivePathStage::Dequeued);
         }
-        Ok(event.map(|event| match event {
-            AccountDeliveryEvent::Delivery(delivery) => AccountDeliveryReceive::Delivery(delivery),
+        Ok(event.map(|(event, crossing)| match event {
+            AccountDeliveryEvent::Delivery(delivery) => {
+                (AccountDeliveryReceive::Delivery(delivery), crossing)
+            }
             AccountDeliveryEvent::Overflow { generation } => {
                 // Serialize current-queue ownership with adapter replacement.
                 // The old receiver still consumes its shared loss signal, but
@@ -2834,7 +2849,7 @@ impl MarmotRelayPlaneAccountAdapter {
                     observed.consumed_current_control = false;
                     observed
                 };
-                AccountDeliveryReceive::Overflow(observed)
+                (AccountDeliveryReceive::Overflow(observed), None)
             }
         }))
     }
@@ -2895,6 +2910,20 @@ impl MarmotRelayPlaneAccountAdapter {
                     generation,
                     marker_token,
                 )
+            })
+    }
+
+    pub(crate) fn crossing_still_current(&self, receipt: ControlCrossingReceipt) -> bool {
+        account_deliveries_read(&self.relay_plane.inner.transport.account_deliveries)
+            .get(&self.account_id)
+            .filter(|route| {
+                route.sender.identity() == self.delivery_queue_id
+                    && route.sender.identity() == receipt.queue_identity
+            })
+            .is_some_and(|route| {
+                route
+                    .sender
+                    .crossing_still_current(&self.delivery_overflow, receipt)
             })
     }
 

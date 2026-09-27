@@ -1120,6 +1120,10 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         direct_timing.route_refresh_unfinished_us,
     );
     eprintln!(
+        "loss_deferred_receive_lifecycle: {:?}; fixture-owned counts freeze at the diagnostic stop and describe evaluated transitions only",
+        direct_timing.deferred_receive,
+    );
+    eprintln!(
         "loss_app_projection_boundaries: order=[account_storage_setup, transaction_call_entry_to_closure_entry, source_timeline_call, chat_list_refresh_call_inclusive, presentation_hydration_nested_in_refresh, closure_exit_to_transaction_return], completed_count_total_us_max_us={:?}, result_error_exits={:?}, closure_not_entered={}, unfinished_at_frozen_stop_us={:?}; transaction entry includes owner wait/begin, return includes commit/rollback, callbacks and owner release; neither is SQL-only, fsync-only, or an additive partition",
         direct_timing.app_projection_stages,
         direct_timing.app_projection_stage_errors,

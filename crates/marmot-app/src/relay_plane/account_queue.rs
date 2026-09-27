@@ -40,6 +40,17 @@ struct QueueState {
     alternate_turn: bool,
 }
 
+/// Scheduling evidence only: this delivery actually crossed one current
+/// durable control under the queue and overflow locks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ControlCrossingReceipt {
+    pub(crate) queue_identity: usize,
+    pub(crate) route_generation: u64,
+    pub(crate) overflow_generation: u64,
+    pub(crate) marker_token: u64,
+    pub(crate) dropped_count: u64,
+}
+
 enum QueueItem {
     Delivery {
         delivery: Box<TransportDelivery>,
@@ -156,6 +167,31 @@ impl AccountDeliverySender {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loss.pending && loss.generation == generation && loss.marker_token == marker_token
+    }
+
+    pub(super) fn crossing_still_current(
+        &self,
+        overflow: &AccountDeliveryOverflowState,
+        receipt: ControlCrossingReceipt,
+    ) -> bool {
+        let queue = self.inner.state.lock().unwrap();
+        if !queue.receiver_alive
+            || queue.routes_retired
+            || queue.route_generation != receipt.route_generation
+        {
+            return false;
+        }
+        let loss = overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loss.pending
+            && loss.generation == receipt.overflow_generation
+            && loss.marker_token == receipt.marker_token
+            && loss.dropped == receipt.dropped_count
+            && loss.marker_durable
+            && !loss.marker_closed
+            && !loss.marker_in_progress
     }
 
     /// Keep the historical consume operation for old receivers, but only a
@@ -373,26 +409,45 @@ impl AccountDeliveryReceiver {
         &mut self,
         overflow: &AccountDeliveryOverflowState,
     ) -> Option<AccountDeliveryEvent> {
-        let event = self.inner.state.lock().unwrap().pop(overflow);
+        let event = self
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .pop(overflow)
+            .map(|(event, _)| event);
         if event.is_some() {
             self.inner.space.notify_waiters();
         }
         event
     }
 
+    #[cfg(test)]
     pub(super) async fn recv(
         &mut self,
         overflow: &AccountDeliveryOverflowState,
     ) -> Option<AccountDeliveryEvent> {
+        self.recv_with_crossing(overflow)
+            .await
+            .map(|(event, _)| event)
+    }
+
+    pub(super) async fn recv_with_crossing(
+        &mut self,
+        overflow: &AccountDeliveryOverflowState,
+    ) -> Option<(AccountDeliveryEvent, Option<ControlCrossingReceipt>)> {
         loop {
             let notified = self.inner.available.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             {
                 let mut state = self.inner.state.lock().unwrap();
-                if let Some(event) = state.pop(overflow) {
+                if let Some((event, mut crossing)) = state.pop(overflow) {
+                    if let Some(receipt) = &mut crossing {
+                        receipt.queue_identity = Arc::as_ptr(&self.inner) as usize;
+                    }
                     self.inner.space.notify_waiters();
-                    return Some(event);
+                    return Some((event, crossing));
                 }
                 if state.senders == 0 {
                     return None;
@@ -498,7 +553,10 @@ impl QueueState {
             .then_some(group)
     }
 
-    fn pop(&mut self, overflow: &AccountDeliveryOverflowState) -> Option<AccountDeliveryEvent> {
+    fn pop(
+        &mut self,
+        overflow: &AccountDeliveryOverflowState,
+    ) -> Option<(AccountDeliveryEvent, Option<ControlCrossingReceipt>)> {
         let head = self.items.front()?;
         if matches!(head, QueueItem::Overflow { ready: false, .. }) {
             return None;
@@ -522,18 +580,42 @@ impl QueueState {
         let alternate = loss
             .as_ref()
             .and_then(|current| self.alternate_index(current));
+        let crossing = alternate.and_then(|index| {
+            let mut controls = self.items.iter().take(index).filter_map(|item| {
+                if let QueueItem::Overflow {
+                    generation,
+                    marker_token,
+                    ..
+                } = item
+                {
+                    Some((*generation, *marker_token))
+                } else {
+                    None
+                }
+            });
+            let (overflow_generation, marker_token) = controls.next()?;
+            controls.next().is_none().then_some(ControlCrossingReceipt {
+                queue_identity: 0,
+                route_generation: self.route_generation,
+                overflow_generation,
+                marker_token,
+                dropped_count: loss.as_ref().expect("alternate holds overflow").dropped,
+            })
+        });
         let item = self.items.remove(alternate.unwrap_or(0))?;
         drop(loss);
         self.alternate_turn = alternate.is_none() && current_group;
         match item {
-            QueueItem::Delivery { delivery, .. } => Some(AccountDeliveryEvent::Delivery(delivery)),
+            QueueItem::Delivery { delivery, .. } => {
+                Some((AccountDeliveryEvent::Delivery(delivery), crossing))
+            }
             QueueItem::Overflow {
                 generation,
                 ready: true,
                 ..
             } => {
                 self.alternate_turn = false;
-                Some(AccountDeliveryEvent::Overflow { generation })
+                Some((AccountDeliveryEvent::Overflow { generation }, None))
             }
             QueueItem::Overflow { ready: false, .. } => unreachable!(),
         }
@@ -629,6 +711,73 @@ mod tests {
             panic!("first group A omission reserves its control");
         };
         (sender, receiver, overflow, generation)
+    }
+
+    #[tokio::test]
+    async fn crossing_receipt_names_only_the_current_disjoint_control() {
+        let (sender, mut receiver, overflow, generation) = loss_queue();
+        sender
+            .try_send(AccountDeliveryEvent::Overflow { generation })
+            .unwrap();
+        let token = {
+            let mut loss = overflow.inner.lock().unwrap();
+            loss.marker_durable = true;
+            loss.marker_token
+        };
+        let (first, first_receipt) = receiver.recv_with_crossing(&overflow).await.unwrap();
+        assert!(matches!(first, AccountDeliveryEvent::Delivery(_)));
+        assert_eq!(first_receipt, None);
+        let (second, second_receipt) = receiver.recv_with_crossing(&overflow).await.unwrap();
+        assert!(matches!(second, AccountDeliveryEvent::Delivery(_)));
+        assert_eq!(second_receipt, None);
+        assert!(matches!(
+            sender.route_delivery(delivery(2, 22, 3), &overflow),
+            RouteAdmission::Accepted
+        ));
+        let (crossed, receipt) = receiver.recv_with_crossing(&overflow).await.unwrap();
+        assert!(
+            matches!(crossed, AccountDeliveryEvent::Delivery(ref delivery) if delivery.message.payload[0] == 3)
+        );
+        let receipt = receipt.expect("disjoint delivery crossed the ready durable control");
+        assert_eq!(receipt.queue_identity, sender.identity());
+        assert_eq!(receipt.overflow_generation, generation);
+        assert_eq!(receipt.marker_token, token);
+        assert!(sender.crossing_still_current(&overflow, receipt));
+        sender.invalidate_routes();
+        assert!(!sender.crossing_still_current(&overflow, receipt));
+    }
+
+    #[tokio::test]
+    async fn later_omission_invalidates_a_crossing_receipt() {
+        let (sender, mut receiver, overflow, generation) = loss_queue();
+        sender
+            .try_send(AccountDeliveryEvent::Overflow { generation })
+            .unwrap();
+        overflow.inner.lock().unwrap().marker_durable = true;
+        for _ in 0..2 {
+            assert!(matches!(
+                receiver.recv_with_crossing(&overflow).await,
+                Some((AccountDeliveryEvent::Delivery(_), None))
+            ));
+        }
+        assert!(matches!(
+            sender.route_delivery(delivery(2, 22, 3), &overflow),
+            RouteAdmission::Accepted
+        ));
+        let (_, receipt) = receiver.recv_with_crossing(&overflow).await.unwrap();
+        let receipt = receipt.unwrap();
+        assert!(sender.crossing_still_current(&overflow, receipt));
+        while sender.inner.state.lock().unwrap().items.len() < ACCOUNT_DELIVERY_BUFFER {
+            assert!(matches!(
+                sender.route_delivery(delivery(1, 11, 4), &overflow),
+                RouteAdmission::Accepted
+            ));
+        }
+        assert!(matches!(
+            sender.route_delivery(delivery(1, 11, 5), &overflow),
+            RouteAdmission::Omitted { .. }
+        ));
+        assert!(!sender.crossing_still_current(&overflow, receipt));
     }
 
     async fn wait_control_ready(sender: &AccountDeliverySender, generation: u64) {

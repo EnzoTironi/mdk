@@ -105,9 +105,81 @@ pub(crate) struct TestQueueDrainCostProbe {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TestDeferredReceiveEvent {
+    CrossingReturned,
+    Armed,
+    Retained,
+    DiscardedStaleOrJob,
+    DiscardedCommand,
+    DiscardedRevalidation,
+    DiscardedControl,
+    DiscardedReceiveError,
+    ControlCompleted,
+    DispatchAttempt,
+    DispatchJob,
+    DispatchDeferred,
+    DispatchInlineOther,
+    DispatchControlDeferred,
+    DispatchStale,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestDeferredReceiveLifecycle {
+    pub(crate) crossing_returned: u64,
+    pub(crate) armed: u64,
+    pub(crate) retained: u64,
+    pub(crate) discarded_stale_or_job: u64,
+    pub(crate) discarded_command: u64,
+    pub(crate) discarded_revalidation: u64,
+    pub(crate) discarded_control: u64,
+    pub(crate) discarded_receive_error: u64,
+    pub(crate) control_completed: u64,
+    pub(crate) dispatch_attempt: u64,
+    pub(crate) dispatch_job: u64,
+    pub(crate) dispatch_deferred: u64,
+    pub(crate) dispatch_inline_other: u64,
+    pub(crate) dispatch_control_deferred: u64,
+    pub(crate) dispatch_stale: u64,
+}
+
+#[cfg(test)]
+impl TestDeferredReceiveLifecycle {
+    fn record(&mut self, event: TestDeferredReceiveEvent) {
+        use TestDeferredReceiveEvent as Event;
+        let count = match event {
+            Event::CrossingReturned => &mut self.crossing_returned,
+            Event::Armed => &mut self.armed,
+            Event::Retained => &mut self.retained,
+            Event::DiscardedStaleOrJob => &mut self.discarded_stale_or_job,
+            Event::DiscardedCommand => &mut self.discarded_command,
+            Event::DiscardedRevalidation => &mut self.discarded_revalidation,
+            Event::DiscardedControl => &mut self.discarded_control,
+            Event::DiscardedReceiveError => &mut self.discarded_receive_error,
+            Event::ControlCompleted => &mut self.control_completed,
+            Event::DispatchAttempt => &mut self.dispatch_attempt,
+            Event::DispatchJob => &mut self.dispatch_job,
+            Event::DispatchDeferred => &mut self.dispatch_deferred,
+            Event::DispatchInlineOther => &mut self.dispatch_inline_other,
+            Event::DispatchControlDeferred => &mut self.dispatch_control_deferred,
+            Event::DispatchStale => &mut self.dispatch_stale,
+        };
+        *count += 1;
+    }
+}
+
+#[cfg(test)]
 impl TestQueueDrainCostProbe {
     pub(crate) fn active(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn deferred_receive_event(&self, event: TestDeferredReceiveEvent) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if timing.enabled {
+            timing.deferred_receive.record(event);
+        }
     }
 
     pub(crate) fn start_direct_receive_timing(&self) {
@@ -184,6 +256,7 @@ impl TestQueueDrainCostProbe {
             ),
         };
         let frozen = TestDirectReceiveTimingSnapshot {
+            deferred_receive: timing.deferred_receive,
             claim_to_ingest: timing.claim_to_ingest.snapshot(),
             ingest_to_tail: timing.ingest_to_tail.snapshot(),
             between_claims: timing.between_claims.snapshot(),
@@ -644,6 +717,7 @@ enum TestDirectReceivePhase {
 #[derive(Default)]
 struct TestDirectReceiveTiming {
     enabled: bool,
+    deferred_receive: TestDeferredReceiveLifecycle,
     next_id: u64,
     phase: TestDirectReceivePhase,
     claim_to_ingest: TestDirectTimingStage,
@@ -670,6 +744,7 @@ struct TestDirectReceiveTiming {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TestDirectReceiveTimingSnapshot {
+    pub(crate) deferred_receive: TestDeferredReceiveLifecycle,
     pub(crate) claim_to_ingest: (u64, u64, u64),
     pub(crate) ingest_to_tail: (u64, u64, u64),
     pub(crate) between_claims: (u64, u64, u64),
@@ -697,7 +772,7 @@ pub(crate) struct TestDirectReceiveTimingSnapshot {
 }
 use super::audit::EpochBackfillTerminalAudit;
 use super::epoch_stall::BackfillDecision;
-use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
+use super::recovery::{AttemptGrant, ControlDeferralProof, ExplicitRecoveryPermit};
 use crate::config::CursorPersistence;
 
 #[cfg(test)]
@@ -952,6 +1027,7 @@ pub(crate) use comparison_job::{
 pub(crate) enum PendingRecoverySelection {
     NotPending,
     Deferred,
+    ControlDeferred(ControlDeferralProof),
     Grant(Box<AttemptGrant>),
 }
 
@@ -3029,8 +3105,26 @@ impl AppClient {
     pub(crate) async fn receive_next_delivery(
         &mut self,
     ) -> Result<crate::relay_plane::AccountDeliveryReceive, AppError> {
+        self.receive_next_delivery_with_crossing()
+            .await
+            .map(|(delivery, _)| delivery)
+    }
+
+    pub(crate) async fn receive_next_delivery_with_crossing(
+        &mut self,
+    ) -> Result<
+        (
+            crate::relay_plane::AccountDeliveryReceive,
+            Option<crate::relay_plane::ControlCrossingReceipt>,
+        ),
+        AppError,
+    > {
         loop {
-            let Some(received) = self.adapter.receive_account_delivery().await? else {
+            let Some((received, crossing)) = self
+                .adapter
+                .receive_account_delivery_with_crossing()
+                .await?
+            else {
                 if let Some(loss) = self
                     .adapter
                     .unpersisted_notification_loss()
@@ -3044,8 +3138,9 @@ impl AppClient {
                 crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) => delivery,
                 crate::relay_plane::AccountDeliveryReceive::Overflow(overflow) => {
                     self.observe_delivery_overflow(overflow)?;
-                    return Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(
-                        overflow,
+                    return Ok((
+                        crate::relay_plane::AccountDeliveryReceive::Overflow(overflow),
+                        None,
                     ));
                 }
             };
@@ -3076,8 +3171,15 @@ impl AppClient {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 continue;
             }
-            return Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(
-                delivery,
+            #[cfg(test)]
+            if crossing.is_some()
+                && let Some(probe) = self.test_queue_drain_cost_probe.as_ref()
+            {
+                probe.deferred_receive_event(TestDeferredReceiveEvent::CrossingReturned);
+            }
+            return Ok((
+                crate::relay_plane::AccountDeliveryReceive::Delivery(delivery),
+                crossing,
             ));
         }
     }
@@ -5155,7 +5257,9 @@ impl AppClient {
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         match self.select_pending_epoch_backfill(seam)? {
             PendingRecoverySelection::NotPending => Ok(EpochBackfillRunOutcome::NotPending),
-            PendingRecoverySelection::Deferred => Ok(EpochBackfillRunOutcome::Deferred),
+            PendingRecoverySelection::Deferred | PendingRecoverySelection::ControlDeferred(_) => {
+                Ok(EpochBackfillRunOutcome::Deferred)
+            }
             PendingRecoverySelection::Grant(grant) => {
                 self.execute_pending_epoch_backfill_grant(*grant).await
             }
@@ -5176,6 +5280,19 @@ impl AppClient {
         seam: EpochBackfillExecutionSeam,
         consumed_control: Option<(u64, u64)>,
     ) -> Result<PendingRecoverySelection, AppError> {
+        self.select_pending_epoch_backfill_with_control_proof(seam, consumed_control, None)
+            .map(|selection| match selection {
+                PendingRecoverySelection::ControlDeferred(_) => PendingRecoverySelection::Deferred,
+                other => other,
+            })
+    }
+
+    pub(crate) fn select_pending_epoch_backfill_with_control_proof(
+        &mut self,
+        seam: EpochBackfillExecutionSeam,
+        consumed_control: Option<(u64, u64)>,
+        expected: Option<ControlDeferralProof>,
+    ) -> Result<PendingRecoverySelection, AppError> {
         self.drop_terminal_epoch_backfill_intents();
         let storage = self.app.account_storage(&self.state.label)?;
         if storage.pending_recovery_demands()?.is_empty()
@@ -5187,14 +5304,20 @@ impl AppClient {
         }
         let mut explicit = ExplicitRecoveryPermit::default();
         let permit = (seam == EpochBackfillExecutionSeam::ExplicitCatchUp).then_some(&mut explicit);
-        let Some(grant) = self.authorize_account_recovery_for_with_control_skip(
+        let mut control_deferral = None;
+        let Some(grant) = self.authorize_account_recovery_for_with_control_proof(
             permit,
             seam,
             None,
             consumed_control,
+            expected,
+            &mut control_deferral,
         )?
         else {
-            return Ok(PendingRecoverySelection::Deferred);
+            return Ok(match control_deferral {
+                Some(proof) => PendingRecoverySelection::ControlDeferred(proof),
+                None => PendingRecoverySelection::Deferred,
+            });
         };
         #[cfg(test)]
         self.record_test_recovery_selection(&grant);
@@ -8024,11 +8147,12 @@ mod tests {
     use super::{
         DrainVerdict, EpochBackfillReplayOutcome, RecoveryDrainState,
         TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS, TestAppProjectionStage,
-        TestQueueDrainCostProbe, TransportReconciliationWork, backfill_drain_verdict,
-        epoch_backfill_terminal_rows, incomplete_full_history_repair, order_reconciliation_pass,
-        reconciliation_start_after_cursor, recovery_investigation_ended,
+        TestDeferredReceiveEvent, TestQueueDrainCostProbe, TransportReconciliationWork,
+        backfill_drain_verdict, epoch_backfill_terminal_rows, incomplete_full_history_repair,
+        order_reconciliation_pass, reconciliation_start_after_cursor, recovery_investigation_ended,
         transport_reconciliation_record,
     };
+
     use crate::runtime::QueueDrainCostProbeTarget;
     use crate::tests::{
         ScriptedPushRelayClient, armed_group_ids, bounded_epoch_backfill_config,
@@ -8047,6 +8171,42 @@ mod tests {
     use transport_nostr_adapter::AccountSubscriptionEose;
     use transport_nostr_adapter::NostrRelayEvent;
     use transport_nostr_peeler::NostrTransportEvent;
+
+    #[test]
+    fn deferred_receive_probe_is_disabled_and_freezes_with_account_timing() {
+        let probe = TestQueueDrainCostProbe::default();
+        probe.deferred_receive_event(TestDeferredReceiveEvent::CrossingReturned);
+        assert_eq!(
+            probe
+                .stop_direct_receive_timing()
+                .deferred_receive
+                .crossing_returned,
+            0
+        );
+        probe.start_direct_receive_timing();
+        probe.deferred_receive_event(TestDeferredReceiveEvent::CrossingReturned);
+        probe.deferred_receive_event(TestDeferredReceiveEvent::Armed);
+        let frozen = probe.stop_direct_receive_timing();
+        assert_eq!(frozen.deferred_receive.crossing_returned, 1);
+        assert_eq!(frozen.deferred_receive.armed, 1);
+        probe.deferred_receive_event(TestDeferredReceiveEvent::DispatchAttempt);
+        assert_eq!(
+            probe.stop_direct_receive_timing().deferred_receive,
+            frozen.deferred_receive
+        );
+
+        let other_account = TestQueueDrainCostProbe::default();
+        other_account.start_direct_receive_timing();
+        other_account.deferred_receive_event(TestDeferredReceiveEvent::ControlCompleted);
+        assert_eq!(
+            other_account
+                .stop_direct_receive_timing()
+                .deferred_receive
+                .control_completed,
+            1
+        );
+        assert_eq!(frozen.deferred_receive.control_completed, 0);
+    }
 
     #[test]
     fn direct_receive_timing_is_disabled_until_the_target_account_arms_it() {

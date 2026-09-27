@@ -58,6 +58,8 @@ use transport_nostr_adapter::SubscriptionAttempt;
 
 enum ComparisonRecoveryOrigin {
     DirectOverflow,
+    /// The ordinary delivery's visibility and push tail already completed.
+    DeferredReceive,
     PeriodicMaintenance,
     PostConvergence {
         audit_tracker_update: bool,
@@ -140,7 +142,94 @@ enum PendingComparisonExecution {
         recovery: Box<OnlineEpochGapRecovery>,
         network: ComparisonNetworkJob,
     },
+    ControlDeferred(crate::client::recovery::ControlDeferralProof),
     Inline(Result<EpochBackfillRunOutcome, AppError>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DeferredControlReceive {
+    crossing: crate::relay_plane::ControlCrossingReceipt,
+    proof: crate::client::recovery::ControlDeferralProof,
+    control_completed: bool,
+}
+
+impl DeferredControlReceive {
+    fn discard_for_command(hint: &mut Option<Self>, command: &AccountWorkerCommand) {
+        if !command.readable_during_comparison_catch_up() {
+            *hint = None;
+        }
+    }
+
+    pub(crate) fn arm_or_retain(
+        existing: Option<Self>,
+        client: &AppClient,
+        crossing: Option<crate::relay_plane::ControlCrossingReceipt>,
+        proof: crate::client::recovery::ControlDeferralProof,
+    ) -> Option<Self> {
+        let Some(crossing) = crossing else {
+            return existing.filter(|pending| {
+                !pending.control_completed
+                    && pending.proof == proof
+                    && client.adapter.crossing_still_current(pending.crossing)
+            });
+        };
+        (crossing.marker_token == proof.marker_token
+            && client.adapter.crossing_still_current(crossing))
+        .then_some(Self {
+            crossing,
+            proof,
+            control_completed: false,
+        })
+    }
+
+    fn complete(
+        mut self,
+        client: &AppClient,
+        overflow: crate::relay_plane::AccountDeliveryOverflow,
+        proof: crate::client::recovery::ControlDeferralProof,
+    ) -> Option<Self> {
+        if !overflow.consumed_current_control
+            || self.proof != proof
+            || self.crossing.overflow_generation != overflow.generation
+            || self.crossing.marker_token != overflow.marker_token
+            || !client.adapter.crossing_still_current(self.crossing)
+        {
+            return None;
+        }
+        self.control_completed = true;
+        Some(self)
+    }
+}
+
+#[cfg(test)]
+fn record_deferred_receive_event(
+    client: &AppClient,
+    event: crate::client::TestDeferredReceiveEvent,
+) {
+    if let Some(probe) = client.test_queue_drain_cost_probe.as_ref() {
+        probe.deferred_receive_event(event);
+    }
+}
+
+struct DeferredDispatchReadiness<'a> {
+    force_receive_continuation: bool,
+    pending: &'a VecDeque<AccountWorkerCommand>,
+    commands: &'a mpsc::Receiver<AccountWorkerCommand>,
+    convergence_due: bool,
+    bounded_admission_due: bool,
+    other_job_active: bool,
+}
+
+impl DeferredDispatchReadiness<'_> {
+    fn allows(&self, hint: Option<&DeferredControlReceive>) -> bool {
+        hint.is_some_and(|pending| pending.control_completed)
+            && !self.force_receive_continuation
+            && self.pending.is_empty()
+            && self.commands.is_empty()
+            && !self.convergence_due
+            && !self.bounded_admission_due
+            && !self.other_job_active
+    }
 }
 
 pub(crate) struct ManagedAccountWorker {
@@ -1687,10 +1776,25 @@ async fn run_app_runtime_account_worker(
     // before yielding. Keep this outside the biased select so a ready account
     // queue cannot immediately win another Receive in the same worker poll.
     let mut handoff_after_completed_receive = false;
+    let mut deferred_control_receive: Option<DeferredControlReceive> = None;
     let mut yield_to_bounded_admission = false;
     let mut bounded_probe_at = TokioInstant::now();
     let mut bounded_prepare_error_reported = false;
     'worker: loop {
+        if comparison_recovery.is_some()
+            || online_epoch_gap.is_some()
+            || deferred_control_receive
+                .is_some_and(|pending| !client.adapter.crossing_still_current(pending.crossing))
+        {
+            #[cfg(test)]
+            if deferred_control_receive.is_some() {
+                record_deferred_receive_event(
+                    &client,
+                    crate::client::TestDeferredReceiveEvent::DiscardedStaleOrJob,
+                );
+            }
+            deferred_control_receive = None;
+        }
         // A direct-overflow result has a forced original Receive continuation;
         // let it run first, then perform the pending cooperative handoff.
         if handoff_after_completed_receive {
@@ -2087,6 +2191,7 @@ async fn run_app_runtime_account_worker(
                             &shared, &product_backlog, &mut scheduled_convergence,
                         ).await;
                     }
+                    ComparisonRecoveryOrigin::DeferredReceive => {}
                     ComparisonRecoveryOrigin::PostConvergence { audit_tracker_update } => {
                         if audit_tracker_update {
                             shared.schedule_audit_log_tracker_update("scheduled_convergence");
@@ -2185,12 +2290,7 @@ async fn run_app_runtime_account_worker(
             }
             // Alternate a command and a ready recovery quantum. A permanently
             // nonempty command channel must not starve group convergence.
-            command = async {
-                match ready_command.and_then(|index| pending.remove(index)) {
-                    Some(command) => Some((command, true)),
-                    None => commands.recv().await.map(|command| (command, false)),
-                }
-            }, if !force_receive_continuation
+            command = receive_ready_worker_command(ready_command, &mut pending, &mut commands), if !force_receive_continuation
                 && (online_epoch_gap.is_some() || !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
                 && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
@@ -2231,6 +2331,22 @@ async fn run_app_runtime_account_worker(
                             }
                             command => command,
                         };
+                        // A caller or mutation that runs between the crossed
+                        // Receive and its control owns the next scheduling
+                        // decision. Snapshot reads leave the hint intact.
+                        #[cfg(test)]
+                        let had_deferred_control_receive = deferred_control_receive.is_some();
+                        DeferredControlReceive::discard_for_command(
+                            &mut deferred_control_receive,
+                            &command,
+                        );
+                        #[cfg(test)]
+                        if had_deferred_control_receive && deferred_control_receive.is_none() {
+                            record_deferred_receive_event(
+                                &client,
+                                crate::client::TestDeferredReceiveEvent::DiscardedCommand,
+                            );
+                        }
                         let may_change_push_registration_work =
                             command.may_change_push_registration_work();
                         match command {
@@ -2429,6 +2545,7 @@ async fn run_app_runtime_account_worker(
                                                     return;
                                                 }
                                                 PendingComparisonExecution::Inline(result) => result,
+                                                PendingComparisonExecution::ControlDeferred(_) => Ok(EpochBackfillRunOutcome::Deferred),
                                             }
                                         };
                                         let _ = report_pending_epoch_backfill_result(
@@ -2536,10 +2653,17 @@ async fn run_app_runtime_account_worker(
                 if let Some(result) = completed_direct_overflow.take() {
                     (Some(result), None)
                 } else {
-                    (None, Some(client.receive_next_delivery().await))
+                    (None, Some(client.receive_next_delivery_with_crossing().await))
                 }
             }, if force_receive_continuation || online_epoch_gap.as_ref().is_none_or(|job| job.network.is_some()) => {
                 let (completed_overflow, received) = received;
+                let mut received_crossing = None;
+                let received = received.map(|result| {
+                    result.map(|(delivery, crossing)| {
+                        received_crossing = crossing;
+                        delivery
+                    })
+                });
                 #[cfg(test)]
                 let resumed_direct_overflow = completed_overflow.is_some();
                 yield_to_bounded_admission = true;
@@ -2599,18 +2723,32 @@ async fn run_app_runtime_account_worker(
                         (ingested, false)
                     }
                     Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(overflow)) => {
+                        let deferred_for_control = deferred_control_receive.take();
+                        #[cfg(test)]
+                        let had_deferred_for_control = deferred_for_control.is_some();
                         let backfill_armed = client.has_pending_epoch_backfill();
                         let observation = backfill_armed.then(|| shared.product_analytics.begin(
                             crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                         )).flatten();
-                        match execute_pending_comparison_or_inline(
+                        let selection = execute_pending_comparison_or_inline_with_proof(
                             &mut client,
                             &shared,
                             EpochBackfillExecutionSeam::Receive,
                             overflow
                                 .consumed_current_control
                                 .then_some((overflow.generation, overflow.marker_token)),
-                        ).await {
+                            None,
+                        ).await;
+                        #[cfg(test)]
+                        if had_deferred_for_control
+                            && !matches!(&selection, PendingComparisonExecution::ControlDeferred(_))
+                        {
+                            record_deferred_receive_event(
+                                &client,
+                                crate::client::TestDeferredReceiveEvent::DiscardedControl,
+                            );
+                        }
+                        match selection {
                             PendingComparisonExecution::OnlineEpochGap { recovery, network } => {
                                 online_epoch_gap = Some(OnlineEpochGapJob {
                                     recovery: Some(*recovery),
@@ -2638,6 +2776,33 @@ async fn run_app_runtime_account_worker(
                                 });
                                 receive_observation.finish_app(&Ok(SyncSummary::default()));
                                 continue 'worker;
+                            }
+                            PendingComparisonExecution::ControlDeferred(proof) => {
+                                deferred_control_receive = deferred_for_control
+                                    .and_then(|pending| pending.complete(&client, overflow, proof));
+                                #[cfg(test)]
+                                if deferred_control_receive.is_some() {
+                                    record_deferred_receive_event(
+                                        &client,
+                                        crate::client::TestDeferredReceiveEvent::ControlCompleted,
+                                    );
+                                } else if had_deferred_for_control {
+                                    record_deferred_receive_event(
+                                        &client,
+                                        crate::client::TestDeferredReceiveEvent::DiscardedControl,
+                                    );
+                                }
+                                match finish_direct_overflow_recovery(
+                                    &mut client, Ok(EpochBackfillRunOutcome::Deferred),
+                                    backfill_armed, observation,
+                                    EpochBackfillReportContext {
+                                        events: &events, account_id_hex: &account_id_hex,
+                                        account_label: &account_label, shared: &shared,
+                                    },
+                                ) {
+                                    Ok((summary, incomplete)) => (Ok(summary), incomplete),
+                                    Err(error) => (Err(error), false),
+                                }
                             }
                             PendingComparisonExecution::Inline(result) => {
                                 match finish_direct_overflow_recovery(
@@ -2730,8 +2895,9 @@ async fn run_app_runtime_account_worker(
                                 let backfill_result = if comparison_recovery.is_some() || online_epoch_gap.is_some() {
                                     PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
                                 } else {
-                                    execute_pending_comparison_or_inline(
+                                    execute_pending_comparison_or_inline_with_proof(
                                         &mut client, &shared, EpochBackfillExecutionSeam::Receive,
+                                        None,
                                         None,
                                     ).await
                                 };
@@ -2786,6 +2952,42 @@ async fn run_app_runtime_account_worker(
                                             probe.direct_receive_handoff(id);
                                         }
                                         continue 'worker;
+                                    }
+                                    PendingComparisonExecution::ControlDeferred(proof) => {
+                                        #[cfg(test)]
+                                        let had_deferred_control_receive = deferred_control_receive.is_some();
+                                        deferred_control_receive = DeferredControlReceive::arm_or_retain(
+                                            deferred_control_receive,
+                                            &client,
+                                            received_crossing,
+                                            proof,
+                                        );
+                                        #[cfg(test)]
+                                        match (had_deferred_control_receive, deferred_control_receive.is_some()) {
+                                            (false, true) => record_deferred_receive_event(
+                                                &client, crate::client::TestDeferredReceiveEvent::Armed,
+                                            ),
+                                            (true, true) => record_deferred_receive_event(
+                                                &client, crate::client::TestDeferredReceiveEvent::Retained,
+                                            ),
+                                            (true, false) => record_deferred_receive_event(
+                                                &client, crate::client::TestDeferredReceiveEvent::DiscardedRevalidation,
+                                            ),
+                                            (false, false) => {}
+                                        }
+                                        let result = Ok(EpochBackfillRunOutcome::Deferred);
+                                        let _ = report_pending_epoch_backfill_result(
+                                            &client,
+                                            result,
+                                            backfill_armed,
+                                            observation,
+                                            EpochBackfillReportContext {
+                                                events: &events,
+                                                account_id_hex: &account_id_hex,
+                                                account_label: &account_label,
+                                                shared: &shared,
+                                            },
+                                        );
                                     }
                                     PendingComparisonExecution::Inline(result) => {
                                         let _ = report_pending_epoch_backfill_result(
@@ -2845,6 +3047,14 @@ async fn run_app_runtime_account_worker(
                         }
                     }
                     Err(err) => {
+                        #[cfg(test)]
+                        if deferred_control_receive.is_some() {
+                            record_deferred_receive_event(
+                                &client,
+                                crate::client::TestDeferredReceiveEvent::DiscardedReceiveError,
+                            );
+                        }
+                        deferred_control_receive = None;
                         #[cfg(test)]
                         if let Some(probe) = &direct_probe {
                             probe.direct_receive_reset();
@@ -3161,6 +3371,83 @@ async fn run_app_runtime_account_worker(
                     }
                 };
             }
+            // A ready, completed exact-control continuation precedes a
+            // simultaneously due periodic tick. Earlier biased arms still
+            // own shutdown, commands, and due recovery work.
+            _ = async {}, if DeferredDispatchReadiness {
+                force_receive_continuation,
+                pending: &pending,
+                commands: &commands,
+                convergence_due: yield_to_convergence
+                    && scheduled_convergence.has_ready()
+                    && !scheduled_convergence_held_for_test(&account_id_hex),
+                bounded_admission_due: yield_to_bounded_admission
+                    && bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready),
+                other_job_active: comparison_recovery.is_some() || online_epoch_gap.is_some(),
+            }.allows(deferred_control_receive.as_ref()) => {
+                // One opportunity from an earlier, successfully ingested
+                // ordinary Receive. The control's original tail has run.
+                let backfill_armed = client.has_pending_epoch_backfill();
+                let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                    crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
+                )).flatten();
+                let selection = dispatch_deferred_control_receive_once(
+                    &mut deferred_control_receive,
+                    &mut client,
+                    &shared,
+                ).await;
+                match selection {
+                    PendingComparisonExecution::Offloaded { grant, subscription_attempt, network } => {
+                        comparison_recovery = Some(ComparisonRecoveryJob {
+                            grant: *grant,
+                            subscription_attempt,
+                            network,
+                            observation,
+                            backfill_armed,
+                            phase: None,
+                            origin: ComparisonRecoveryOrigin::DeferredReceive,
+                        });
+                    }
+                    PendingComparisonExecution::OnlineEpochGap { recovery, network } => {
+                        online_epoch_gap = Some(OnlineEpochGapJob {
+                            recovery: Some(*recovery),
+                            network: Some(network),
+                            queue: None,
+                            credit: None,
+                            submissions: Vec::new(),
+                            observation,
+                            backfill_armed,
+                            phase: None,
+                            origin: ComparisonRecoveryOrigin::DeferredReceive,
+                        });
+                    }
+                    PendingComparisonExecution::Inline(result) => {
+                        let _ = report_pending_epoch_backfill_result(
+                            &client, result, backfill_armed, observation,
+                            EpochBackfillReportContext {
+                                events: &events,
+                                account_id_hex: &account_id_hex,
+                                account_label: &account_label,
+                                shared: &shared,
+                            },
+                        );
+                    }
+                    PendingComparisonExecution::ControlDeferred(_) => {
+                        // A replacement or still-queued control conservatively
+                        // hands durable debt back to normal scheduling.
+                        let _ = report_pending_epoch_backfill_result(
+                            &client, Ok(EpochBackfillRunOutcome::Deferred),
+                            backfill_armed, observation,
+                            EpochBackfillReportContext {
+                                events: &events,
+                                account_id_hex: &account_id_hex,
+                                account_label: &account_label,
+                                shared: &shared,
+                            },
+                        );
+                    }
+                }
+            }
             _ = maintenance_tick.tick() => {
                 local_submission_due = true;
                 attachment_due = true;
@@ -3316,6 +3603,7 @@ async fn run_app_runtime_account_worker(
                         continue 'worker;
                     }
                     PendingComparisonExecution::Inline(result) => result,
+                    PendingComparisonExecution::ControlDeferred(_) => Ok(EpochBackfillRunOutcome::Deferred),
                 };
                 let _ = report_pending_epoch_backfill_result(
                     &client,
@@ -3359,11 +3647,88 @@ async fn run_app_runtime_account_worker(
 /// Select one existing owner grant, then move only an eligible comparison,
 /// EpochGap, or QueueLoss immutable SDK request to the shared worker job.
 /// Other frozen shapes execute inline without a replacement reservation.
+async fn dispatch_deferred_control_receive_once(
+    hint: &mut Option<DeferredControlReceive>,
+    client: &mut AppClient,
+    shared: &RuntimeSharedServices,
+) -> PendingComparisonExecution {
+    let Some(pending) = hint.take() else {
+        return PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred));
+    };
+    #[cfg(test)]
+    record_deferred_receive_event(
+        client,
+        crate::client::TestDeferredReceiveEvent::DispatchAttempt,
+    );
+    if !pending.control_completed
+        || !client.adapter.crossing_still_current(pending.crossing)
+        || client.adapter.queued_overflow_marker_token().is_some()
+    {
+        #[cfg(test)]
+        record_deferred_receive_event(
+            client,
+            crate::client::TestDeferredReceiveEvent::DispatchStale,
+        );
+        return PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred));
+    }
+    let selection = execute_pending_comparison_or_inline_with_proof(
+        client,
+        shared,
+        EpochBackfillExecutionSeam::Receive,
+        None,
+        Some(pending.proof),
+    )
+    .await;
+    #[cfg(test)]
+    record_deferred_receive_event(
+        client,
+        match &selection {
+            PendingComparisonExecution::Offloaded { .. }
+            | PendingComparisonExecution::OnlineEpochGap { .. } => {
+                crate::client::TestDeferredReceiveEvent::DispatchJob
+            }
+            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred)) => {
+                crate::client::TestDeferredReceiveEvent::DispatchDeferred
+            }
+            PendingComparisonExecution::Inline(_) => {
+                crate::client::TestDeferredReceiveEvent::DispatchInlineOther
+            }
+            PendingComparisonExecution::ControlDeferred(_) => {
+                crate::client::TestDeferredReceiveEvent::DispatchControlDeferred
+            }
+        },
+    );
+    selection
+}
+
 async fn execute_pending_comparison_or_inline(
     client: &mut AppClient,
     shared: &RuntimeSharedServices,
     seam: EpochBackfillExecutionSeam,
     consumed_control: Option<(u64, u64)>,
+) -> PendingComparisonExecution {
+    match execute_pending_comparison_or_inline_with_proof(
+        client,
+        shared,
+        seam,
+        consumed_control,
+        None,
+    )
+    .await
+    {
+        PendingComparisonExecution::ControlDeferred(_) => {
+            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
+        }
+        other => other,
+    }
+}
+
+async fn execute_pending_comparison_or_inline_with_proof(
+    client: &mut AppClient,
+    shared: &RuntimeSharedServices,
+    seam: EpochBackfillExecutionSeam,
+    consumed_control: Option<(u64, u64)>,
+    expected: Option<crate::client::recovery::ControlDeferralProof>,
 ) -> PendingComparisonExecution {
     let mut credit = bounded_recovery::try_acquire_recovery_credit(&shared.recovery_credit_pool());
     let selection = if credit.is_none()
@@ -3374,7 +3739,7 @@ async fn execute_pending_comparison_or_inline(
     {
         Ok(crate::client::PendingRecoverySelection::Deferred)
     } else {
-        client.select_pending_epoch_backfill_with_control_skip(seam, consumed_control)
+        client.select_pending_epoch_backfill_with_control_proof(seam, consumed_control, expected)
     };
     match selection {
         Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
@@ -3497,6 +3862,15 @@ async fn execute_pending_comparison_or_inline(
                 .unwrap()
                 .push("selection_deferred");
             PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
+        }
+        Ok(crate::client::PendingRecoverySelection::ControlDeferred(proof)) => {
+            #[cfg(test)]
+            shared
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .push("selection_deferred");
+            PendingComparisonExecution::ControlDeferred(proof)
         }
         Ok(crate::client::PendingRecoverySelection::NotPending) => {
             #[cfg(test)]
@@ -4491,6 +4865,17 @@ fn ready_command_index(
                     || command.readable_during_comparison_catch_up()))
             && (has_capacity || !command.needs_media_slot())
     })
+}
+
+async fn receive_ready_worker_command(
+    ready_index: Option<usize>,
+    pending: &mut VecDeque<AccountWorkerCommand>,
+    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
+) -> Option<(AccountWorkerCommand, bool)> {
+    match ready_index.and_then(|index| pending.remove(index)) {
+        Some(command) => Some((command, true)),
+        None => commands.recv().await.map(|command| (command, false)),
+    }
 }
 
 fn reserve_media_http(media_http: &MediaHttpContext) -> OwnedSemaphorePermit {
@@ -7104,6 +7489,13 @@ async fn finish_receive_after_recovery(
     audit_tracker_update: bool,
     retry_push_registration: bool,
 ) {
+    #[cfg(test)]
+    context
+        .shared
+        .comparison_test_trace
+        .lock()
+        .unwrap()
+        .push("receive_followup_tail");
     if audit_tracker_update {
         context.shared.schedule_audit_log_tracker_update("receive");
     }
@@ -7177,17 +7569,25 @@ fn finish_direct_overflow_recovery(
     }
 }
 
-/// Drive the real inline direct-overflow selection and its existing Receive
-/// continuation with a control popped from the account adapter. The test owns
-/// the adapter, so it calls these worker helpers in the same order as the
-/// steady-state Receive arm without starting a competing account worker.
+/// Drive the real control selection, original Receive tail, and optional
+/// one-shot continuation with a control popped from the account adapter.
+/// The test owns the adapter, so it uses the worker's transition and dispatch
+/// helpers without starting a competing account worker.
 #[cfg(test)]
 pub(crate) async fn exercise_direct_overflow_receive_for_test(
     client: &mut AppClient,
     runtime: &super::MarmotAppRuntime,
     overflow: crate::relay_plane::AccountDeliveryOverflow,
-) -> (SyncSummary, bool) {
+    mut deferred_receive: Option<DeferredControlReceive>,
+) -> (SyncSummary, bool, bool) {
     let shared = runtime.shared_services();
+    let tail_before = shared
+        .comparison_test_trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| **entry == "receive_followup_tail")
+        .count();
     let events = &runtime.events;
     let account_id_hex = hex::encode(client.adapter.account_id().as_slice());
     let account_label = client.state.label.clone();
@@ -7204,17 +7604,28 @@ pub(crate) async fn exercise_direct_overflow_receive_for_test(
     let receive_observation = shared
         .app_performance_telemetry()
         .observe(RuntimeOp::WorkerReceive);
-    let selection = execute_pending_comparison_or_inline(
+    let deferred_proof = deferred_receive.map(|hint| hint.proof);
+    if let Some(proof) = deferred_proof {
+        assert!(DeferredControlReceive::arm_or_retain(None, client, None, proof).is_none());
+    }
+    let selection = execute_pending_comparison_or_inline_with_proof(
         client,
         &shared,
         EpochBackfillExecutionSeam::Receive,
         overflow
             .consumed_current_control
             .then_some((overflow.generation, overflow.marker_token)),
+        None,
     )
     .await;
-    let PendingComparisonExecution::Inline(result) = selection else {
-        panic!("queued control must defer before offload");
+    let result = match selection {
+        PendingComparisonExecution::ControlDeferred(proof) => {
+            deferred_receive =
+                deferred_receive.and_then(|pending| pending.complete(client, overflow, proof));
+            Ok(EpochBackfillRunOutcome::Deferred)
+        }
+        PendingComparisonExecution::Inline(result) => result,
+        _ => panic!("queued control must defer before offload"),
     };
     assert!(matches!(result, Ok(EpochBackfillRunOutcome::Deferred)));
     let (summary, incomplete) = finish_direct_overflow_recovery(
@@ -7262,7 +7673,89 @@ pub(crate) async fn exercise_direct_overflow_receive_for_test(
         retry_push_registration,
     )
     .await;
-    (summary, incomplete)
+    let tail_after = shared
+        .comparison_test_trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| **entry == "receive_followup_tail")
+        .count();
+    assert_eq!(tail_after, tail_before + 1);
+    if let Some(proof) = deferred_proof {
+        assert_eq!(
+            client
+                .app
+                .account_storage(&client.state.label)
+                .unwrap()
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            proof.retry_attempt_serial,
+            "the exact control and its original tail do not reserve recovery"
+        );
+    }
+    let dispatched = if deferred_receive.is_some() {
+        let selection =
+            dispatch_deferred_control_receive_once(&mut deferred_receive, client, &shared).await;
+        let PendingComparisonExecution::OnlineEpochGap { recovery, network } = selection else {
+            panic!("completed exact control must reserve the online QueueLoss grant");
+        };
+        assert_eq!(recovery.grant().plan().unwrap().len(), 1);
+        assert_eq!(
+            recovery.grant().plan().unwrap()[0].cause,
+            storage_sqlite::RecoveryCause::QueueLoss
+        );
+        network.abort_and_wait().await;
+        let job = OnlineEpochGapJob {
+            recovery: Some(*recovery),
+            network: None,
+            queue: None,
+            credit: None,
+            submissions: Vec::new(),
+            observation: None,
+            backfill_armed,
+            phase: None,
+            origin: ComparisonRecoveryOrigin::DeferredReceive,
+        };
+        assert!(
+            finish_online_recovery(
+                client,
+                job,
+                Ok(EpochBackfillRunOutcome::Deferred),
+                ReceiveTailContext {
+                    events,
+                    account_id_hex: &account_id_hex,
+                    account_label: &account_label,
+                    shared: &shared,
+                    scheduled_push_retry: &mut scheduled_push_retry,
+                    command_tx: &command_tx,
+                },
+                &shared.product_analytics.backlog_source(),
+                &mut scheduled_convergence,
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(
+            shared
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| **entry == "receive_followup_tail")
+                .count(),
+            tail_after,
+            "the deferred completion must not replay the ordinary Receive tail"
+        );
+        assert!(matches!(
+            dispatch_deferred_control_receive_once(&mut deferred_receive, client, &shared).await,
+            PendingComparisonExecution::Inline(Ok(EpochBackfillRunOutcome::Deferred))
+        ));
+        true
+    } else {
+        false
+    };
+    (summary, incomplete, dispatched)
 }
 
 async fn finish_online_recovery(
@@ -7339,6 +7832,7 @@ async fn finish_online_recovery(
                     )
                     .await;
                 }
+                ComparisonRecoveryOrigin::DeferredReceive => {}
                 ComparisonRecoveryOrigin::DirectOverflow => unreachable!(),
             }
         }
@@ -7975,6 +8469,147 @@ mod tests {
             !pending,
             "the completed Receive hands control to Tokio once"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_receive_waits_for_commands_and_due_recovery_work() {
+        let proof = crate::client::recovery::ControlDeferralProof {
+            marker_token: 7,
+            demand_id: [1; 16],
+            demand_revision: 1,
+            loss_revision: 1,
+            route_revision: 1,
+            inventory_revision: 1,
+            retry_attempt_serial: 0,
+        };
+        let hint = DeferredControlReceive {
+            crossing: crate::relay_plane::ControlCrossingReceipt {
+                queue_identity: 1,
+                route_generation: 1,
+                overflow_generation: 1,
+                marker_token: 7,
+                dropped_count: 1,
+            },
+            proof,
+            control_completed: true,
+        };
+        let (tx, mut commands) = mpsc::channel(2);
+        let mut pending = VecDeque::new();
+        let (media_http_tx, _) = mpsc::unbounded_channel();
+        let (worker_lifetime, _) = watch::channel(());
+        let media_http = MediaHttpContext {
+            product: Default::default(),
+            tx: media_http_tx,
+            permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+            prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+            worker_lifetime,
+        };
+        let ready = |pending: &VecDeque<AccountWorkerCommand>,
+                     commands: &mpsc::Receiver<AccountWorkerCommand>,
+                     convergence_due,
+                     bounded_admission_due| {
+            DeferredDispatchReadiness {
+                force_receive_continuation: false,
+                pending,
+                commands,
+                convergence_due,
+                bounded_admission_due,
+                other_job_active: false,
+            }
+            .allows(Some(&hint))
+        };
+        assert!(ready(&pending, &commands, false, false));
+        let mut readiness = DeferredDispatchReadiness {
+            force_receive_continuation: false,
+            pending: &pending,
+            commands: &commands,
+            convergence_due: false,
+            bounded_admission_due: false,
+            other_job_active: false,
+        };
+        assert!(
+            !readiness.allows(None),
+            "an absent hint leaves maintenance runnable"
+        );
+        readiness.force_receive_continuation = true;
+        assert!(
+            !readiness.allows(Some(&hint)),
+            "the original control tail keeps priority"
+        );
+        readiness.force_receive_continuation = false;
+        readiness.other_job_active = true;
+        assert!(
+            !readiness.allows(Some(&hint)),
+            "an active owner job blocks continuation"
+        );
+        let mut retained = Some(hint);
+        let (respond, _) = oneshot::channel();
+        DeferredControlReceive::discard_for_command(
+            &mut retained,
+            &AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: GroupId::new(vec![8; 16]),
+                respond,
+            },
+        );
+        assert!(
+            retained.is_some(),
+            "a snapshot read preserves the exact hint"
+        );
+        let (respond, _) = oneshot::channel();
+        tx.try_send(AccountWorkerCommand::RepairFullHistory { respond })
+            .unwrap();
+        assert!(!ready(&pending, &commands, false, false));
+        let (command, approved_pending) = receive_ready_worker_command(
+            ready_command_index(&pending, &media_http, false, false),
+            &mut pending,
+            &mut commands,
+        )
+        .await
+        .unwrap();
+        assert!(!approved_pending);
+        assert!(matches!(
+            command,
+            AccountWorkerCommand::RepairFullHistory { .. }
+        ));
+        DeferredControlReceive::discard_for_command(&mut retained, &command);
+        assert!(retained.is_none(), "a caller invalidates the old hint");
+        let (respond, _) = oneshot::channel();
+        pending.push_back(AccountWorkerCommand::CatchUp { respond });
+        assert!(!ready(&pending, &commands, false, false));
+        let mut retained = Some(hint);
+        let (command, approved_pending) = receive_ready_worker_command(
+            ready_command_index(&pending, &media_http, false, false),
+            &mut pending,
+            &mut commands,
+        )
+        .await
+        .unwrap();
+        assert!(approved_pending);
+        assert!(matches!(command, AccountWorkerCommand::CatchUp { .. }));
+        DeferredControlReceive::discard_for_command(&mut retained, &command);
+        assert!(
+            retained.is_none(),
+            "queued CatchUp invalidates the old hint"
+        );
+        let mut retained = Some(hint);
+        let (respond, _) = oneshot::channel();
+        DeferredControlReceive::discard_for_command(
+            &mut retained,
+            &AccountWorkerCommand::RetryGroupConvergence {
+                group_id: GroupId::new(vec![8; 16]),
+                respond,
+            },
+        );
+        assert!(retained.is_none(), "a mutation invalidates the old hint");
+
+        let mut convergence = ScheduledConvergence::new(Duration::from_millis(1));
+        convergence.schedule_groups([GroupId::new(vec![9; 16])]);
+        tokio::time::advance(Duration::from_millis(20)).await;
+        assert!(convergence.has_ready());
+        assert!(!ready(&pending, &commands, convergence.has_ready(), false));
+        assert!(convergence.take_ready().is_some());
+        assert!(!ready(&pending, &commands, false, true));
+        assert!(ready(&pending, &commands, false, false));
     }
 
     #[tokio::test]
