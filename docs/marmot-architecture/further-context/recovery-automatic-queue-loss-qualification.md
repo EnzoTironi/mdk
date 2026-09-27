@@ -393,9 +393,9 @@ arms; it is not a pure scheduler or CPU measure. Errors, reconnect, teardown,
 injected discard, background handoff, and joined-group tails are excluded or
 invalidated explicitly.
 
-At head `05fa4924`, two stimulated Receive cases and two nonstimulated cases
-requiring Maintenance each failed strict active acquisition on both x86_64
-attempts at the same assertion. All four had a healthy live delivery accepted,
+At head `05fa4924`, the stimulated Receive fixture and the nonstimulated
+Maintenance-required fixture each failed strict active acquisition on its
+first x86_64 attempt and configured retry: four failures total. All four had a healthy live delivery accepted,
 dequeued, ingested, and observed by Alice; both Receive wakes were ingested.
 The owner deferred 723–786 selections per run, selected no grant during the
 hold, and later made useful target/epoch/plaintext progress under a later
@@ -415,13 +415,30 @@ outside runtime ingest is 27.02–27.91 seconds; it does not identify a storage
 or projection suboperation. Runtime-wide transaction totals contain nested
 work and cannot be subtracted as an exclusive partition.
 
-One further test-only Alice measurement now times the existing app-level
-secure-prune call made during direct message projection. It reports completed
-count/total/max, error exits, and any call straddling the frozen stop. The
-elapsed call includes account/classifier setup and storage work; it does not
-isolate SQL transaction time. A completed child can also belong to a parent
-later excluded or unfinished, so aggregate subtraction requires matching
-counts and boundaries. The per-message prune's no-expiry path remains a
-candidate for investigation, not an approved production optimization. New-head
-x86_64 evidence for that single call is pending. The PR remains draft without
-merge, device qualification, default activation, or release.
+At head `15b9e444`, the same two fixtures again failed strict active
+acquisition on their first x86_64 attempts and configured retries: four more
+failures, bringing the record to 72 across 18 heads. Each run retained healthy
+live accepted/dequeued/ingested/plaintext evidence and later useful
+target/epoch/plaintext progress, while leaving queue debt pending. The owner
+selected no grant during the hold and deferred 710–742 selections per run;
+both Receive wakes were accepted, dequeued, and ingested. The separate
+`05fa4924` epoch-gap first-fail/retry-pass cause remains unresolved;
+`15b9e444` passing on its first attempt does not establish a fix.
+
+The test-only Alice secure-prune measurement at `15b9e444` completed for
+710–742 matching direct messages per run, without error or unfinished calls.
+Its inclusive elapsed total was 0.282–0.302 seconds, about 0.65–0.70% of the
+matching 43.37–43.52-second completed claim-to-ingest parent total. This does
+not support a production no-expiry fast path as the dominant cost.
+
+The next test-only Alice measurement times the existing
+`record_account_app_event_at` call during direct received-message projection.
+Its inclusive elapsed time covers account/storage setup, atomic raw-event,
+timeline, and chat-list work, and hydration of the returned update; it is not
+SQL-only time, a commit count, or CPU time. It reports completed count/total/max,
+result error exits, and any call unfinished at the frozen stop. A completed
+child can belong to a parent later excluded or unfinished, so comparisons
+require matched counts and boundaries and these aggregates are not an additive
+partition. The probe does not claim to count panics. New-head x86_64 evidence
+for this call is pending. The PR remains draft without merge, device
+qualification, default activation, or release.
