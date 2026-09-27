@@ -204,6 +204,36 @@ establish that the candidate fence fixes the x86_64 backlog or live-response
 failures. The 44 failed x86_64 attempts and open CI blocker remain unresolved;
 this PR remains draft.
 
+Exact `2829401da` CI added four failed x86_64 attempts, reaching 48 across
+12 heads. Rust jobs 1–3 passed; both tries in job 4's Receive fixture and job
+5's unstimulated fixture missed the held target-acquisition gate at 45 seconds.
+The Receive tries still had 318 and 353 ordinary deliveries queued, so the
+zero-queue ordinary Receive stimulus was not sent. The target was eventually
+returned and queued after later grants, while the loss marker remained pending;
+that useful progress does not satisfy the fixture's same-grant active-acquisition
+or healthy-live-observation proof. Some route attempts timed out during NEG;
+others returned bounded event prefixes without reaching the held target.
+Runtime-wide ingest and storage transaction timings are nested, shared across
+accounts, and do not assign the backlog to directory work. Queue-depth change
+does not count novel successful ingests when arrivals and replays continue.
+
+This diagnostic change extends only the fixture-armed, Alice-owned test
+cost probe to time directory enrichment in this path. The inclusive
+`display_names` span covers `display_names_for_account_ids`, excluding sender
+extraction and its later warning/fallback; the inclusive `remember_sender`
+span covers `remember_directory_message_sender`. Nested stages time existing
+account catalog enumeration, cached-handle acquisition, profile/entry queries,
+hydration and merge/equality work, and actual write attempts. The `queries`
+count is measured query operations, including a cache-entry scan that can
+perform multiple cache reads; it is not a SQL statement count. Write attempts
+are not confirmed writes. Ordinary error returns are counted, panics are not.
+Parent and nested durations are inclusive and cannot be added to partition
+wall time. No extra storage read, task, await, production cache, or policy
+change is part of this diagnostic. Local default and test-policy-overrides
+attribution, directory freshness, and sender tests pass; new-head x86_64 CI
+has not yet run. A production directory optimization remains unproven, and
+the draft PR's recovery blocker remains open.
+
 This is a focused local outcome, not proof for every account route shape,
 continuous traffic, relays without comparison support, process restart, or
 device delivery. The SDK's per-route negotiation and acquisition deadlines,

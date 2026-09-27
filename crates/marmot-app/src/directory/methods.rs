@@ -51,12 +51,73 @@ use crate::{
     blocking_app_task, push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
 };
 
+#[derive(Clone, Copy)]
+enum DirectoryCostStage {
+    Catalog,
+    Handles,
+    Queries,
+    Merge,
+    WriteAttempts,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DirectoryCost<'a> {
+    #[cfg(test)]
+    probe: Option<&'a crate::client::TestQueueDrainCostProbe>,
+    #[cfg(not(test))]
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+impl DirectoryCost<'_> {
+    fn time<T>(self, stage: DirectoryCostStage, work: impl FnOnce() -> T) -> T {
+        #[cfg(test)]
+        let started = self.probe.map(|_| std::time::Instant::now());
+        #[cfg(not(test))]
+        let _ = stage;
+        let result = work();
+        #[cfg(test)]
+        if let (Some(probe), Some(started)) = (self.probe, started) {
+            let counter = match stage {
+                DirectoryCostStage::Catalog => &probe.directory_catalog,
+                DirectoryCostStage::Handles => &probe.directory_handles,
+                DirectoryCostStage::Queries => &probe.directory_queries,
+                DirectoryCostStage::Merge => &probe.directory_merge,
+                DirectoryCostStage::WriteAttempts => &probe.directory_write_attempts,
+            };
+            counter.record(started.elapsed());
+        }
+        result
+    }
+}
+
 impl MarmotApp {
     /// Resolve batched profile names with first-cache precedence, then local labels.
     /// Shared profiles replace cached profiles only when strictly newer.
     pub(crate) fn display_names_for_account_ids(
         &self,
         account_id_hexes: &[String],
+    ) -> Result<HashMap<String, String>, AppError> {
+        self.display_names_for_account_ids_costed(account_id_hexes, DirectoryCost::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn display_names_for_account_ids_observed(
+        &self,
+        account_id_hexes: &[String],
+        probe: &crate::client::TestQueueDrainCostProbe,
+    ) -> Result<HashMap<String, String>, AppError> {
+        self.display_names_for_account_ids_costed(
+            account_id_hexes,
+            DirectoryCost {
+                probe: probe.active().then_some(probe),
+            },
+        )
+    }
+
+    fn display_names_for_account_ids_costed(
+        &self,
+        account_id_hexes: &[String],
+        cost: DirectoryCost<'_>,
     ) -> Result<HashMap<String, String>, AppError> {
         let mut account_ids = account_id_hexes
             .iter()
@@ -68,33 +129,41 @@ impl MarmotApp {
             return Ok(HashMap::new());
         }
 
-        let caches = self.directory_caches()?;
-        let shared_storage = self.shared_storage()?;
-        let local_accounts = self.local_accounts_by_id()?;
+        let caches = self.directory_caches_costed(cost)?;
+        let shared_storage = cost.time(DirectoryCostStage::Handles, || self.shared_storage())?;
+        let local_accounts = self.local_accounts_by_id_costed(cost)?;
         let mut profiles = HashMap::<String, Option<UserProfileMetadata>>::new();
         let mut missing = account_ids.clone();
         for cache in caches {
-            profiles.extend(cache.profiles_for_ids(&missing)?);
+            profiles.extend(cost.time(DirectoryCostStage::Queries, || {
+                cache.profiles_for_ids(&missing)
+            })?);
             // The first cache row wins even when it contains no profile.
             missing.retain(|id| !profiles.contains_key(id));
             if missing.is_empty() {
                 break;
             }
         }
-        for record in shared_storage.directory_profiles_for_ids(&account_ids)? {
-            let Some(json) = record.profile_json else {
-                continue;
-            };
-            let candidate: UserProfileMetadata = serde_json::from_str(&json)?;
-            let profile = profiles.entry(record.account_id_hex).or_default();
-            // Match select_newer_directory_entry: account-cache ties win.
-            if profile
-                .as_ref()
-                .is_none_or(|current| candidate.created_at > current.created_at)
-            {
-                *profile = Some(candidate);
+        let shared_profiles = cost.time(DirectoryCostStage::Queries, || {
+            shared_storage.directory_profiles_for_ids(&account_ids)
+        })?;
+        cost.time(DirectoryCostStage::Merge, || -> Result<(), AppError> {
+            for record in shared_profiles {
+                let Some(json) = record.profile_json else {
+                    continue;
+                };
+                let candidate: UserProfileMetadata = serde_json::from_str(&json)?;
+                let profile = profiles.entry(record.account_id_hex).or_default();
+                // Match select_newer_directory_entry: account-cache ties win.
+                if profile
+                    .as_ref()
+                    .is_none_or(|current| candidate.created_at > current.created_at)
+                {
+                    *profile = Some(candidate);
+                }
             }
-        }
+            Ok(())
+        })?;
         let mut names = HashMap::new();
 
         for account_id in account_ids {
@@ -115,8 +184,17 @@ impl MarmotApp {
     pub(crate) fn local_accounts_by_id(
         &self,
     ) -> Result<HashMap<String, LocalAccountNames>, AppError> {
+        self.local_accounts_by_id_costed(DirectoryCost::default())
+    }
+
+    fn local_accounts_by_id_costed(
+        &self,
+        cost: DirectoryCost<'_>,
+    ) -> Result<HashMap<String, LocalAccountNames>, AppError> {
         let mut local = HashMap::new();
-        for account in self.account_home().accounts()? {
+        for account in cost.time(DirectoryCostStage::Catalog, || {
+            self.account_home().accounts()
+        })? {
             // Preserve first-record directory links and last-label display fallback for aliases.
             local
                 .entry(account.account_id_hex)
@@ -657,15 +735,24 @@ impl MarmotApp {
         &self,
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
+        self.directory_entry_for_account_id_costed(account_id_hex, DirectoryCost::default())
+    }
+
+    fn directory_entry_for_account_id_costed(
+        &self,
+        account_id_hex: &str,
+        cost: DirectoryCost<'_>,
+    ) -> Result<Option<UserDirectoryRecord>, AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
-        let caches = self.directory_caches()?;
-        let shared_storage = self.shared_storage()?;
-        let local_accounts = self.local_accounts_by_id()?;
-        self.directory_entry_for_account_id_with_handles(
+        let caches = self.directory_caches_costed(cost)?;
+        let shared_storage = cost.time(DirectoryCostStage::Handles, || self.shared_storage())?;
+        let local_accounts = self.local_accounts_by_id_costed(cost)?;
+        self.directory_entry_for_account_id_with_handles_costed(
             &account_id_hex,
             &caches,
             &shared_storage,
             &local_accounts,
+            cost,
         )
     }
 
@@ -1308,19 +1395,47 @@ impl MarmotApp {
         shared_storage: &SqliteSharedStorage,
         local_accounts: &HashMap<String, LocalAccountNames>,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
-        let cached_entry = Self::directory_entry_from_caches(caches, account_id_hex)?
-            .map(|entry| Self::hydrate_directory_record(entry, local_accounts))
-            .transpose()?;
-        let shared_entry = shared_storage
-            .public_directory_user(account_id_hex)?
-            .map(|record| {
-                Self::hydrate_directory_record(
-                    user_directory_record_from_public(record)?,
-                    local_accounts,
-                )
-            })
-            .transpose()?;
-        Ok(select_newer_directory_entry(cached_entry, shared_entry))
+        self.directory_entry_for_account_id_with_handles_costed(
+            account_id_hex,
+            caches,
+            shared_storage,
+            local_accounts,
+            DirectoryCost::default(),
+        )
+    }
+
+    fn directory_entry_for_account_id_with_handles_costed(
+        &self,
+        account_id_hex: &str,
+        caches: &[DirectoryCache],
+        shared_storage: &SqliteSharedStorage,
+        local_accounts: &HashMap<String, LocalAccountNames>,
+        cost: DirectoryCost<'_>,
+    ) -> Result<Option<UserDirectoryRecord>, AppError> {
+        let cached = cost.time(DirectoryCostStage::Queries, || {
+            Self::directory_entry_from_caches(caches, account_id_hex)
+        })?;
+        let cached_entry = cost.time(DirectoryCostStage::Merge, || {
+            cached
+                .map(|entry| Self::hydrate_directory_record(entry, local_accounts))
+                .transpose()
+        })?;
+        let shared = cost.time(DirectoryCostStage::Queries, || {
+            shared_storage.public_directory_user(account_id_hex)
+        })?;
+        let shared_entry = cost.time(DirectoryCostStage::Merge, || {
+            shared
+                .map(|record| {
+                    Self::hydrate_directory_record(
+                        user_directory_record_from_public(record)?,
+                        local_accounts,
+                    )
+                })
+                .transpose()
+        })?;
+        Ok(cost.time(DirectoryCostStage::Merge, || {
+            select_newer_directory_entry(cached_entry, shared_entry)
+        }))
     }
 
     fn directory_entry_from_caches(
@@ -1390,11 +1505,24 @@ impl MarmotApp {
         account_id_hex: &str,
         reason: &str,
     ) -> Result<(), AppError> {
+        self.remember_directory_user_with_reason_costed(
+            account_id_hex,
+            reason,
+            DirectoryCost::default(),
+        )
+    }
+
+    fn remember_directory_user_with_reason_costed(
+        &self,
+        account_id_hex: &str,
+        reason: &str,
+        cost: DirectoryCost<'_>,
+    ) -> Result<(), AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let entry = self
-            .directory_entry_for_account_id(&account_id_hex)?
+            .directory_entry_for_account_id_costed(&account_id_hex, cost)?
             .unwrap_or_else(|| self.empty_directory_record(&account_id_hex));
-        self.save_directory_entry_with_reason(&entry, reason)
+        self.save_directory_entry_with_reason_costed(&entry, reason, cost)
     }
 
     pub(crate) fn remember_directory_message_sender(
@@ -1402,6 +1530,21 @@ impl MarmotApp {
         message: &ReceivedMessage,
     ) -> Result<(), AppError> {
         self.remember_directory_user_with_reason(&message.sender, "message")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remember_directory_message_sender_observed(
+        &self,
+        message: &ReceivedMessage,
+        probe: &crate::client::TestQueueDrainCostProbe,
+    ) -> Result<(), AppError> {
+        self.remember_directory_user_with_reason_costed(
+            &message.sender,
+            "message",
+            DirectoryCost {
+                probe: probe.active().then_some(probe),
+            },
+        )
     }
 
     fn remember_directory_follow_list(
@@ -1581,31 +1724,57 @@ impl MarmotApp {
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), AppError> {
-        let local_accounts = self.local_accounts_by_id()?;
-        let proposed_entry = Self::hydrate_directory_record(entry.clone(), &local_accounts)?;
-        let shared_storage = self.shared_storage()?;
-        let shared_record = shared_storage.public_directory_user(&proposed_entry.account_id_hex)?;
-        let shared_entry = shared_record
-            .clone()
-            .map(|record| {
-                Self::hydrate_directory_record(
-                    user_directory_record_from_public(record)?,
-                    &local_accounts,
-                )
-            })
-            .transpose()?;
-        let entry = select_newer_directory_entry(Some(proposed_entry), shared_entry.clone())
-            .expect("proposed directory entry should be present");
-        let caches = self.directory_caches()?;
-        let public_entry = public_directory_user_record(&entry)?;
-        let shared_entry_matches = shared_record.as_ref() == Some(&public_entry);
+        self.save_directory_entry_with_reason_costed(entry, reason, DirectoryCost::default())
+    }
+
+    fn save_directory_entry_with_reason_costed(
+        &self,
+        entry: &UserDirectoryRecord,
+        reason: &str,
+        cost: DirectoryCost<'_>,
+    ) -> Result<(), AppError> {
+        let local_accounts = self.local_accounts_by_id_costed(cost)?;
+        let proposed_entry = cost.time(DirectoryCostStage::Merge, || {
+            Self::hydrate_directory_record(entry.clone(), &local_accounts)
+        })?;
+        let shared_storage = cost.time(DirectoryCostStage::Handles, || self.shared_storage())?;
+        let shared_record = cost.time(DirectoryCostStage::Queries, || {
+            shared_storage.public_directory_user(&proposed_entry.account_id_hex)
+        })?;
+        let shared_entry = cost.time(DirectoryCostStage::Merge, || {
+            shared_record
+                .clone()
+                .map(|record| {
+                    Self::hydrate_directory_record(
+                        user_directory_record_from_public(record)?,
+                        &local_accounts,
+                    )
+                })
+                .transpose()
+        })?;
+        let entry = cost.time(DirectoryCostStage::Merge, || {
+            select_newer_directory_entry(Some(proposed_entry), shared_entry.clone())
+                .expect("proposed directory entry should be present")
+        });
+        let caches = self.directory_caches_costed(cost)?;
+        let (public_entry, shared_entry_matches) = cost.time(DirectoryCostStage::Merge, || {
+            let public_entry = public_directory_user_record(&entry)?;
+            let shared_entry_matches = shared_record.as_ref() == Some(&public_entry);
+            Ok::<_, AppError>((public_entry, shared_entry_matches))
+        })?;
         let mut caches_match = true;
         for cache in &caches {
-            let cached_entry = cache
-                .entry(&entry.account_id_hex)?
-                .map(|record| Self::hydrate_directory_record(record, &local_accounts))
-                .transpose()?;
-            if cached_entry.as_ref() != Some(&entry) {
+            let cached = cost.time(DirectoryCostStage::Queries, || {
+                cache.entry(&entry.account_id_hex)
+            })?;
+            let cached_entry = cost.time(DirectoryCostStage::Merge, || {
+                cached
+                    .map(|record| Self::hydrate_directory_record(record, &local_accounts))
+                    .transpose()
+            })?;
+            if cost.time(DirectoryCostStage::Merge, || {
+                cached_entry.as_ref() != Some(&entry)
+            }) {
                 caches_match = false;
                 break;
             }
@@ -1619,14 +1788,18 @@ impl MarmotApp {
             // activity log.
             return Ok(());
         }
-        shared_storage.put_public_directory_user(&public_entry)?;
+        cost.time(DirectoryCostStage::WriteAttempts, || {
+            shared_storage.put_public_directory_user(&public_entry)
+        })?;
         let _ = self
             .presentation_signals
             .profile_updates
             .send(entry.account_id_hex.clone());
         self.presentation_signals.wake();
         for cache in caches {
-            cache.put_with_reason(&entry, reason)?;
+            cost.time(DirectoryCostStage::WriteAttempts, || {
+                cache.put_with_reason(&entry, reason)
+            })?;
         }
         self.request_directory_sync_rebuild();
         Ok(())
@@ -1725,12 +1898,20 @@ impl MarmotApp {
     }
 
     pub(crate) fn directory_caches(&self) -> Result<Vec<DirectoryCache>, AppError> {
+        self.directory_caches_costed(DirectoryCost::default())
+    }
+
+    fn directory_caches_costed(
+        &self,
+        cost: DirectoryCost<'_>,
+    ) -> Result<Vec<DirectoryCache>, AppError> {
         #[cfg(test)]
         self.directory_handle_acquire_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let accounts = self
-            .account_home()
-            .accounts()?
+        let accounts = cost
+            .time(DirectoryCostStage::Catalog, || {
+                self.account_home().accounts()
+            })?
             .into_iter()
             .filter(|account| account.is_active_signing())
             .collect::<Vec<_>>();
@@ -1738,7 +1919,9 @@ impl MarmotApp {
 
         let mut caches = Vec::with_capacity(accounts.len());
         for account in accounts {
-            caches.push(self.directory_cache_for_account(&account)?);
+            caches.push(cost.time(DirectoryCostStage::Handles, || {
+                self.directory_cache_for_account(&account)
+            })?);
         }
 
         self.migrate_legacy_directory_cache_once(&caches)?;
@@ -1884,6 +2067,94 @@ impl MarmotApp {
                 label: account.label,
                 local_signing: account.local_signing,
             })
+    }
+}
+
+#[cfg(test)]
+mod cost_probe_tests {
+    use super::*;
+    use crate::client::TestQueueDrainCostProbe;
+    use cgka_traits::GroupId;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn directory_cost_probe_is_scoped_and_records_error_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = marmot_account::AccountHome::open(dir.path());
+        let alice = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let probe = TestQueueDrainCostProbe::default();
+        let alice_id = vec![alice.account_id_hex];
+
+        app.display_names_for_account_ids_observed(&alice_id, &probe)
+            .unwrap();
+        assert_eq!(probe.directory_catalog.snapshot().0, 0);
+
+        probe.enabled.store(true, Ordering::SeqCst);
+        let names = probe
+            .display_names
+            .time(|| app.display_names_for_account_ids_observed(&alice_id, &probe));
+        assert_eq!(
+            names.unwrap().values().next().map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(probe.display_names.snapshot().0, 1);
+        assert!(probe.directory_catalog.snapshot().0 > 0);
+        assert!(probe.directory_handles.snapshot().0 > 0);
+        assert!(probe.directory_queries.snapshot().0 > 0);
+
+        let sender = format!("{:064x}", 42);
+        let message = ReceivedMessage {
+            authority: None,
+            message_id_hex: "message-id".to_owned(),
+            source_message_id_hex: "source-message-id".to_owned(),
+            sender,
+            sender_display_name: None,
+            group_id: GroupId::new(vec![1]),
+            source_epoch: 0,
+            retention: None,
+            plaintext: "hello".to_owned(),
+            kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            recorded_at: 0,
+            received_at: 0,
+        };
+        probe
+            .remember_sender
+            .time(|| app.remember_directory_message_sender_observed(&message, &probe))
+            .unwrap();
+        let writes_after_first = probe.directory_write_attempts.snapshot().0;
+        assert!(writes_after_first > 0);
+        probe
+            .remember_sender
+            .time(|| app.remember_directory_message_sender_observed(&message, &probe))
+            .unwrap();
+        assert_eq!(
+            probe.directory_write_attempts.snapshot().0,
+            writes_after_first
+        );
+        assert_eq!(probe.remember_sender.snapshot().0, 2);
+        assert!(probe.directory_merge.snapshot().0 > 0);
+
+        let catalog_before = probe.directory_catalog.snapshot().0;
+        app.display_names_for_account_ids(&alice_id).unwrap();
+        app.remember_directory_message_sender(&message).unwrap();
+        assert_eq!(probe.directory_catalog.snapshot().0, catalog_before);
+
+        let invalid = probe
+            .display_names
+            .time(|| app.display_names_for_account_ids_observed(&["invalid".to_owned()], &probe));
+        assert!(invalid.is_err());
+        assert_eq!(probe.display_names.snapshot().0, 2);
+
+        app.close_storage().unwrap();
+        let handles_before = probe.directory_handles.snapshot().0;
+        let closed = probe
+            .display_names
+            .time(|| app.display_names_for_account_ids_observed(&alice_id, &probe));
+        assert!(closed.is_err());
+        assert!(probe.directory_handles.snapshot().0 > handles_before);
+        assert_eq!(probe.display_names.snapshot().0, 3);
     }
 }
 

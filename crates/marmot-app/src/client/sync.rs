@@ -53,6 +53,13 @@ pub(crate) struct TestCostStage {
 
 #[cfg(test)]
 impl TestCostStage {
+    pub(crate) fn time<T>(&self, work: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let result = work();
+        self.record(started.elapsed());
+        result
+    }
+
     pub(crate) fn record(&self, elapsed: std::time::Duration) {
         let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -60,7 +67,6 @@ impl TestCostStage {
         self.max_us.fetch_max(us, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "test-policy-overrides")]
     pub(crate) fn snapshot(&self) -> (u64, u64, u64) {
         (
             self.count.load(Ordering::Relaxed),
@@ -79,6 +85,13 @@ pub(crate) struct TestQueueDrainCostProbe {
     pub(crate) inventory: TestCostStage,
     pub(crate) admission: TestCostStage,
     pub(crate) followup_elapsed: TestCostStage,
+    pub(crate) display_names: TestCostStage,
+    pub(crate) remember_sender: TestCostStage,
+    pub(crate) directory_catalog: TestCostStage,
+    pub(crate) directory_handles: TestCostStage,
+    pub(crate) directory_queries: TestCostStage,
+    pub(crate) directory_merge: TestCostStage,
+    pub(crate) directory_write_attempts: TestCostStage,
     pub(crate) dequeued: AtomicU64,
     pub(crate) ingested: AtomicU64,
     pub(crate) duplicates: AtomicU64,
@@ -6134,7 +6147,23 @@ impl AppClient {
         }
         let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
             && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
-        if let Err(error) = self.app.remember_directory_message_sender(&message) {
+        #[cfg(test)]
+        let directory_probe = self
+            .test_queue_drain_cost_probe
+            .as_ref()
+            .filter(|probe| probe.active());
+        #[cfg(test)]
+        let remembered = if let Some(probe) = directory_probe {
+            probe.remember_sender.time(|| {
+                self.app
+                    .remember_directory_message_sender_observed(&message, probe)
+            })
+        } else {
+            self.app.remember_directory_message_sender(&message)
+        };
+        #[cfg(not(test))]
+        let remembered = self.app.remember_directory_message_sender(&message);
+        if let Err(error) = remembered {
             tracing::warn!(
                 target: "marmot_app::client",
                 method = "project_received_message",
@@ -6540,7 +6569,23 @@ impl AppClient {
             })
             .collect::<Vec<_>>();
         // Enrichment must not discard effects the engine already consumed.
-        match self.app.display_names_for_account_ids(&senders) {
+        #[cfg(test)]
+        let directory_probe = self
+            .test_queue_drain_cost_probe
+            .as_ref()
+            .filter(|probe| probe.active());
+        #[cfg(test)]
+        let names = if let Some(probe) = directory_probe {
+            probe.display_names.time(|| {
+                self.app
+                    .display_names_for_account_ids_observed(&senders, probe)
+            })
+        } else {
+            self.app.display_names_for_account_ids(&senders)
+        };
+        #[cfg(not(test))]
+        let names = self.app.display_names_for_account_ids(&senders);
+        match names {
             Ok(names) => names,
             Err(error) => {
                 tracing::warn!(

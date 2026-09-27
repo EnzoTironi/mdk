@@ -1031,6 +1031,16 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         cost_probe.admission.snapshot(),
         cost_probe.followup_elapsed.snapshot(),
     );
+    eprintln!(
+        "loss_directory_cost: alice_display_names_inclusive_count_total_us_max_us={:?}, alice_remember_sender_inclusive_count_total_us_max_us={:?}, nested_catalog_count_total_us_max_us={:?}, nested_handles_count_total_us_max_us={:?}, nested_queries_count_total_us_max_us={:?}, nested_merge_count_total_us_max_us={:?}, nested_write_attempts_count_total_us_max_us={:?}; all stages are target-account synchronous timings, nested stages are not additive, and write counts include failed attempts",
+        cost_probe.display_names.snapshot(),
+        cost_probe.remember_sender.snapshot(),
+        cost_probe.directory_catalog.snapshot(),
+        cost_probe.directory_handles.snapshot(),
+        cost_probe.directory_queries.snapshot(),
+        cost_probe.directory_merge.snapshot(),
+        cost_probe.directory_write_attempts.snapshot(),
+    );
     if status_timed_out {
         timeout(Duration::from_secs(30), status_rx)
             .await
