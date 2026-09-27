@@ -141,28 +141,33 @@ impl TestQueueDrainCostProbe {
         }
         self.enabled.store(false, Ordering::SeqCst);
         timing.enabled = false;
-        let (unfinished, nested_runtime_unfinished_us) = match timing.phase {
-            TestDirectReceivePhase::Idle => (None, None),
-            TestDirectReceivePhase::Ingest {
-                since,
-                runtime_since,
-                ..
-            } => (
-                Some(("claim_to_ingest", elapsed_us(since, now))),
-                runtime_since.map(|started| elapsed_us(started, now)),
-            ),
-            TestDirectReceivePhase::PostIngest { since, .. } => {
-                (Some(("ingest_to_tail", elapsed_us(since, now))), None)
-            }
-            TestDirectReceivePhase::Between { since } => {
-                (Some(("between_claims", elapsed_us(since, now))), None)
-            }
-        };
+        let (unfinished, nested_runtime_unfinished_us, secure_prune_unfinished_us) =
+            match timing.phase {
+                TestDirectReceivePhase::Idle => (None, None, None),
+                TestDirectReceivePhase::Ingest {
+                    since,
+                    runtime_since,
+                    secure_prune_since,
+                    ..
+                } => (
+                    Some(("claim_to_ingest", elapsed_us(since, now))),
+                    runtime_since.map(|started| elapsed_us(started, now)),
+                    secure_prune_since.map(|started| elapsed_us(started, now)),
+                ),
+                TestDirectReceivePhase::PostIngest { since, .. } => {
+                    (Some(("ingest_to_tail", elapsed_us(since, now))), None, None)
+                }
+                TestDirectReceivePhase::Between { since } => {
+                    (Some(("between_claims", elapsed_us(since, now))), None, None)
+                }
+            };
         let frozen = TestDirectReceiveTimingSnapshot {
             claim_to_ingest: timing.claim_to_ingest.snapshot(),
             ingest_to_tail: timing.ingest_to_tail.snapshot(),
             between_claims: timing.between_claims.snapshot(),
             runtime_ingest_child: timing.runtime_ingest_child.snapshot(),
+            secure_prune_call_inclusive: timing.secure_prune_call_inclusive.snapshot(),
+            secure_prune_error_exits: timing.secure_prune_error_exits,
             handoff_excluded: timing.handoff_excluded,
             join_excluded: timing.join_excluded,
             discard_excluded: timing.discard_excluded,
@@ -170,6 +175,7 @@ impl TestQueueDrainCostProbe {
             reset_excluded: timing.reset_excluded,
             unfinished,
             nested_runtime_unfinished_us,
+            secure_prune_unfinished_us,
         };
         timing.phase = TestDirectReceivePhase::Idle;
         timing.frozen = Some(frozen);
@@ -198,6 +204,7 @@ impl TestQueueDrainCostProbe {
             id,
             since: now,
             runtime_since: None,
+            secure_prune_since: None,
         };
         Some(id)
     }
@@ -215,10 +222,11 @@ impl TestQueueDrainCostProbe {
             id: current,
             since,
             runtime_since,
+            secure_prune_since,
         } = timing.phase
             && current == id
         {
-            if success && runtime_since.is_none() {
+            if success && runtime_since.is_none() && secure_prune_since.is_none() {
                 timing.claim_to_ingest.record(since, now);
                 timing.phase = TestDirectReceivePhase::PostIngest { id, since: now };
             } else {
@@ -323,6 +331,50 @@ impl TestQueueDrainCostProbe {
             timing.runtime_ingest_child.record(since, now);
         }
     }
+
+    pub(crate) fn direct_secure_prune_started(&self) -> Option<u64> {
+        self.direct_secure_prune_started_at(Instant::now())
+    }
+
+    fn direct_secure_prune_started_at(&self, now: Instant) -> Option<u64> {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if !timing.enabled {
+            return None;
+        }
+        if let TestDirectReceivePhase::Ingest {
+            id,
+            secure_prune_since,
+            ..
+        } = &mut timing.phase
+            && secure_prune_since.is_none()
+        {
+            *secure_prune_since = Some(now);
+            return Some(*id);
+        }
+        None
+    }
+
+    pub(crate) fn direct_secure_prune_finished(&self, id: u64, success: bool) {
+        self.direct_secure_prune_finished_at(id, success, Instant::now());
+    }
+
+    fn direct_secure_prune_finished_at(&self, id: u64, success: bool, now: Instant) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if !timing.enabled {
+            return;
+        }
+        if let TestDirectReceivePhase::Ingest {
+            id: current,
+            secure_prune_since,
+            ..
+        } = &mut timing.phase
+            && *current == id
+            && let Some(since) = secure_prune_since.take()
+        {
+            timing.secure_prune_call_inclusive.record(since, now);
+            timing.secure_prune_error_exits += u64::from(!success);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +415,7 @@ enum TestDirectReceivePhase {
         id: u64,
         since: Instant,
         runtime_since: Option<Instant>,
+        secure_prune_since: Option<Instant>,
     },
     PostIngest {
         id: u64,
@@ -383,6 +436,8 @@ struct TestDirectReceiveTiming {
     ingest_to_tail: TestDirectTimingStage,
     between_claims: TestDirectTimingStage,
     runtime_ingest_child: TestDirectTimingStage,
+    secure_prune_call_inclusive: TestDirectTimingStage,
+    secure_prune_error_exits: u64,
     handoff_excluded: u64,
     join_excluded: u64,
     discard_excluded: u64,
@@ -398,6 +453,8 @@ pub(crate) struct TestDirectReceiveTimingSnapshot {
     pub(crate) ingest_to_tail: (u64, u64, u64),
     pub(crate) between_claims: (u64, u64, u64),
     pub(crate) runtime_ingest_child: (u64, u64, u64),
+    pub(crate) secure_prune_call_inclusive: (u64, u64, u64),
+    pub(crate) secure_prune_error_exits: u64,
     pub(crate) handoff_excluded: u64,
     pub(crate) join_excluded: u64,
     pub(crate) discard_excluded: u64,
@@ -405,6 +462,7 @@ pub(crate) struct TestDirectReceiveTimingSnapshot {
     pub(crate) reset_excluded: u64,
     pub(crate) unfinished: Option<(&'static str, u64)>,
     pub(crate) nested_runtime_unfinished_us: Option<u64>,
+    pub(crate) secure_prune_unfinished_us: Option<u64>,
 }
 use super::audit::EpochBackfillTerminalAudit;
 use super::epoch_stall::BackfillDecision;
@@ -7738,6 +7796,11 @@ mod tests {
             probe: probe.clone(),
         };
         assert!(probe.direct_receive_claim_at(Instant::now()).is_none());
+        assert!(
+            probe
+                .direct_secure_prune_started_at(Instant::now())
+                .is_none()
+        );
         assert!(target.for_account("bob").is_none());
         assert!(Arc::ptr_eq(&target.for_account("alice").unwrap(), &probe));
         assert_eq!(probe.stop_direct_receive_timing().claim_to_ingest.0, 0);
@@ -7754,6 +7817,11 @@ mod tests {
             Some(first)
         );
         probe.direct_runtime_ingest_finished_at(first, t + Duration::from_millis(3));
+        assert_eq!(
+            probe.direct_secure_prune_started_at(t + Duration::from_millis(3)),
+            Some(first)
+        );
+        probe.direct_secure_prune_finished_at(first, true, t + Duration::from_millis(4));
         probe.direct_receive_ingested_at(first, true, t + Duration::from_millis(5));
         probe.direct_receive_tail_finished_at(first, t + Duration::from_millis(7));
         let second = probe
@@ -7766,6 +7834,9 @@ mod tests {
         assert_eq!(frozen.ingest_to_tail, (2, 5_000, 3_000));
         assert_eq!(frozen.between_claims, (1, 4_000, 4_000));
         assert_eq!(frozen.runtime_ingest_child, (1, 2_000, 2_000));
+        assert_eq!(frozen.secure_prune_call_inclusive, (1, 1_000, 1_000));
+        assert_eq!(frozen.secure_prune_error_exits, 0);
+        assert_eq!(frozen.secure_prune_unfinished_us, None);
         assert_eq!(frozen.unfinished, Some(("between_claims", 3_000)));
         assert!(
             probe
@@ -7774,6 +7845,37 @@ mod tests {
         );
         assert_eq!(
             probe.stop_direct_receive_timing_at(t + Duration::from_millis(30)),
+            frozen
+        );
+    }
+
+    #[test]
+    fn direct_secure_prune_counts_error_and_freezes_mid_call() {
+        let probe = TestQueueDrainCostProbe::default();
+        let t = Instant::now();
+        probe.start_direct_receive_timing();
+        let failed = probe.direct_receive_claim_at(t).unwrap();
+        assert_eq!(
+            probe.direct_secure_prune_started_at(t + Duration::from_millis(1)),
+            Some(failed)
+        );
+        probe.direct_secure_prune_finished_at(failed, false, t + Duration::from_millis(3));
+        probe.direct_receive_ingested_at(failed, false, t + Duration::from_millis(4));
+        let interrupted = probe
+            .direct_receive_claim_at(t + Duration::from_millis(5))
+            .unwrap();
+        assert_eq!(
+            probe.direct_secure_prune_started_at(t + Duration::from_millis(6)),
+            Some(interrupted)
+        );
+        let frozen = probe.stop_direct_receive_timing_at(t + Duration::from_millis(7));
+        probe.direct_secure_prune_finished_at(interrupted, true, t + Duration::from_millis(8));
+        assert_eq!(frozen.secure_prune_call_inclusive, (1, 2_000, 2_000));
+        assert_eq!(frozen.secure_prune_error_exits, 1);
+        assert_eq!(frozen.secure_prune_unfinished_us, Some(1_000));
+        assert_eq!(frozen.unfinished, Some(("claim_to_ingest", 2_000)));
+        assert_eq!(
+            probe.stop_direct_receive_timing_at(t + Duration::from_millis(9)),
             frozen
         );
     }

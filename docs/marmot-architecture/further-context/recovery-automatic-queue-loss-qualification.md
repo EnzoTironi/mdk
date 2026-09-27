@@ -391,7 +391,37 @@ work, and are not a matched subset of completed second intervals. The third
 interval includes waiting, duplicate filtering, overflow, and other worker
 arms; it is not a pure scheduler or CPU measure. Errors, reconnect, teardown,
 injected discard, background handoff, and joined-group tails are excluded or
-invalidated explicitly. No storage optimization is justified by these
-unmeasured local spans. Fresh-head CI is needed for timing evidence, and the
-PR remains draft without merge, device qualification, default activation, or
-release.
+invalidated explicitly.
+
+At head `05fa4924`, two stimulated Receive cases and two nonstimulated cases
+requiring Maintenance each failed strict active acquisition on both x86_64
+attempts at the same assertion. All four had a healthy live delivery accepted,
+dequeued, ingested, and observed by Alice; both Receive wakes were ingested.
+The owner deferred 723–786 selections per run, selected no grant during the
+hold, and later made useful target/epoch/plaintext progress under a later
+grant while retaining pending debt. These four failures bring the record to
+68 x86_64 attempts across 17 heads. The separate online epoch-gap test failed
+its first attempt at a conjunction of network-result and queue-route evidence,
+then passed its configured retry; that assertion does not identify which leg
+failed or establish a cause related to this revision.
+
+The four Alice probe windows lasted 45.17–45.44 seconds. Completed direct
+claim-to-ingest spans totaled 43.34–43.70 seconds, with nested runtime ingest
+at 15.57–16.40 seconds; completed tails totaled 1.27–1.51 seconds and
+between-claim spans 0.32–0.47 seconds. Counts matched in each run, all
+handoff/join/error exclusions were zero, and only a short between-claim span
+straddled stop. For these matched completed spans, the elapsed residual
+outside runtime ingest is 27.02–27.91 seconds; it does not identify a storage
+or projection suboperation. Runtime-wide transaction totals contain nested
+work and cannot be subtracted as an exclusive partition.
+
+One further test-only Alice measurement now times the existing app-level
+secure-prune call made during direct message projection. It reports completed
+count/total/max, error exits, and any call straddling the frozen stop. The
+elapsed call includes account/classifier setup and storage work; it does not
+isolate SQL transaction time. A completed child can also belong to a parent
+later excluded or unfinished, so aggregate subtraction requires matching
+counts and boundaries. The per-message prune's no-expiry path remains a
+candidate for investigation, not an approved production optimization. New-head
+x86_64 evidence for that single call is pending. The PR remains draft without
+merge, device qualification, default activation, or release.

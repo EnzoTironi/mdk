@@ -802,11 +802,20 @@ impl AppClient {
         group_id: &GroupId,
         now_seconds: u64,
     ) -> Result<SecureDeleteExpiredResult, AppError> {
-        self.app.secure_prune_expired_account_app_events(
+        #[cfg(test)]
+        let direct_probe = self.test_queue_drain_cost_probe.as_ref();
+        #[cfg(test)]
+        let direct_prune_id = direct_probe.and_then(|probe| probe.direct_secure_prune_started());
+        let result = self.app.secure_prune_expired_account_app_events(
             &self.state.label,
             &hex::encode(group_id.as_slice()),
             now_seconds,
-        )
+        );
+        #[cfg(test)]
+        if let (Some(probe), Some(id)) = (direct_probe, direct_prune_id) {
+            probe.direct_secure_prune_finished(id, result.is_ok());
+        }
+        result
     }
 
     pub(crate) fn encrypted_media_component_id(profile: ProtocolProfile) -> u16 {
