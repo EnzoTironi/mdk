@@ -43,6 +43,8 @@ use marmot_forensics::EpochBackfillCompletionKind;
 
 use super::AppClient;
 #[cfg(test)]
+use std::sync::Mutex as StdMutex;
+#[cfg(test)]
 use std::sync::atomic::AtomicU64;
 
 #[cfg(test)]
@@ -78,8 +80,10 @@ impl TestCostStage {
     }
 }
 
-/// Fixture-armed, account-owned aggregate timings. The async follow-up elapsed
-/// includes suspension; the other two spans wrap synchronous calls only.
+/// Fixture-armed, account-owned aggregate timings. The direct Receive spans
+/// share one lock so stop freezes completed work and its current boundary.
+/// Existing follow-up elapsed includes suspension; inventory and admission
+/// wrap synchronous calls only.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct TestQueueDrainCostProbe {
@@ -97,6 +101,7 @@ pub(crate) struct TestQueueDrainCostProbe {
     pub(crate) dequeued: AtomicU64,
     pub(crate) ingested: AtomicU64,
     pub(crate) duplicates: AtomicU64,
+    direct_receive: StdMutex<TestDirectReceiveTiming>,
 }
 
 #[cfg(test)]
@@ -104,6 +109,302 @@ impl TestQueueDrainCostProbe {
     pub(crate) fn active(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
     }
+
+    pub(crate) fn start_direct_receive_timing(&self) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        let next_id = timing.next_id;
+        *timing = TestDirectReceiveTiming {
+            enabled: true,
+            next_id,
+            ..TestDirectReceiveTiming::default()
+        };
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn stop_direct_receive_timing(&self) -> TestDirectReceiveTimingSnapshot {
+        let mut timing = self.direct_receive.lock().unwrap();
+        self.stop_direct_receive_timing_locked(&mut timing, Instant::now())
+    }
+
+    fn stop_direct_receive_timing_at(&self, now: Instant) -> TestDirectReceiveTimingSnapshot {
+        let mut timing = self.direct_receive.lock().unwrap();
+        self.stop_direct_receive_timing_locked(&mut timing, now)
+    }
+
+    fn stop_direct_receive_timing_locked(
+        &self,
+        timing: &mut TestDirectReceiveTiming,
+        now: Instant,
+    ) -> TestDirectReceiveTimingSnapshot {
+        if let Some(frozen) = timing.frozen {
+            return frozen;
+        }
+        self.enabled.store(false, Ordering::SeqCst);
+        timing.enabled = false;
+        let (unfinished, nested_runtime_unfinished_us) = match timing.phase {
+            TestDirectReceivePhase::Idle => (None, None),
+            TestDirectReceivePhase::Ingest {
+                since,
+                runtime_since,
+                ..
+            } => (
+                Some(("claim_to_ingest", elapsed_us(since, now))),
+                runtime_since.map(|started| elapsed_us(started, now)),
+            ),
+            TestDirectReceivePhase::PostIngest { since, .. } => {
+                (Some(("ingest_to_tail", elapsed_us(since, now))), None)
+            }
+            TestDirectReceivePhase::Between { since } => {
+                (Some(("between_claims", elapsed_us(since, now))), None)
+            }
+        };
+        let frozen = TestDirectReceiveTimingSnapshot {
+            claim_to_ingest: timing.claim_to_ingest.snapshot(),
+            ingest_to_tail: timing.ingest_to_tail.snapshot(),
+            between_claims: timing.between_claims.snapshot(),
+            runtime_ingest_child: timing.runtime_ingest_child.snapshot(),
+            handoff_excluded: timing.handoff_excluded,
+            join_excluded: timing.join_excluded,
+            discard_excluded: timing.discard_excluded,
+            error_excluded: timing.error_excluded,
+            reset_excluded: timing.reset_excluded,
+            unfinished,
+            nested_runtime_unfinished_us,
+        };
+        timing.phase = TestDirectReceivePhase::Idle;
+        timing.frozen = Some(frozen);
+        frozen
+    }
+
+    pub(crate) fn direct_receive_claim(&self) -> Option<u64> {
+        self.direct_receive_claim_at(Instant::now())
+    }
+
+    fn direct_receive_claim_at(&self, now: Instant) -> Option<u64> {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if !timing.enabled {
+            return None;
+        }
+        match timing.phase {
+            TestDirectReceivePhase::Between { since } => {
+                timing.between_claims.record(since, now);
+            }
+            TestDirectReceivePhase::Idle => {}
+            _ => timing.reset_excluded += 1,
+        }
+        timing.next_id = timing.next_id.wrapping_add(1);
+        let id = timing.next_id;
+        timing.phase = TestDirectReceivePhase::Ingest {
+            id,
+            since: now,
+            runtime_since: None,
+        };
+        Some(id)
+    }
+
+    pub(crate) fn direct_receive_ingested(&self, id: u64, success: bool) {
+        self.direct_receive_ingested_at(id, success, Instant::now());
+    }
+
+    fn direct_receive_ingested_at(&self, id: u64, success: bool, now: Instant) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if !timing.enabled {
+            return;
+        }
+        if let TestDirectReceivePhase::Ingest {
+            id: current,
+            since,
+            runtime_since,
+        } = timing.phase
+            && current == id
+        {
+            if success && runtime_since.is_none() {
+                timing.claim_to_ingest.record(since, now);
+                timing.phase = TestDirectReceivePhase::PostIngest { id, since: now };
+            } else {
+                timing.error_excluded += 1;
+                timing.phase = TestDirectReceivePhase::Idle;
+            }
+        }
+    }
+
+    pub(crate) fn direct_receive_tail_finished(&self, id: u64) {
+        self.direct_receive_tail_finished_at(id, Instant::now());
+    }
+
+    fn direct_receive_tail_finished_at(&self, id: u64, now: Instant) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if !timing.enabled {
+            return;
+        }
+        if let TestDirectReceivePhase::PostIngest { id: current, since } = timing.phase
+            && current == id
+        {
+            timing.ingest_to_tail.record(since, now);
+            timing.phase = TestDirectReceivePhase::Between { since: now };
+        }
+    }
+
+    pub(crate) fn direct_receive_handoff(&self, id: u64) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if timing.enabled
+            && matches!(timing.phase, TestDirectReceivePhase::PostIngest { id: current, .. } if current == id)
+        {
+            timing.handoff_excluded += 1;
+            timing.phase = TestDirectReceivePhase::Idle;
+        }
+    }
+
+    pub(crate) fn direct_receive_join(&self, id: u64) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if timing.enabled
+            && matches!(timing.phase, TestDirectReceivePhase::PostIngest { id: current, .. } if current == id)
+        {
+            timing.join_excluded += 1;
+            timing.phase = TestDirectReceivePhase::Idle;
+        }
+    }
+
+    pub(crate) fn direct_receive_discarded(&self, id: u64) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if timing.enabled
+            && matches!(timing.phase, TestDirectReceivePhase::Ingest { id: current, .. } if current == id)
+        {
+            timing.discard_excluded += 1;
+            timing.phase = TestDirectReceivePhase::Idle;
+        }
+    }
+
+    pub(crate) fn direct_receive_reset(&self) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if timing.enabled && !matches!(timing.phase, TestDirectReceivePhase::Idle) {
+            timing.reset_excluded += 1;
+            timing.phase = TestDirectReceivePhase::Idle;
+        }
+    }
+
+    pub(crate) fn direct_runtime_ingest_started(&self) -> Option<u64> {
+        self.direct_runtime_ingest_started_at(Instant::now())
+    }
+
+    fn direct_runtime_ingest_started_at(&self, now: Instant) -> Option<u64> {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if !timing.enabled {
+            return None;
+        }
+        if let TestDirectReceivePhase::Ingest {
+            id, runtime_since, ..
+        } = &mut timing.phase
+            && runtime_since.is_none()
+        {
+            *runtime_since = Some(now);
+            return Some(*id);
+        }
+        None
+    }
+
+    pub(crate) fn direct_runtime_ingest_finished(&self, id: u64) {
+        self.direct_runtime_ingest_finished_at(id, Instant::now());
+    }
+
+    fn direct_runtime_ingest_finished_at(&self, id: u64, now: Instant) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if !timing.enabled {
+            return;
+        }
+        if let TestDirectReceivePhase::Ingest {
+            id: current,
+            runtime_since,
+            ..
+        } = &mut timing.phase
+            && *current == id
+            && let Some(since) = runtime_since.take()
+        {
+            timing.runtime_ingest_child.record(since, now);
+        }
+    }
+}
+
+#[cfg(test)]
+fn elapsed_us(since: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(since)
+        .as_micros()
+        .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct TestDirectTimingStage {
+    count: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+#[cfg(test)]
+impl TestDirectTimingStage {
+    fn record(&mut self, since: Instant, now: Instant) {
+        let us = elapsed_us(since, now);
+        self.count += 1;
+        self.total_us = self.total_us.saturating_add(us);
+        self.max_us = self.max_us.max(us);
+    }
+
+    fn snapshot(self) -> (u64, u64, u64) {
+        (self.count, self.total_us, self.max_us)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+enum TestDirectReceivePhase {
+    #[default]
+    Idle,
+    Ingest {
+        id: u64,
+        since: Instant,
+        runtime_since: Option<Instant>,
+    },
+    PostIngest {
+        id: u64,
+        since: Instant,
+    },
+    Between {
+        since: Instant,
+    },
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestDirectReceiveTiming {
+    enabled: bool,
+    next_id: u64,
+    phase: TestDirectReceivePhase,
+    claim_to_ingest: TestDirectTimingStage,
+    ingest_to_tail: TestDirectTimingStage,
+    between_claims: TestDirectTimingStage,
+    runtime_ingest_child: TestDirectTimingStage,
+    handoff_excluded: u64,
+    join_excluded: u64,
+    discard_excluded: u64,
+    error_excluded: u64,
+    reset_excluded: u64,
+    frozen: Option<TestDirectReceiveTimingSnapshot>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestDirectReceiveTimingSnapshot {
+    pub(crate) claim_to_ingest: (u64, u64, u64),
+    pub(crate) ingest_to_tail: (u64, u64, u64),
+    pub(crate) between_claims: (u64, u64, u64),
+    pub(crate) runtime_ingest_child: (u64, u64, u64),
+    pub(crate) handoff_excluded: u64,
+    pub(crate) join_excluded: u64,
+    pub(crate) discard_excluded: u64,
+    pub(crate) error_excluded: u64,
+    pub(crate) reset_excluded: u64,
+    pub(crate) unfinished: Option<(&'static str, u64)>,
+    pub(crate) nested_runtime_unfinished_us: Option<u64>,
 }
 use super::audit::EpochBackfillTerminalAudit;
 use super::epoch_stall::BackfillDecision;
@@ -3537,6 +3838,11 @@ impl AppClient {
         if let (Some(slot), Some(receive)) = (&client.audit_v5_peel_slot, probe_receive.clone()) {
             slot.lock().unwrap().arm(&delivery.message, receive);
         }
+        #[cfg(test)]
+        let direct_probe = client.test_queue_drain_cost_probe.as_ref();
+        #[cfg(test)]
+        let direct_runtime_id =
+            direct_probe.and_then(|probe| probe.direct_runtime_ingest_started());
         let ingest = client
             .runtime
             .ingest_delivery_with_observer(delivery, |phase, duration, success| {
@@ -3559,6 +3865,10 @@ impl AppClient {
                 }
             })
             .await;
+        #[cfg(test)]
+        if let (Some(probe), Some(id)) = (direct_probe, direct_runtime_id) {
+            probe.direct_runtime_ingest_finished(id);
+        }
         if let (Some(probe), Some(slot)) = (&mut client.audit_v5_probe, &client.audit_v5_peel_slot)
             && let Some(completion) = slot.lock().unwrap().take()
         {
@@ -7395,11 +7705,13 @@ mod tests {
     use super::DrainCounts;
     use super::{
         DrainVerdict, EpochBackfillReplayOutcome, RecoveryDrainState,
-        TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS, TransportReconciliationWork,
-        backfill_drain_verdict, epoch_backfill_terminal_rows, incomplete_full_history_repair,
-        order_reconciliation_pass, reconciliation_start_after_cursor, recovery_investigation_ended,
+        TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS, TestQueueDrainCostProbe,
+        TransportReconciliationWork, backfill_drain_verdict, epoch_backfill_terminal_rows,
+        incomplete_full_history_repair, order_reconciliation_pass,
+        reconciliation_start_after_cursor, recovery_investigation_ended,
         transport_reconciliation_record,
     };
+    use crate::runtime::QueueDrainCostProbeTarget;
     use crate::tests::{
         ScriptedPushRelayClient, armed_group_ids, bounded_epoch_backfill_config,
         client_on_app_relay_plane, make_group_terminal,
@@ -7413,10 +7725,110 @@ mod tests {
     use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use transport_nostr_adapter::AccountSubscriptionEose;
     use transport_nostr_adapter::NostrRelayEvent;
     use transport_nostr_peeler::NostrTransportEvent;
+
+    #[test]
+    fn direct_receive_timing_is_disabled_until_the_target_account_arms_it() {
+        let probe = Arc::new(TestQueueDrainCostProbe::default());
+        let target = QueueDrainCostProbeTarget {
+            account_label: "alice".into(),
+            probe: probe.clone(),
+        };
+        assert!(probe.direct_receive_claim_at(Instant::now()).is_none());
+        assert!(target.for_account("bob").is_none());
+        assert!(Arc::ptr_eq(&target.for_account("alice").unwrap(), &probe));
+        assert_eq!(probe.stop_direct_receive_timing().claim_to_ingest.0, 0);
+    }
+
+    #[test]
+    fn direct_receive_timing_freezes_completed_and_straddling_spans_at_stop() {
+        let probe = TestQueueDrainCostProbe::default();
+        let t = Instant::now();
+        probe.start_direct_receive_timing();
+        let first = probe.direct_receive_claim_at(t).unwrap();
+        assert_eq!(
+            probe.direct_runtime_ingest_started_at(t + Duration::from_millis(1)),
+            Some(first)
+        );
+        probe.direct_runtime_ingest_finished_at(first, t + Duration::from_millis(3));
+        probe.direct_receive_ingested_at(first, true, t + Duration::from_millis(5));
+        probe.direct_receive_tail_finished_at(first, t + Duration::from_millis(7));
+        let second = probe
+            .direct_receive_claim_at(t + Duration::from_millis(11))
+            .unwrap();
+        probe.direct_receive_ingested_at(second, true, t + Duration::from_millis(14));
+        probe.direct_receive_tail_finished_at(second, t + Duration::from_millis(17));
+        let frozen = probe.stop_direct_receive_timing_at(t + Duration::from_millis(20));
+        assert_eq!(frozen.claim_to_ingest, (2, 8_000, 5_000));
+        assert_eq!(frozen.ingest_to_tail, (2, 5_000, 3_000));
+        assert_eq!(frozen.between_claims, (1, 4_000, 4_000));
+        assert_eq!(frozen.runtime_ingest_child, (1, 2_000, 2_000));
+        assert_eq!(frozen.unfinished, Some(("between_claims", 3_000)));
+        assert!(
+            probe
+                .direct_receive_claim_at(t + Duration::from_millis(21))
+                .is_none()
+        );
+        assert_eq!(
+            probe.stop_direct_receive_timing_at(t + Duration::from_millis(30)),
+            frozen
+        );
+    }
+
+    #[test]
+    fn direct_receive_handoff_error_and_reset_exclude_unfinished_cycles() {
+        let probe = TestQueueDrainCostProbe::default();
+        let t = Instant::now();
+        probe.start_direct_receive_timing();
+        let handed_off = probe.direct_receive_claim_at(t).unwrap();
+        probe.direct_receive_ingested_at(handed_off, true, t + Duration::from_millis(2));
+        probe.direct_receive_handoff(handed_off);
+        let joined = probe
+            .direct_receive_claim_at(t + Duration::from_micros(2_500))
+            .unwrap();
+        probe.direct_receive_ingested_at(joined, true, t + Duration::from_micros(2_750));
+        probe.direct_receive_join(joined);
+        let failed = probe
+            .direct_receive_claim_at(t + Duration::from_millis(3))
+            .unwrap();
+        probe.direct_receive_ingested_at(failed, false, t + Duration::from_millis(5));
+        let completed = probe
+            .direct_receive_claim_at(t + Duration::from_millis(6))
+            .unwrap();
+        probe.direct_receive_ingested_at(completed, true, t + Duration::from_millis(8));
+        probe.direct_receive_tail_finished_at(completed, t + Duration::from_millis(10));
+        probe.direct_receive_reset();
+        let discarded = probe
+            .direct_receive_claim_at(t + Duration::from_millis(11))
+            .unwrap();
+        probe.direct_receive_discarded(discarded);
+        let interrupted = probe
+            .direct_receive_claim_at(t + Duration::from_millis(12))
+            .unwrap();
+        assert_eq!(
+            probe.direct_runtime_ingest_started_at(t + Duration::from_millis(13)),
+            Some(interrupted)
+        );
+        let frozen = probe.stop_direct_receive_timing_at(t + Duration::from_millis(14));
+        probe.direct_runtime_ingest_finished_at(interrupted, t + Duration::from_millis(16));
+        assert_eq!(frozen.handoff_excluded, 1);
+        assert_eq!(frozen.join_excluded, 1);
+        assert_eq!(frozen.discard_excluded, 1);
+        assert_eq!(frozen.error_excluded, 1);
+        assert_eq!(frozen.reset_excluded, 1);
+        assert_eq!(frozen.claim_to_ingest, (3, 4_250, 2_000));
+        assert_eq!(frozen.ingest_to_tail, (1, 2_000, 2_000));
+        assert_eq!(frozen.unfinished, Some(("claim_to_ingest", 2_000)));
+        assert_eq!(frozen.nested_runtime_unfinished_us, Some(1_000));
+        assert_eq!(frozen.runtime_ingest_child, (0, 0, 0));
+        assert_eq!(
+            probe.stop_direct_receive_timing_at(t + Duration::from_millis(17)),
+            frozen
+        );
+    }
 
     #[cfg(feature = "test-policy-overrides")]
     #[test]

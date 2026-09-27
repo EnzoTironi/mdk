@@ -782,6 +782,18 @@ fn install_storage_telemetry(client: &AppClient, telemetry: &crate::AppPerforman
     }
 }
 
+#[cfg(test)]
+struct TestDirectReceiveWorkerGuard(Option<Arc<crate::client::TestQueueDrainCostProbe>>);
+
+#[cfg(test)]
+impl Drop for TestDirectReceiveWorkerGuard {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.0 {
+            probe.direct_receive_reset();
+        }
+    }
+}
+
 pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     command_tx: mpsc::Sender<AccountWorkerCommand>,
@@ -872,9 +884,7 @@ async fn run_app_runtime_account_worker(
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|target| {
-                (target.account_label == account_label).then(|| target.probe.clone())
-            });
+            .and_then(|target| target.for_account(&account_label));
         client.test_recovery_selection_witness = shared
             .recovery_selection_witness
             .lock()
@@ -890,6 +900,9 @@ async fn run_app_runtime_account_worker(
             .as_ref()
             .and_then(|(label, witness)| (label == &account_label).then(|| witness.clone()));
     }
+    #[cfg(test)]
+    let _direct_receive_worker_guard =
+        TestDirectReceiveWorkerGuard(client.test_queue_drain_cost_probe.clone());
     let mut scheduled_convergence = ScheduledConvergence::with_test_delay(
         convergence_settlement_delay(&app),
         scheduled_convergence_test_delay(&app),
@@ -2472,6 +2485,15 @@ async fn run_app_runtime_account_worker(
                 let resumed_direct_overflow = completed_overflow.is_some();
                 yield_to_bounded_admission = true;
                 #[cfg(test)]
+                let direct_probe = client.test_queue_drain_cost_probe.clone();
+                #[cfg(test)]
+                let direct_cycle = matches!(
+                    &received,
+                    Some(Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(_)))
+                )
+                .then(|| direct_probe.as_ref().and_then(|probe| probe.direct_receive_claim()))
+                .flatten();
+                #[cfg(test)]
                 if let Some(Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery))) = &received
                     && let (Ok(event_id), Some(subscription_id)) = (
                         <[u8; 32]>::try_from(delivery.message.id.as_slice()),
@@ -2487,6 +2509,9 @@ async fn run_app_runtime_account_worker(
                         })
                         .is_some();
                     if drop_this {
+                        if let (Some(probe), Some(id)) = (&direct_probe, direct_cycle) {
+                            probe.direct_receive_discarded(id);
+                        }
                         *shared.ordinary_drop_witness.lock().unwrap() =
                             Some(subscription_id.clone());
                         shared.ordinary_delivery_dropped.notify_one();
@@ -2507,7 +2532,12 @@ async fn run_app_runtime_account_worker(
                     }
                 } else { match received.expect("relay receive or completed overflow exists") {
                     Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
-                        (client.ingest_received_delivery(*delivery).await, false)
+                        let ingested = client.ingest_received_delivery(*delivery).await;
+                        #[cfg(test)]
+                        if let (Some(probe), Some(id)) = (&direct_probe, direct_cycle) {
+                            probe.direct_receive_ingested(id, ingested.is_ok());
+                        }
+                        (ingested, false)
                     }
                     Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(overflow)) => {
                         let backfill_armed = client.has_pending_epoch_backfill();
@@ -2576,6 +2606,12 @@ async fn run_app_runtime_account_worker(
                 receive_observation.finish_app(&result);
                 match result {
                     Ok(summary) => {
+                        #[cfg(test)]
+                        if !summary.joined_groups.is_empty()
+                            && let (Some(probe), Some(id)) = (&direct_probe, direct_cycle)
+                        {
+                            probe.direct_receive_join(id);
+                        }
                         reconnect_backoff.reset();
                         publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                         // An inline convergence pass on a delivered rival can
@@ -2661,6 +2697,10 @@ async fn run_app_runtime_account_worker(
                                             },
                                         });
                                         handoff_after_completed_receive = true;
+                                        #[cfg(test)]
+                                        if let (Some(probe), Some(id)) = (&direct_probe, direct_cycle) {
+                                            probe.direct_receive_handoff(id);
+                                        }
                                         continue 'worker;
                                     }
                                     PendingComparisonExecution::OnlineEpochGap {
@@ -2682,6 +2722,10 @@ async fn run_app_runtime_account_worker(
                                             },
                                         });
                                         handoff_after_completed_receive = true;
+                                        #[cfg(test)]
+                                        if let (Some(probe), Some(id)) = (&direct_probe, direct_cycle) {
+                                            probe.direct_receive_handoff(id);
+                                        }
                                         continue 'worker;
                                     }
                                     PendingComparisonExecution::Inline(result) => {
@@ -2730,6 +2774,10 @@ async fn run_app_runtime_account_worker(
                             audit_tracker_update, retry_push_registration,
                         ).await;
                         #[cfg(test)]
+                        if let (Some(probe), Some(id)) = (&direct_probe, direct_cycle) {
+                            probe.direct_receive_tail_finished(id);
+                        }
+                        #[cfg(test)]
                         if resumed_direct_overflow {
                             shared.comparison_test_trace.lock().unwrap().push("direct_overflow_receive_tail");
                         }
@@ -2738,6 +2786,10 @@ async fn run_app_runtime_account_worker(
                         }
                     }
                     Err(err) => {
+                        #[cfg(test)]
+                        if let Some(probe) = &direct_probe {
+                            probe.direct_receive_reset();
+                        }
                         #[cfg(test)]
                         if resumed_direct_overflow {
                             shared.comparison_test_trace.lock().unwrap().push("direct_overflow_receive_reconnect");
@@ -2846,10 +2898,7 @@ async fn run_app_runtime_account_worker(
                                             .lock()
                                             .unwrap()
                                             .as_ref()
-                                            .and_then(|target| {
-                                                (target.account_label == account_label)
-                                                    .then(|| target.probe.clone())
-                                            });
+                                            .and_then(|target| target.for_account(&account_label));
                                         reopened.test_recovery_selection_witness = shared
                                             .recovery_selection_witness
                                             .lock()
@@ -7807,6 +7856,20 @@ mod tests {
     mod worker_wait_attribution_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn direct_receive_probe_worker_teardown_invalidates_between_cycle() {
+        let probe = Arc::new(crate::client::TestQueueDrainCostProbe::default());
+        probe.start_direct_receive_timing();
+        let id = probe.direct_receive_claim().unwrap();
+        probe.direct_receive_ingested(id, true);
+        probe.direct_receive_tail_finished(id);
+        drop(TestDirectReceiveWorkerGuard(Some(probe.clone())));
+        let frozen = probe.stop_direct_receive_timing();
+        assert_eq!(frozen.reset_excluded, 1);
+        assert_eq!(frozen.ingest_to_tail.0, 1);
+        assert!(frozen.unfinished.is_none());
+    }
 
     use marmot_account::AccountHome;
 

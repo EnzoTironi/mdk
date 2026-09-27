@@ -2801,7 +2801,12 @@ impl MarmotRelayPlaneAccountAdapter {
     pub(crate) async fn receive_account_delivery(
         &self,
     ) -> Result<Option<AccountDeliveryReceive>, TransportAdapterError> {
-        let event = self.delivery_rx.lock().await.recv().await;
+        let event = self
+            .delivery_rx
+            .lock()
+            .await
+            .recv(&self.delivery_overflow)
+            .await;
         #[cfg(test)]
         if let Some(AccountDeliveryEvent::Delivery(delivery)) = &event
             && let Some(id) = self.relay_plane.live_path_id(delivery)

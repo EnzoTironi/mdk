@@ -728,7 +728,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         .app_performance_telemetry()
         .snapshot();
     let cost_window_started = std::time::Instant::now();
-    cost_probe.enabled.store(true, Ordering::SeqCst);
+    cost_probe.start_direct_receive_timing();
     pause_release_tx.send(true).unwrap();
     let mut stimulated_receive = false;
     let mut stimulus_inner_id = None;
@@ -910,7 +910,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     let wake_lag = wake_lag_probe.stop_and_snapshot();
     live_path_witness.stop();
     gate.release();
-    cost_probe.enabled.store(false, Ordering::SeqCst);
+    let direct_timing = cost_probe.stop_direct_receive_timing();
     let cost_window_ms = cost_window_started
         .elapsed()
         .as_millis()
@@ -1095,6 +1095,20 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         cost_probe.directory_queries.snapshot(),
         cost_probe.directory_merge.snapshot(),
         cost_probe.directory_write_attempts.snapshot(),
+    );
+    eprintln!(
+        "loss_direct_cycle: alice_claim_to_ingest_count_total_us_max_us={:?}, alice_ingest_to_tail_count_total_us_max_us={:?}, alice_between_claims_count_total_us_max_us={:?}, nested_alice_runtime_ingest_count_total_us_max_us={:?}, handoff_excluded={}, join_excluded={}, discard_excluded={}, error_excluded={}, reset_excluded={}, unfinished_at_stop={:?}, nested_runtime_unfinished_us={:?}; parent stages are disjoint completed spans, runtime ingest and the existing follow-up are nested, and the frozen stop snapshot reports boundary-straddling work without assigning it to a completed span",
+        direct_timing.claim_to_ingest,
+        direct_timing.ingest_to_tail,
+        direct_timing.between_claims,
+        direct_timing.runtime_ingest_child,
+        direct_timing.handoff_excluded,
+        direct_timing.join_excluded,
+        direct_timing.discard_excluded,
+        direct_timing.error_excluded,
+        direct_timing.reset_excluded,
+        direct_timing.unfinished,
+        direct_timing.nested_runtime_unfinished_us,
     );
     eprintln!(
         "loss_live_path: correlation={live_correlation}, bounded_group_hint_candidates={live_group_candidates}, dropped_group_hint_observations={live_group_observations_dropped}, exact_event_stage_aggregates={live_exact_path:?}; repeated event IDs retain per-stage counts and first timestamps, which do not link stages to the same copy; group-hint candidates are not exact-event evidence until correlated to the sender's local published source; absence after the timed probe is unknown, not proof of relay loss"

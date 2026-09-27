@@ -3810,6 +3810,20 @@ fn queued_delivery(account_id: &MemberId, id: u8) -> TransportDelivery {
     }
 }
 
+fn qualified_queued_delivery(
+    account_id: &MemberId,
+    group: u8,
+    transport_route: u8,
+    id: u8,
+) -> TransportDelivery {
+    let mut delivery = queued_delivery(account_id, id);
+    delivery.group_id_hint = Some(GroupId::new(vec![group; 16]));
+    delivery.message.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: vec![transport_route; 32],
+    };
+    delivery
+}
+
 #[tokio::test]
 async fn retired_adapter_control_pop_cannot_defer_replacement_queue() {
     let relay = Arc::new(RecordingRelayClient::default());
@@ -4020,20 +4034,32 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
         .get(&account)
         .unwrap()
         .clone();
+    route.sender.install_routes(
+        [(1, 11), (2, 22)]
+            .into_iter()
+            .map(|(group, transport_route)| TransportGroupSubscription {
+                group_id: GroupId::new(vec![group; 16]),
+                transport_group_id: vec![transport_route; 32],
+                endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+            })
+            .collect(),
+    );
     for _ in 0..ACCOUNT_DELIVERY_BUFFER {
         assert!(matches!(
-            route
-                .sender
-                .route_delivery(queued_delivery(&account, 1), &route.overflow),
+            route.sender.route_delivery(
+                qualified_queued_delivery(&account, 1, 11, 1),
+                &route.overflow
+            ),
             RouteAdmission::Accepted
         ));
     }
     let RouteAdmission::Omitted {
         signal_generation: Some(generation),
         ..
-    } = route
-        .sender
-        .route_delivery(queued_delivery(&account, 2), &route.overflow)
+    } = route.sender.route_delivery(
+        qualified_queued_delivery(&account, 1, 11, 2),
+        &route.overflow,
+    )
     else {
         panic!("first omission reserves the exact control");
     };
@@ -4109,7 +4135,48 @@ async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
         loss.ticket.revision
     );
 
-    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+    for _ in 0..2 {
+        assert!(matches!(
+            client.adapter.receive_account_delivery().await.unwrap(),
+            Some(AccountDeliveryReceive::Delivery(_))
+        ));
+    }
+    assert!(matches!(
+        route.sender.route_delivery(
+            qualified_queued_delivery(&account, 2, 22, 3),
+            &route.overflow,
+        ),
+        RouteAdmission::Accepted
+    ));
+    let Some(AccountDeliveryReceive::Delivery(independent)) =
+        client.adapter.receive_account_delivery().await.unwrap()
+    else {
+        panic!("independent group must receive its alternate turn across the durable control");
+    };
+    assert_eq!(independent.message.payload, [3]);
+    assert_eq!(
+        client.adapter.queued_overflow_marker_token(),
+        Some(marker_token)
+    );
+    assert!(matches!(
+        client
+            .select_pending_epoch_backfill(EpochBackfillExecutionSeam::Receive)
+            .unwrap(),
+        PendingRecoverySelection::Deferred
+    ));
+    assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+    assert_eq!(
+        storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.cause == RecoveryCause::QueueLoss)
+            .unwrap()
+            .ticket
+            .revision,
+        loss.ticket.revision
+    );
+    for _ in 2..ACCOUNT_DELIVERY_BUFFER {
         assert!(matches!(
             client.adapter.receive_account_delivery().await.unwrap(),
             Some(AccountDeliveryReceive::Delivery(_))
@@ -4309,16 +4376,17 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
     .unwrap();
     for _ in 0..ACCOUNT_DELIVERY_BUFFER {
         assert!(matches!(
-            receiver.recv().await,
+            receiver.recv(&overflow).await,
             Some(AccountDeliveryEvent::Delivery(_))
         ));
     }
-    let AccountDeliveryEvent::Overflow { generation } = receiver.recv().await.unwrap() else {
+    let AccountDeliveryEvent::Overflow { generation } = receiver.recv(&overflow).await.unwrap()
+    else {
         panic!("control record")
     };
     assert_eq!(overflow.consume_signal(generation).dropped, 2);
     assert!(
-        receiver.try_recv().is_none(),
+        receiver.try_recv(&overflow).is_none(),
         "count updates do not enqueue duplicate controls"
     );
 }

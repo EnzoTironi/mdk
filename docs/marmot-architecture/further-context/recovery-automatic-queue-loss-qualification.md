@@ -298,6 +298,17 @@ Forwarder recovery retires a pending or ready control position atomically
 with signal cancellation, so accepted items behind it drain and a late marker
 writer cannot recreate it. The pending loss evidence remains authoritative.
 
+The current local revision also lets a qualified different-group delivery
+cross a **ready** overflow control only while the exact current queue marker
+is durable and no later omission has invalidated that fact. Every crossed
+control must be disjoint from the candidate group. Pending controls, stale
+queue generations or marker tokens, notification loss, changed routing, and
+same-group deliveries still block crossing. The control retains its loss
+authority and its direct Receive behavior. A real adapter regression checks
+the qualified dequeue and composes its consumed control with the existing
+Receive selection; it does not run the account worker or establish strict
+recovery on x86_64.
+
 The focused default and `test-policy-overrides` relay-plane suites each passed
 102 tests; both all-target `marmot-app` Clippy checks, formatting, and diff
 checks passed. Tests cover three-group progress and per-group order, overflow
@@ -315,8 +326,8 @@ ingested successfully at 13,761 ms, and observed by Alice at 13,771 ms.
 The target was returned and queued by that grant with no later grant; the
 durable QueueLoss marker and demand correctly remained pending. The passing
 run verifies the empty-queue timing path, not healthy cross-group service
-ahead of the original backlog: post-loss ordinary arrivals sit behind the
-reserved control and cannot overtake it. Neither local run classifies the 56
+ahead of the original backlog: at that earlier head, post-loss ordinary
+arrivals sat behind the reserved control. Neither local run classifies the 56
 recorded x86_64 failures across 14 prior heads; fresh-head CI and the open
 review blocker remain separate gates. No control promotion, recovery contract
 change, or fixture assertion change is included.
@@ -363,6 +374,24 @@ state and concurrent status/send/live bounds. The separate healthy event was
 accepted and dequeued at 14,075 ms, ingested at 14,083 ms, and observed by
 Alice at 14,088 ms. The QueueLoss marker and demand remained pending. Queue
 depth is an advisory sample, and neither log timestamps the exact control
-pop. This single revised local pass does not close the prior 60 failed x86_64
-attempts across 15 heads, the open review blocker, or fresh CI. The PR remains
-draft without merge, device qualification, default activation, or release.
+pop. Four later failed x86_64 attempts at head `8cbd4c7e` bring the recorded
+total to 64 across 16 heads. The original 42.80-second failure and revised
+56.79-second local pass remain separate evidence. Neither the new queue
+selection nor the local pass closes strict recovery or the open review blocker.
+
+A test-only Alice probe now reports three disjoint **completed** direct Receive
+intervals: claimed delivery to ingest return, ingest return to Receive tail
+completion, and tail completion to the next claimed delivery. A lock-held stop
+freezes totals and reports any unfinished parent interval at that boundary.
+Runtime ingest is a nested child; it can complete inside a parent later
+excluded or unfinished, so subtracting its aggregate from a completed parent
+aggregate would not give exact exclusive cost. Existing follow-up counters
+also include cycles later excluded for background handoff or joined-group
+work, and are not a matched subset of completed second intervals. The third
+interval includes waiting, duplicate filtering, overflow, and other worker
+arms; it is not a pure scheduler or CPU measure. Errors, reconnect, teardown,
+injected discard, background handoff, and joined-group tails are excluded or
+invalidated explicitly. No storage optimization is justified by these
+unmeasured local spans. Fresh-head CI is needed for timing evidence, and the
+PR remains draft without merge, device qualification, default activation, or
+release.

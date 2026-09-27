@@ -358,6 +358,16 @@ pub(crate) struct QueueDrainCostProbeTarget {
 }
 
 #[cfg(test)]
+impl QueueDrainCostProbeTarget {
+    pub(crate) fn for_account(
+        &self,
+        account_label: &str,
+    ) -> Option<Arc<crate::client::TestQueueDrainCostProbe>> {
+        (self.account_label == account_label).then(|| self.probe.clone())
+    }
+}
+
+#[cfg(test)]
 pub(crate) struct WorkerLoopPause {
     pub(crate) account_label: String,
     pub(crate) entered: oneshot::Sender<()>,
