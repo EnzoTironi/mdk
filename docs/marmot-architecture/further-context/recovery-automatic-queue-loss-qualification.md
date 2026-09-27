@@ -465,3 +465,34 @@ so comparisons need matched counts and boundaries, not additive subtraction.
 The probe does not claim to count panics. Fresh x86_64 evidence for the split
 is pending. The PR remains draft without merge, device qualification,
 default activation, or release.
+
+Exact `c3ae98f5` CI added four failed x86_64 QueueLoss attempts, reaching 78
+across 20 heads. The Receive and Maintenance-required fixtures each failed
+strict active acquisition on their first attempt and configured retry; Rust
+jobs 3–5 passed. Each failing attempt selected no grant during the hold and
+deferred 690–742 selections. Status, send, and healthy live probes passed,
+and target retention, epoch advance, and dependent plaintext appeared under
+a later grant while debt remained pending. Matching Alice direct measurements
+put `record_account_app_event_at` at 16.62–16.87 seconds inclusive within
+43.33–43.41 seconds of completed claim-to-ingest time. The nested source and
+timeline call took 8.20–8.42 seconds; chat-list refresh took 7.22–7.30
+seconds inclusive, including 0.89–1.00 seconds of hydration. The closure-exit
+to transaction-return envelope took 1.11–1.27 seconds. These measurements
+do not isolate SQL, CPU, fsync, or an exclusive wall-time partition.
+
+The current storage follow-up skips encrypted-media reference replacement
+only for a brand-new app event that cannot create media references under the
+existing chat component parser. Every existing message ID still takes the
+original replacement path, including non-media replays, so prior references
+can be retired. There is no new SQL or transaction split. A focused SQLite
+trace checks the skipped plain, custom-kind, and malformed media-tag cases
+and the retained replay and media paths. Existing encrypted-media tests pass
+17/17, including prune and reopen cases; an injected `BEFORE DELETE` failure
+checks that earlier app-event and timeline tag updates roll back and that
+the reference and retirement state remain unchanged. A successful same-ID
+media-to-plain transition retires the reference, and a conflicting replay
+retains the original source epoch. Focused app source-epoch tests pass with
+default and `test-policy-overrides` features; storage and app all-target
+Clippy checks pass in both configurations. No post-change x86_64 timing or
+strict fixture result exists yet. Speedup and strict recovery qualification
+remain unmeasured; the PR stays draft.

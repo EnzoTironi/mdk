@@ -678,6 +678,167 @@ mod tests {
     }
 
     #[test]
+    fn new_non_media_events_skip_reference_replacement_but_replays_do_not() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static REFERENCE_DELETES: AtomicUsize = AtomicUsize::new(0);
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        REFERENCE_DELETES.store(0, Ordering::SeqCst);
+        store.lock().unwrap().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(|event| {
+                if let TraceEvent::Profile(statement, _) = event
+                    && statement
+                        .sql()
+                        .contains("DELETE FROM encrypted_media_epoch_secret_references")
+                {
+                    REFERENCE_DELETES.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+
+        let mut plain = media_event("plain", 10, 7);
+        plain.tags.clear();
+        store.record_app_event(&plain).unwrap();
+        let mut custom = media_event("custom", 11, 7);
+        custom.kind = 22_224;
+        custom.tags.clear();
+        store.record_app_event(&custom).unwrap();
+        let mut malformed = media_event("malformed", 12, 7);
+        malformed.tags[0].push(format!("v {ENCRYPTED_MEDIA_FORMAT_V2}"));
+        store.record_app_event(&malformed).unwrap();
+        assert_eq!(REFERENCE_DELETES.load(Ordering::SeqCst), 0);
+
+        store.record_app_event(&plain).unwrap();
+        assert_eq!(REFERENCE_DELETES.load(Ordering::SeqCst), 1);
+        store
+            .record_app_event(&media_event("media", 13, 7))
+            .unwrap();
+        assert_eq!(REFERENCE_DELETES.load(Ordering::SeqCst), 2);
+        store
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::empty(), None);
+    }
+
+    #[test]
+    fn existing_media_transition_failure_rolls_back_and_replay_keeps_durable_epoch() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let media = media_event("transition", 10, 7);
+        store.record_app_event(&media).unwrap();
+        let before = {
+            let conn = store.lock().unwrap();
+            (
+                conn.query_row(
+                    "SELECT tags_json FROM app_events WHERE group_id_hex='aa' AND message_id_hex='transition'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                conn.query_row(
+                    "SELECT tags_json FROM message_timeline WHERE group_id_hex='aa' AND message_id_hex='transition'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            )
+        };
+        let mut plain = media.clone();
+        plain.tags.clear();
+        plain.plaintext = "plain replay".to_owned();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER abort_reference_delete
+                 BEFORE DELETE ON encrypted_media_epoch_secret_references
+                 BEGIN SELECT RAISE(ABORT, 'abort reference replacement'); END;",
+            )
+            .unwrap();
+        let error = store.record_app_event(&plain).unwrap_err();
+        assert!(format!("{error}").contains("abort reference replacement"));
+        let after_failure = {
+            let conn = store.lock().unwrap();
+            (
+                conn.query_row(
+                    "SELECT tags_json FROM app_events WHERE group_id_hex='aa' AND message_id_hex='transition'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                conn.query_row(
+                    "SELECT tags_json FROM message_timeline WHERE group_id_hex='aa' AND message_id_hex='transition'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(after_failure, before);
+        assert!(secret_is_referenced(
+            &store,
+            "aa",
+            GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            7
+        ));
+        assert!(
+            store
+                .encrypted_media_epoch_secret_may_be_served("aa", 7)
+                .unwrap()
+        );
+        let retirement_watermarks: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM encrypted_media_epoch_secret_retirement_watermarks",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retirement_watermarks, 0);
+
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER abort_reference_delete")
+            .unwrap();
+        store.record_app_event(&plain).unwrap();
+        assert!(!secret_is_referenced(
+            &store,
+            "aa",
+            GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            7
+        ));
+        assert!(
+            !store
+                .encrypted_media_epoch_secret_may_be_served("aa", 7)
+                .unwrap()
+        );
+
+        let mut conflicting_replay = media_event("transition", 20, 8);
+        conflicting_replay.plaintext = "media replay".to_owned();
+        store.record_app_event(&conflicting_replay).unwrap();
+        assert!(secret_is_referenced(
+            &store,
+            "aa",
+            GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            7
+        ));
+        assert!(!secret_is_referenced(
+            &store,
+            "aa",
+            GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            8
+        ));
+        assert!(
+            store
+                .encrypted_media_epoch_secret_may_be_served("aa", 7)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn shared_epoch_secret_survives_partial_sweep_until_final_reference() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store

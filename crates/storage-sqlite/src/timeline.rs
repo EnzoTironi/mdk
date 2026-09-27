@@ -818,7 +818,15 @@ impl SqliteAccountStorage {
                 }
             }
             reports::rescrub_control(&conn, &event.group_id_hex, &event.message_id_hex)?;
-            replace_encrypted_media_secret_references_tx(&conn, event)?;
+            // A brand-new non-media event cannot own retained media-secret
+            // references. Keep the full replacement for every replay: old
+            // references may require retirement even if visible tags changed.
+            if existing_event.is_some()
+                || (event.kind == MARMOT_APP_EVENT_KIND_CHAT
+                    && !encrypted_media_component_ids(&event.tags).is_empty())
+            {
+                replace_encrypted_media_secret_references_tx(&conn, event)?;
+            }
             upsert_message_modifier_edges_tx(&conn, event)?;
             for message_id in &affected_message_ids {
                 upsert_message_timeline_projection_for_message_tx(
