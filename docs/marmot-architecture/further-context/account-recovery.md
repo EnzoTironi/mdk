@@ -56,9 +56,13 @@ The simulator comes first; Jeff validates on a phone.
    - Attempts that fail only because relays were unreachable do not count toward the budget.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
-3. **Required relays are the group relays we operate.** These are the whitenoise.chat
-   relays, and NIP-77 is a hard requirement for group relays from now on. Any other relay
-   is read on a best-effort budget and never blocks completion.
+3. **Required relays are per route.** A group route requires its group relays. Today those
+   are the whitenoise.chat relays we operate, and NIP-77 is a hard requirement for group
+   relays from now on. The account inbox route requires the account's inbox relays. An
+   empty required set never certifies a scope. A required relay that does not support NIP-77
+   leaves its scope waiting for that capability; the scope does not complete vacuously.
+   Treating relays we do not operate as best-effort needs a configured set of operated
+   relays. Until one exists, every relay on a route is required.
 4. Both implementation steps land before the next MarmotKit release.
 
 ## Design
