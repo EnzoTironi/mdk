@@ -87,8 +87,9 @@ NIP-77 comparison covers what remains.
 - A delivery that misses the hand-off or spill limits becomes queue loss, as today: the
   cursor stays fenced until recovery settles that loss, and live input keeps flowing.
 - A spilled event counts as retained for cursor safety once its write is durable. The live
-  cursor never passes an event that is neither admitted, durably spilled, nor covered by
-  pending queue loss.
+  cursor passes an event only after it is admitted or durably spilled. Pending queue loss
+  holds the cursor fence until recovery settles the obligation. Deliveries already in hand
+  keep flowing, because the fence is on the subscription cursor.
 - While spilled rows remain, the worker alternates them with live deliveries, and yields
   between them, so neither a busy live queue nor a large spill starves the other. Order is
   not guaranteed; the engine already handles reordered input (deferral and retained input).
@@ -97,8 +98,8 @@ NIP-77 comparison covers what remains.
   attempts it is removed and recorded as queue loss in the same transaction, so recovery
   keeps an obligation.
 - In the incident, overflow came from replaying history the device already had. Under this
-  design that costs no network at all: the spilled events are admitted as duplicates and
-  dropped cheaply.
+  design those deliveries are discarded before they become spill rows, so the incident
+  creates no spill rows and no recovery fetch.
 
 ### 2. Recovery never touches live subscriptions
 
@@ -152,8 +153,6 @@ window is cheap once we are caught up.
 - Conservative mode (`RecoveryExecutorMode`). It is internal to `marmot-app` and not in the
   bindings.
 - Three recovery job slots and their yield flags in the worker loop, replaced by one.
-- The approved exception for unbounded retention of unresolved-loss rows. Loss records are
-  now capped at every tier.
 - The 22 recovery notes, replaced by this one. The bounded-acquisition interface contract
   stays in its own document.
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
@@ -172,6 +171,11 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Epoch-stall detector facts.
 - Post-join maintenance subscriptions. These are unchanged here and revisited later: they
   are also a full-history request.
+- The #1946 rule that recovery debt is never evicted. Spill rows are capped; unresolved loss
+  is not. Every unresolved loss generation and every parked obligation stays until qualified
+  completion or an explicit deep repair, with no fixed row cap, as
+  [runtime-state-bounds.md](../runtime-state-bounds.md) records. A cap on that debt would
+  need its own reviewed retirement rule.
 
 ## Storage
 
@@ -205,7 +209,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 | --- | --- | --- |
 | 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Nightly and #2060 done; docs in review; scorecard in progress |
 | 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | In review |
-| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | Not started |
+| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | In progress |
 
 ## Risks and open items
 
@@ -213,8 +217,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   tests).
 - Whether the fork reports a per-relay NIP-77 outcome with a truncation flag. If not, that
   needs a small fork change.
-- **Ask:** raise the NIP-77 match-set cap on the whitenoise relays to at least the
-  inventory cap (16,384 per route), so comparisons are never truncated.
+- The NIP-77 match-set cap on the whitenoise relays is 5,000,000 on both relays, far above
+  the inventory cap (16,384 per route), so comparisons there are not truncated.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.
