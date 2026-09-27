@@ -680,6 +680,49 @@ pub(crate) struct RecoveryDrainState {
     routes_dirty: bool,
     silence_started: std::time::Instant,
     gate_polled_at: std::time::Instant,
+    candidate_fence: CandidateDrainFence,
+}
+
+/// Attempt-local evidence that an adapter handoff has reached this account's
+/// serialized consumer. It is bounded by the comparison's candidate cap and
+/// carries no claim that the engine retained a consumed event.
+#[derive(Default)]
+struct CandidateDrainFence {
+    expected: HashSet<[u8; 32]>,
+    observed: HashSet<[u8; 32]>,
+    queued: Vec<(TransportReconciliationRoute, [u8; 32], u64)>,
+}
+
+struct PendingLocalCandidate {
+    route: TransportReconciliationRoute,
+    created_at: u64,
+}
+
+impl CandidateDrainFence {
+    fn observe(&mut self, id: &[u8]) {
+        if let Ok(id) = <[u8; 32]>::try_from(id)
+            && self.expected.contains(&id)
+        {
+            self.observed.insert(id);
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.queued
+            .iter()
+            .all(|(_, id, _)| self.observed.contains(id))
+    }
+
+    fn pending_candidates(&self) -> Vec<PendingLocalCandidate> {
+        self.queued
+            .iter()
+            .filter(|(_, id, _)| !self.observed.contains(id))
+            .map(|(route, _, created_at)| PendingLocalCandidate {
+                route: route.clone(),
+                created_at: *created_at,
+            })
+            .collect()
+    }
 }
 
 /// Owner scheduling budget between completed recovery deliveries. The
@@ -728,6 +771,7 @@ impl RecoveryDrainState {
             routes_dirty: false,
             silence_started: now,
             gate_polled_at: now,
+            candidate_fence: CandidateDrainFence::default(),
         }
     }
 }
@@ -803,6 +847,17 @@ impl DrainVerdict {
             Self::NoProgressQuantumYield
         }
     }
+}
+
+fn recovery_investigation_ended(verdict: DrainVerdict, local_admission_pending: bool) -> bool {
+    !local_admission_pending
+        && matches!(
+            verdict,
+            DrainVerdict::Complete
+                | DrainVerdict::RepairDeadline
+                | DrainVerdict::NovelProgressQuantumYield
+                | DrainVerdict::NoProgressQuantumYield
+        )
 }
 
 /// Turn the end-of-stored-events gate into the public outcome of an explicit
@@ -2819,7 +2874,8 @@ impl AppClient {
                 .is_some_and(|quantum| drain_started.elapsed() >= quantum)
                 && admission_complete
             {
-                if matches!(completion, DrainCompletion::EndOfStoredEvents { .. })
+                if state.candidate_fence.complete()
+                    && matches!(completion, DrainCompletion::EndOfStoredEvents { .. })
                     && self.backfill_drain_verdict().await == DrainVerdict::Complete
                 {
                     break Some(DrainVerdict::Complete);
@@ -2893,10 +2949,12 @@ impl AppClient {
                             self.backfill_drain_verdict().await
                         }
                     };
-                    if verdict == DrainVerdict::Complete && !admission_complete {
+                    if verdict == DrainVerdict::Complete
+                        && (!admission_complete || !state.candidate_fence.complete())
+                    {
                         // A closed transport can answer immediately. Let the
-                        // worker's slice clock elapse while the queue producer
-                        // still owns deliveries, instead of looping at once.
+                        // worker's slice clock elapse while the producer or
+                        // account consumer still owns candidate deliveries.
                         if let Some(slice_deadline) = slice_deadline {
                             tokio::time::sleep_until(slice_deadline).await;
                         }
@@ -2965,12 +3023,17 @@ impl AppClient {
             let event_id = hex::encode(delivery.message.id.as_slice());
             if receipts.contains(&event_id) {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
+                state
+                    .candidate_fence
+                    .observe(delivery.message.id.as_slice());
                 counts.skipped = counts.skipped.saturating_add(1);
                 // Liveness, but not progress. It must not outlast the moment
                 // the relays confirm they served this account's history.
-                if self
-                    .backfill_gate_reports_complete(completion, &mut gate_polled_at)
-                    .await
+                if admission_complete
+                    && state.candidate_fence.complete()
+                    && self
+                        .backfill_gate_reports_complete(completion, &mut gate_polled_at)
+                        .await
                 {
                     break Some(DrainVerdict::Complete);
                 }
@@ -2992,6 +3055,7 @@ impl AppClient {
                     .await);
             }
             let mut delivery_summary = SyncSummary::default();
+            let source_event_id = delivery.message.id.clone();
             let ingested =
                 match Self::ingest_delivery(receipts, *delivery, &mut delivery_summary).await {
                     Ok(ingested) => ingested,
@@ -3008,6 +3072,7 @@ impl AppClient {
                             .await);
                     }
                 };
+            state.candidate_fence.observe(source_event_id.as_slice());
             if ingested.must_stay_fetchable {
                 counts.unpersisted = counts.unpersisted.saturating_add(1);
             }
@@ -3059,11 +3124,15 @@ impl AppClient {
             state.summary = summary;
             return Ok(None);
         };
-        if verdict == DrainVerdict::Complete && !admission_complete {
-            // The immutable acquisition owns a batch that has not all reached
-            // the account queue. EOSE cannot end the drain before that owner
-            // submits its final item (or its bounded admission window fails).
+        if verdict == DrainVerdict::Complete
+            && (!admission_complete || !state.candidate_fence.complete())
+        {
+            // EOSE covers relay history, not local adapter/router/account
+            // consumption. The unchanged quantum bounds this pending handoff.
             state.summary = summary;
+            if let Some(slice) = slice {
+                tokio::time::sleep_until(slice_started + slice).await;
+            }
             return Ok(None);
         }
 
@@ -4773,20 +4842,49 @@ impl AppClient {
                 == Some(recovery.subscription_attempt))
     }
 
-    pub(crate) fn online_epoch_gap_start_drain(&self, recovery: &mut OnlineEpochGapRecovery) {
+    pub(crate) fn online_epoch_gap_start_drain(
+        &self,
+        recovery: &mut OnlineEpochGapRecovery,
+        network: &ComparisonNetworkResult,
+    ) {
         #[cfg(test)]
         {
             drop(recovery.phase.take());
             recovery.phase =
                 self.recovery_phase_guard(&recovery.grant, TestRecoveryPhase::Completion);
         }
-        recovery.drain = Some(RecoveryDrainState::new(
+        let mut drain = RecoveryDrainState::new(
             DrainCompletion::EndOfStoredEvents {
                 silence_budget: self.epoch_backfill_eose_wait(),
                 execution_quantum: self.epoch_backfill_execution_quantum(),
             },
             self.state.last_transport_timestamp,
-        ));
+        );
+        drain.candidate_fence.expected = network.continuation_candidate_ids();
+        recovery.drain = Some(drain);
+    }
+
+    pub(crate) fn online_epoch_gap_submissions_ready(
+        &self,
+        recovery: &mut OnlineEpochGapRecovery,
+        submissions: &[RouteSubmission],
+    ) {
+        let fence = &mut recovery
+            .drain
+            .as_mut()
+            .expect("online drain initialized")
+            .candidate_fence;
+        for route in submissions {
+            if route.continuation_evidence.is_some() {
+                fence.queued.extend(
+                    route
+                        .queued_candidates
+                        .iter()
+                        .copied()
+                        .map(|(id, created_at)| (route.route.clone(), id, created_at)),
+                );
+            }
+        }
     }
 
     pub(crate) async fn online_epoch_gap_drain_slice(
@@ -4813,6 +4911,12 @@ impl AppClient {
         drop(recovery.phase.take());
         let result = match drain {
             Ok((summary, verdict)) => {
+                let pending_local_candidates = recovery
+                    .drain
+                    .as_ref()
+                    .expect("online drain initialized")
+                    .candidate_fence
+                    .pending_candidates();
                 let continuation_evidence = submissions
                     .iter_mut()
                     .filter_map(|route| route.continuation_evidence.take())
@@ -4844,8 +4948,8 @@ impl AppClient {
                             &mut recovery.execution.counts,
                             &mut recovery.execution.drain_verdict,
                             (outcomes, continuation_evidence, unavailable_routes),
-                            summary,
-                            verdict,
+                            (summary, verdict),
+                            &pending_local_candidates,
                         )
                         .await
                     }
@@ -5204,8 +5308,8 @@ impl AppClient {
             counts,
             drain_verdict,
             comparison,
-            summary,
-            verdict,
+            (summary, verdict),
+            &[],
         )
         .await
     }
@@ -5223,9 +5327,10 @@ impl AppClient {
             Vec<PositiveContinuationEvidence>,
             Vec<TransportReconciliationRoute>,
         ),
-        mut summary: SyncSummary,
-        verdict: DrainVerdict,
+        drain: (SyncSummary, DrainVerdict),
+        pending_local_candidates: &[PendingLocalCandidate],
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let (mut summary, verdict) = drain;
         let (comparison_outcomes, continuation_evidence, unavailable_routes) = comparison;
         *drain_verdict = Some(verdict);
         let local = self.drain_pending_session_events().await.map_err(|error| {
@@ -5325,13 +5430,24 @@ impl AppClient {
                 } else {
                     outcome
                 };
-                let investigation_ended = matches!(
-                    verdict,
-                    DrainVerdict::Complete
-                        | DrainVerdict::RepairDeadline
-                        | DrainVerdict::NovelProgressQuantumYield
-                        | DrainVerdict::NoProgressQuantumYield
-                );
+                let local_admission_pending = obligation.scopes.iter().any(|scope| {
+                    pending_local_candidates.iter().any(|candidate| {
+                        candidate.created_at <= scope.goal.until_seconds
+                            && scope
+                                .goal
+                                .since_seconds
+                                .is_none_or(|since| candidate.created_at >= since)
+                            && match &candidate.route {
+                                TransportReconciliationRoute::Inbox => scope.goal.route_kind == 0,
+                                TransportReconciliationRoute::Group(id) => {
+                                    scope.goal.route_kind == 1
+                                        && scope.goal.transport_group_id.as_ref() == Some(id)
+                                }
+                            }
+                    })
+                });
+                let investigation_ended =
+                    recovery_investigation_ended(verdict, local_admission_pending);
                 let mut eligibility = super::recovery::eligibility_after_observation(
                     obligation.cause,
                     outcome,
@@ -7167,22 +7283,29 @@ mod worker_resume_boundary_tests;
 mod tests {
     use super::DrainCounts;
     use super::{
-        DrainVerdict, EpochBackfillReplayOutcome, TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
-        TransportReconciliationWork, backfill_drain_verdict, epoch_backfill_terminal_rows,
-        incomplete_full_history_repair, order_reconciliation_pass,
-        reconciliation_start_after_cursor, transport_reconciliation_record,
+        DrainVerdict, EpochBackfillReplayOutcome, RecoveryDrainState,
+        TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS, TransportReconciliationWork,
+        backfill_drain_verdict, epoch_backfill_terminal_rows, incomplete_full_history_repair,
+        order_reconciliation_pass, reconciliation_start_after_cursor, recovery_investigation_ended,
+        transport_reconciliation_record,
     };
     use crate::tests::{
         ScriptedPushRelayClient, armed_group_ids, bounded_epoch_backfill_config,
         client_on_app_relay_plane, make_group_terminal,
     };
     use crate::{MarmotApp, SyncFailureStage, SyncSummary};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use cgka_traits::TransportEndpoint;
     use marmot_account::AccountHome;
     use marmot_forensics::EpochBackfillActivationOutcome;
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
+    use transport_nostr_adapter::NostrRelayEvent;
+    use transport_nostr_peeler::NostrTransportEvent;
 
     #[cfg(feature = "test-policy-overrides")]
     #[test]
@@ -8659,6 +8782,195 @@ mod tests {
             DrainVerdict::EoseTimeout,
             "EOSE on every logical subscription is insufficient while another relay remains uncovered"
         );
+    }
+
+    #[tokio::test]
+    async fn eose_and_adapter_handoff_do_not_complete_unconsumed_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group = client.create_group("drain fence", &[]).await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let group_record = app
+            .group("alice", &hex::encode(group.as_slice()))
+            .unwrap()
+            .unwrap();
+        let route: [u8; 32] = hex::decode(group_record.nostr_routing.nostr_group_id_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        for subscription in relay.accepted_subscriptions() {
+            for endpoint in subscription.endpoints() {
+                app.relay_plane
+                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                    .await;
+            }
+        }
+        assert!(client.adapter.account_subscription_eose().await.complete());
+
+        // A signed but invalid MLS payload is enough to exercise the real
+        // adapter/router/account queue without claiming durable retention.
+        let event = EventBuilder::new(Kind::MlsGroupMessage, BASE64_STANDARD.encode([0_u8; 12]))
+            .tags([Tag::custom("h", [hex::encode(route)])])
+            .finalize(&Keys::generate())
+            .unwrap();
+        let id: [u8; 32] = hex::decode(event.id.to_hex()).unwrap().try_into().unwrap();
+        let handed_off = client
+            .adapter
+            .queue_reconciled_event(NostrRelayEvent {
+                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                subscription_id: Some("drain-fence-test".to_owned()),
+                event: NostrTransportEvent::from_nostr_event(&event).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(handed_off, 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app
+                .relay_plane
+                .relay_health()
+                .await
+                .account_delivery_queue_depth
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut drain = RecoveryDrainState::new(
+            super::DrainCompletion::EndOfStoredEvents {
+                silence_budget: Duration::from_secs(1),
+                execution_quantum: Duration::from_millis(1),
+            },
+            None,
+        );
+        drain.candidate_fence.expected.insert(id);
+        drain.candidate_fence.queued.push((
+            storage_sqlite::TransportReconciliationRoute::Group(route),
+            id,
+            crate::unix_now_seconds(),
+        ));
+        drain.drain_started = std::time::Instant::now() - Duration::from_millis(2);
+        let (_, verdict) = client
+            .drain_sdk_relay_slice(
+                &mut drain,
+                &mut DrainCounts::default(),
+                Some(Duration::from_millis(40)),
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verdict, DrainVerdict::NoProgressQuantumYield);
+        assert_eq!(drain.candidate_fence.pending_candidates().len(), 1);
+        assert_eq!(
+            app.relay_plane
+                .relay_health()
+                .await
+                .account_delivery_queue_depth,
+            1
+        );
+        assert!(!recovery_investigation_ended(verdict, true));
+        assert_eq!(
+            super::super::recovery::eligibility_after_observation(
+                storage_sqlite::RecoveryCause::QueueLoss,
+                storage_sqlite::RecoveryScopeOutcome::BudgetExhausted,
+                recovery_investigation_ended(verdict, true),
+                false,
+            ),
+            storage_sqlite::RecoveryEligibility::Retry,
+        );
+
+        for previously_consumed in [false, true] {
+            let mut complete = RecoveryDrainState::new(
+                super::DrainCompletion::EndOfStoredEvents {
+                    silence_budget: Duration::from_secs(1),
+                    execution_quantum: Duration::from_millis(1),
+                },
+                None,
+            );
+            if previously_consumed {
+                complete.candidate_fence.expected.insert(id);
+                complete.candidate_fence.queued.push((
+                    storage_sqlite::TransportReconciliationRoute::Group(route),
+                    id,
+                    crate::unix_now_seconds(),
+                ));
+                complete.candidate_fence.observed.insert(id);
+            }
+            complete.drain_started = std::time::Instant::now() - Duration::from_millis(2);
+            let (_, verdict) = client
+                .drain_sdk_relay_slice(
+                    &mut complete,
+                    &mut DrainCounts::default(),
+                    Some(Duration::from_millis(40)),
+                    true,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(verdict, DrainVerdict::Complete);
+        }
+
+        // A fresh bounded drain consumes the same queued ID through the
+        // account path. Consumption closes the local fence; its invalid MLS
+        // body does not become a claim of retained recovery input.
+        let mut resumed = RecoveryDrainState::new(
+            super::DrainCompletion::EndOfStoredEvents {
+                silence_budget: Duration::from_secs(1),
+                execution_quantum: Duration::from_secs(2),
+            },
+            None,
+        );
+        resumed.candidate_fence.expected.insert(id);
+        resumed.candidate_fence.queued.push((
+            storage_sqlite::TransportReconciliationRoute::Group(route),
+            id,
+            crate::unix_now_seconds(),
+        ));
+        let mut counts = DrainCounts::default();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let terminal = client
+                    .drain_sdk_relay_slice(
+                        &mut resumed,
+                        &mut counts,
+                        Some(Duration::from_millis(40)),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                if resumed.candidate_fence.complete() {
+                    assert!(resumed.candidate_fence.pending_candidates().is_empty());
+                    assert_eq!(
+                        super::super::recovery::eligibility_after_observation(
+                            storage_sqlite::RecoveryCause::QueueLoss,
+                            storage_sqlite::RecoveryScopeOutcome::BudgetExhausted,
+                            recovery_investigation_ended(
+                                DrainVerdict::NoProgressQuantumYield,
+                                false,
+                            ),
+                            false,
+                        ),
+                        storage_sqlite::RecoveryEligibility::NeedsDeepRepair,
+                    );
+                    break;
+                }
+                assert!(
+                    terminal.is_none(),
+                    "candidate cannot complete before consumption"
+                );
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -1830,6 +1830,7 @@ async fn run_app_runtime_account_worker(
                             Ok(true) => {
                                 client.online_epoch_gap_start_drain(
                                     job.recovery.as_mut().expect("online grant exists"),
+                                    &network,
                                 );
                                 job.queue = Some(EpochGapQueueJob::start(
                                     &client,
@@ -1916,6 +1917,10 @@ async fn run_app_runtime_account_worker(
                             );
                         }
                         let job = online_epoch_gap.as_mut().expect("online queue exists");
+                        client.online_epoch_gap_submissions_ready(
+                            job.recovery.as_mut().expect("online grant exists"),
+                            &submissions,
+                        );
                         job.credit = Some(job.queue.take().expect("online queue exists").into_credit());
                         job.submissions = submissions;
                     }

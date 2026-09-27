@@ -130,15 +130,18 @@ This pass is a nonreproduction of the preceding failure, not its cause or fix.
 Its target-route comparisons before the hold were clean request-cap prefixes;
 it does not integrate-qualify either new typed continuation.
 
-The exact `62555076` CI still failed 40 x86_64 attempts across ten heads.
-Rust jobs 1 and 2 failed the Receive and Maintenance fixture variants;
-Rust jobs 3–5 passed. The
-Receive fixture saw hundreds of ordinary deliveries queued at 45 seconds, so
-its zero-queue stimulus could not run. The target route returned only a small
-prefix of a large remote-only set in the first attempts and timed out during
-NEG in later attempts. Bob published healthy-route traffic, but Alice did not
-observe its plaintext within two seconds. The target remained missing. Capped
-owner-decision witnesses do not establish why the terminal attempt parked.
+The exact `62555076` CI added four failures, reaching 40 recorded x86_64
+failed attempts across ten heads. Rust jobs 1 and 2 failed the Receive and
+Maintenance fixture variants; Rust jobs 3–5 passed. The Receive fixture saw
+hundreds of ordinary deliveries queued at 45 seconds, so its zero-queue
+stimulus could not run. The target route returned only a small prefix of a
+large remote-only set in the first attempts and timed out during NEG in later
+attempts. Bob published healthy-route traffic, but Alice did not observe its
+plaintext within two seconds. In both jobs' second tries, useful target
+retention, MLS epoch advance, and dependent plaintexts appeared only after
+five later grants; the held attempt had lost active acquisition, so the strict
+same-grant assertion still failed. Capped owner-decision witnesses did not
+establish why the terminal attempt parked.
 
 One test-only cost probe ran the unchanged Receive fixture once on offline
 Linux arm64. It passed in 68.08 seconds: the queue reached zero before the
@@ -158,6 +161,48 @@ identify the x86 cost. Inventory/projection transaction consolidation remains
 an unproven production hypothesis pending x86 measurement. The local log is
 preserved at `/Volumes/Worktrees/codex/fdad/mdk-2060-linux-probe/logs/receive-loss-cost-linux.log`.
 The open CI blocker remains unresolved; this PR remains draft.
+
+Fresh `b667903c5` CI added four more failures, reaching 44 recorded x86_64
+failed attempts across eleven heads; Rust jobs 3–5 passed. In Rust job 1's
+Receive second try, the target route handed seven candidate events to the
+adapter, but 277 ordinary deliveries remained queued at 45 seconds. The owner
+recorded `Complete` with no candidate in durable reconciliation inventory and
+parked at `NoRetainedCandidate`; the target, epoch advance, and plaintexts were
+still absent at the fixture's useful-state gate. Adapter handoff proves neither
+account-worker consumption nor durable retention, and the exact FIFO position
+of those seven events was not witnessed. The Receive stimulus could not run
+while the account queue remained nonempty. The Maintenance first try in Rust
+job 2 eventually recovered useful state after five later grants but failed the
+same-grant active-acquisition assertion; its second try remained incomplete.
+Healthy live delivery also missed the strict bound in the failed backlog cases.
+
+The account-owned online drain now tracks at most the already bounded remote-only
+candidate IDs from its immutable network result. A successful adapter handoff
+records which candidate IDs were submitted, while the account worker records
+their actual consumption after a duplicate check or successful ingest. EOSE
+can still complete an empty or fully consumed fence. When a submitted candidate
+remains unconsumed, EOSE cannot end the attempt: the unchanged execution
+quantum yields an incomplete verdict, and only an obligation whose selected
+route and time scope contain that candidate remains paced `Retry`. Consumption
+does not assert retention; refused, released, malformed, stale, failed-handoff,
+zero-delivery, and overflow paths keep their existing owner checks. The change
+adds no durable ledger, public API, deadline, or workload adjustment. Focused
+default and feature tests cover real adapter queue handoff, EOSE before account
+consumption, consumption before the queue result is collected, failed and
+zero-delivery handoffs, owner pacing, and preserved empty-fence completion.
+
+One rebuilt offline Linux arm64 library test ran the original 500-event Receive
+fixture once on this correction and passed in 69.23 seconds. Its queue reached
+zero at 20,645 ms, the held target query began at 20,957 ms, and Alice observed
+the healthy live event at 21,046 ms. Active attempt 8 returned and queued the
+target without a later grant; durable retention, epoch advance, both dependent
+plaintexts, and the still-pending loss marker and demand satisfied the fixture.
+The full log is at
+`/Volumes/Worktrees/codex/fdad/mdk-2060-linux-probe/logs/receive-candidate-fence-linux.log`.
+The preceding uncorrected arm64 cost run also passed, so this result does not
+establish that the candidate fence fixes the x86_64 backlog or live-response
+failures. The 44 failed x86_64 attempts and open CI blocker remain unresolved;
+this PR remains draft.
 
 This is a focused local outcome, not proof for every account route shape,
 continuous traffic, relays without comparison support, process restart, or
