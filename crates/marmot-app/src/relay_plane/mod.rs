@@ -39,7 +39,9 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::DirectorySyncPlan;
 
+mod account_queue;
 mod directory;
+use account_queue::{AccountDeliveryReceiver, AccountDeliverySender, RouteAdmission, TrySendError};
 #[cfg(test)]
 pub(crate) mod publish_accounting_tests;
 mod safety;
@@ -156,14 +158,15 @@ pub struct MarmotRelayPlaneAccountAdapter {
     account_id: MemberId,
     relay_plane: MarmotRelayPlane,
     publish_client: Arc<dyn NostrRelayClient>,
-    delivery_rx: Arc<Mutex<mpsc::Receiver<AccountDeliveryEvent>>>,
+    delivery_rx: Arc<Mutex<AccountDeliveryReceiver>>,
+    delivery_queue_id: usize,
     delivery_overflow: Arc<AccountDeliveryOverflowState>,
     incremental_activation: Arc<Mutex<Option<IncrementalActivation>>>,
 }
 
 #[derive(Clone)]
 struct AccountDeliveryRoute {
-    sender: mpsc::Sender<AccountDeliveryEvent>,
+    sender: AccountDeliverySender,
     overflow: Arc<AccountDeliveryOverflowState>,
     recovery_marker: Option<AccountDeliveryRecoveryMarker>,
 }
@@ -1001,8 +1004,12 @@ impl MarmotRelayPlane {
         // deliveries stop at ACCOUNT_DELIVERY_BUFFER, so a full account queue
         // can always carry the explicit recovery signal without awaiting the
         // slow consumer or blocking the shared router.
-        let (delivery_tx, delivery_rx) = mpsc::channel(ACCOUNT_DELIVERY_BUFFER + 1);
+        let (delivery_tx, delivery_rx) = AccountDeliverySender::channel();
+        let delivery_queue_id = delivery_tx.identity();
         let mut routes = account_deliveries_write(&self.inner.transport.account_deliveries);
+        if let Some(old) = routes.get(&account_id) {
+            old.sender.retire_routes();
+        }
         let delivery_overflow = routes
             .get(&account_id)
             .map(|route| route.overflow.clone())
@@ -1025,6 +1032,7 @@ impl MarmotRelayPlane {
             relay_plane: self.clone(),
             publish_client,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
+            delivery_queue_id,
             delivery_overflow,
             incremental_activation: Arc::new(Mutex::new(None)),
         }
@@ -1203,7 +1211,11 @@ impl MarmotRelayPlane {
         &self,
         account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
-        account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
+        if let Some(route) =
+            account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id)
+        {
+            route.sender.retire_routes();
+        }
         self.inner
             .transport
             .adapter
@@ -1727,62 +1739,31 @@ impl MarmotRelayPlane {
                     // every omitted delivery belongs to that explicit recovery
                     // generation; the account cannot trust EOSE or its cursor
                     // again until an unfloored replay resolves the generation.
-                    let queue_depth = route
-                        .sender
-                        .max_capacity()
-                        .saturating_sub(route.sender.capacity());
-                    route.overflow.observe_queue_depth(queue_depth);
-                    if route.sender.capacity() <= 1 {
-                        #[cfg(test)]
-                        if let (Some(witness), Some(id)) = (&live_witness, live_id) {
-                            witness.record(id, TestLivePathStage::QueueFull);
-                        }
-                        let signal_generation = route.overflow.record_drop(queue_depth);
-                        if let Some(marker) = route.recovery_marker.clone() {
-                            persist_queue_loss(&route.sender, &route.overflow, marker, signal_generation);
-                        } else if let Some(generation) = signal_generation {
-                            enqueue_account_delivery_overflow_signal(&route.sender, &route.overflow, generation);
-                        }
-                        tracing::warn!(
-                            target: "marmot_app::relay_plane",
-                            method = "spawn_router",
-                            queue_depth,
-                            "omitting transport delivery: account delivery queue overflow recovery required",
-                        );
-                        continue;
-                    }
-                    match route
-                        .sender
-                        .try_send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
-                    {
-                        Ok(()) => {
+                    match route.sender.route_delivery(delivery, &route.overflow) {
+                        RouteAdmission::Accepted => {
                             #[cfg(test)]
                             if let (Some(witness), Some(id)) = (&live_witness, live_id) {
                                 witness.record(id, TestLivePathStage::QueueAccepted);
                             }
-                            let queue_depth = route
-                                .sender
-                                .max_capacity()
-                                .saturating_sub(route.sender.capacity());
-                            route.overflow.observe_queue_depth(queue_depth);
                         }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
+                        RouteAdmission::Omitted { queue_depth, signal_generation } => {
                             #[cfg(test)]
                             if let (Some(witness), Some(id)) = (&live_witness, live_id) {
                                 witness.record(id, TestLivePathStage::QueueFull);
                             }
-                            // Only this router writes the route, and it reserves
-                            // one control slot above, so reaching Full here
-                            // indicates a violated queue invariant rather than
-                            // ordinary backpressure.
+                            if let Some(marker) = route.recovery_marker.clone() {
+                                persist_queue_loss(&route.sender, &route.overflow, marker, signal_generation);
+                            } else if let Some(generation) = signal_generation {
+                                enqueue_account_delivery_overflow_signal(&route.sender, generation);
+                            }
                             tracing::warn!(
                                 target: "marmot_app::relay_plane",
                                 method = "spawn_router",
-                                error_kind = "reserved_overflow_slot_unavailable",
-                                "account delivery queue invariant failed",
+                                queue_depth,
+                                "omitting transport delivery: account delivery queue overflow recovery required",
                             );
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                        RouteAdmission::Closed => {
                             #[cfg(test)]
                             if let (Some(witness), Some(id)) = (&live_witness, live_id) {
                                 witness.record(id, TestLivePathStage::QueueClosed);
@@ -2522,10 +2503,11 @@ fn recover_relay_notification_forwarder_scoped(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .generation;
-            route.overflow.cancel_signal(generation);
-            let (closed_sender, closed_receiver) = mpsc::channel(1);
-            drop(closed_receiver);
-            route.sender = closed_sender;
+            route
+                .sender
+                .cancel_overflow_signal(&route.overflow, generation);
+            route.sender.retire_routes();
+            route.sender = AccountDeliverySender::closed();
         }
     }
     RelayNotificationForwarderHealth::increment(
@@ -2920,11 +2902,18 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .relay_safety
             .sanitize_activation(activation)
             .map_err(TransportAdapterError::Subscription)?;
+        let mut previous = self.incremental_activation.lock().await;
+        let routes = activation.group_subscriptions.clone();
+        let queue = account_deliveries_read(&self.relay_plane.inner.transport.account_deliveries)
+            .get(&self.account_id)
+            .filter(|route| route.sender.identity() == self.delivery_queue_id)
+            .map(|route| route.sender.clone())
+            .ok_or_else(|| TransportAdapterError::AccountNotActive(self.account_id.clone()))?;
+        queue.invalidate_routes();
         let incremental = activation.since.map(|since| IncrementalActivation {
             inbox_endpoints: activation.inbox_endpoints.clone(),
             since,
         });
-        let mut previous = self.incremental_activation.lock().await;
         let reuse = incremental.is_some()
             && *previous == incremental
             && self.account_subscription_eose().await.complete();
@@ -2932,17 +2921,19 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         // unconditional orphan-REQ cleanup. None always requests full history.
         *previous = None;
         let adapter = &self.relay_plane.inner.transport.adapter;
-        if reuse {
+        let result = if reuse {
             adapter
                 .sync_account_groups(TransportGroupSync {
                     account_id: activation.account_id,
                     group_subscriptions: activation.group_subscriptions,
                     since: activation.since,
                 })
-                .await?;
+                .await
         } else {
-            adapter.activate_account(activation).await?;
-        }
+            adapter.activate_account(activation).await
+        };
+        result?;
+        queue.install_routes(routes);
         *previous = incremental;
         Ok(())
     }
@@ -2960,12 +2951,22 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .relay_safety
             .sanitize_group_sync(sync)
             .map_err(TransportAdapterError::Subscription)?;
+        let _lifecycle = self.incremental_activation.lock().await;
+        let routes = sync.group_subscriptions.clone();
+        let queue = account_deliveries_read(&self.relay_plane.inner.transport.account_deliveries)
+            .get(&self.account_id)
+            .filter(|route| route.sender.identity() == self.delivery_queue_id)
+            .map(|route| route.sender.clone())
+            .ok_or_else(|| TransportAdapterError::AccountNotActive(self.account_id.clone()))?;
+        queue.invalidate_routes_if_changed(&routes);
         self.relay_plane
             .inner
             .transport
             .adapter
             .sync_account_groups(sync)
-            .await
+            .await?;
+        queue.install_routes(routes);
+        Ok(())
     }
 
     async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
@@ -3049,7 +3050,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
 /// queued. The one writer takes any deferred signal only after its latest
 /// watermark is durable, including signals requested while that writer ran.
 fn persist_queue_loss(
-    sender: &mpsc::Sender<AccountDeliveryEvent>,
+    sender: &AccountDeliverySender,
     overflow: &Arc<AccountDeliveryOverflowState>,
     marker: AccountDeliveryRecoveryMarker,
     signal: Option<u64>,
@@ -3068,29 +3069,25 @@ fn persist_queue_loss(
         tokio::spawn(async move {
             overflow.persist_marker_before_drop(marker).await;
             if overflow.take_durable_marker_signal(generation) {
-                enqueue_account_delivery_overflow_signal(&sender, &overflow, generation);
+                enqueue_account_delivery_overflow_signal(&sender, generation);
             }
         });
     } else if overflow.take_durable_marker_signal(generation) {
-        enqueue_account_delivery_overflow_signal(sender, overflow, generation);
+        enqueue_account_delivery_overflow_signal(sender, generation);
     }
 }
 
-fn enqueue_account_delivery_overflow_signal(
-    sender: &mpsc::Sender<AccountDeliveryEvent>,
-    overflow: &AccountDeliveryOverflowState,
-    generation: u64,
-) {
+fn enqueue_account_delivery_overflow_signal(sender: &AccountDeliverySender, generation: u64) {
     match sender.try_send(AccountDeliveryEvent::Overflow { generation }) {
         Ok(()) => {}
         Err(error) => {
-            overflow.cancel_signal(generation);
             tracing::warn!(
                 target: "marmot_app::relay_plane",
                 method = "spawn_router",
                 error_kind = match error {
-                    mpsc::error::TrySendError::Full(_) => "queue_full",
-                    mpsc::error::TrySendError::Closed(_) => "queue_closed",
+                    TrySendError::Full(_) => "queue_full",
+                    TrySendError::Closed(_) => "queue_closed",
+                    TrySendError::MissingReservation(_) => "reservation_retired",
                 },
                 "could not enqueue account delivery overflow recovery signal",
             );

@@ -176,7 +176,7 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
         panic!("poison account deliveries lock");
     }));
 
-    let (delivery_tx, _delivery_rx) = mpsc::channel(1);
+    let (delivery_tx, _delivery_rx) = AccountDeliverySender::channel();
     account_deliveries_write(&deliveries).insert(
         MemberId::new(vec![0x01; 32]),
         AccountDeliveryRoute {
@@ -716,6 +716,12 @@ struct RecordingRelayClient {
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
+    subscribe_gate: StdMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 struct TestNotificationSource {
@@ -1040,6 +1046,11 @@ impl NostrRelayClient for RecordingRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
+        let gate = self.subscribe_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
         self.subscriptions.lock().unwrap().push(subscription);
         Ok(())
     }
@@ -2081,6 +2092,371 @@ async fn live_path_witness_distinguishes_exact_account_queue_admission_and_deque
     assert_eq!(omitted_path.queue_full.count, 1);
     witness.stop();
     plane.set_live_path_witness(None);
+}
+
+#[tokio::test]
+async fn unchanged_account_group_sync_preserves_queued_deliveries() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA7; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let groups = [
+        TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xA1; 16]),
+            transport_group_id: vec![0x11; 32],
+            endpoints: vec![endpoint.clone()],
+        },
+        TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xB2; 16]),
+            transport_group_id: vec![0x22; 32],
+            endpoints: vec![endpoint.clone()],
+        },
+    ];
+    let adapter = plane.account_adapter(account.clone(), relay);
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: groups.to_vec(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    let events = [
+        group_event("old-a-1", &groups[0].transport_group_id),
+        group_event("old-a-2", &groups[0].transport_group_id),
+        group_event("new-b-1", &groups[1].transport_group_id),
+    ];
+    for event in &events[..2] {
+        plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("group-a".into()),
+                event: event.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    timeout(Duration::from_secs(2), async {
+        while plane.relay_health().await.account_delivery_queue_depth != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account.clone(),
+            group_subscriptions: groups.to_vec(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint,
+            subscription_id: Some("group-b".into()),
+            event: events[2].clone(),
+        })
+        .await
+        .unwrap();
+    for expected in &events {
+        let actual = timeout(Duration::from_secs(2), adapter.receive_account_delivery())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let AccountDeliveryReceive::Delivery(delivery) = actual else {
+            panic!("unexpected overflow");
+        };
+        assert_eq!(hex::encode(delivery.message.id.as_slice()), expected.id);
+    }
+}
+
+#[tokio::test]
+async fn unchanged_group_sync_keeps_other_group_responsive_behind_backlog() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA8; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let groups = [
+        TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xA1; 16]),
+            transport_group_id: vec![0x11; 32],
+            endpoints: vec![endpoint.clone()],
+        },
+        TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xB2; 16]),
+            transport_group_id: vec![0x22; 32],
+            endpoints: vec![endpoint.clone()],
+        },
+    ];
+    let adapter = plane.account_adapter(account.clone(), relay);
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint],
+            group_subscriptions: groups.to_vec(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    let route = account_deliveries_read(&plane.inner.transport.account_deliveries)
+        .get(&account)
+        .unwrap()
+        .clone();
+    let enqueue = |group: usize, id: u8| {
+        let mut delivery = queued_delivery(&account, id);
+        delivery.group_id_hint = Some(groups[group].group_id.clone());
+        delivery.message.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: groups[group].transport_group_id.clone(),
+        };
+        assert!(matches!(
+            route.sender.route_delivery(delivery, &route.overflow),
+            RouteAdmission::Accepted
+        ));
+    };
+    for _ in 0..30 {
+        enqueue(0, 1);
+    }
+    enqueue(1, 2);
+    let next_id = |received: Option<AccountDeliveryReceive>| match received.unwrap() {
+        AccountDeliveryReceive::Delivery(delivery) => delivery.message.payload[0],
+        AccountDeliveryReceive::Overflow(_) => panic!("unexpected control"),
+    };
+    assert_eq!(
+        next_id(adapter.receive_account_delivery().await.unwrap()),
+        1
+    );
+    assert_eq!(
+        next_id(adapter.receive_account_delivery().await.unwrap()),
+        2
+    );
+    for _ in 1..30 {
+        assert_eq!(
+            next_id(adapter.receive_account_delivery().await.unwrap()),
+            1
+        );
+    }
+
+    for _ in 0..30 {
+        enqueue(0, 1);
+    }
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account.clone(),
+            group_subscriptions: groups.to_vec(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    enqueue(1, 2);
+    let mut first_two = [
+        next_id(adapter.receive_account_delivery().await.unwrap()),
+        next_id(adapter.receive_account_delivery().await.unwrap()),
+    ];
+    first_two.sort();
+    assert_eq!(first_two, [1, 2]);
+    for _ in 1..30 {
+        assert_eq!(
+            next_id(adapter.receive_account_delivery().await.unwrap()),
+            1
+        );
+    }
+    for _ in 0..30 {
+        enqueue(0, 1);
+    }
+    let mut changed = groups.to_vec();
+    changed[0].transport_group_id = vec![0x33; 32];
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account.clone(),
+            group_subscriptions: changed,
+            since: None,
+        })
+        .await
+        .unwrap();
+    enqueue(1, 2);
+    for _ in 0..30 {
+        assert_eq!(
+            next_id(adapter.receive_account_delivery().await.unwrap()),
+            1
+        );
+    }
+    assert_eq!(
+        next_id(adapter.receive_account_delivery().await.unwrap()),
+        2
+    );
+    plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_group_sync_completion_cannot_install_routes_on_replacement_queue() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA9; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let groups = [
+        TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xA1; 16]),
+            transport_group_id: vec![0x11; 32],
+            endpoints: vec![endpoint.clone()],
+        },
+        TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xB2; 16]),
+            transport_group_id: vec![0x22; 32],
+            endpoints: vec![endpoint.clone()],
+        },
+    ];
+    let old = plane.account_adapter(account.clone(), relay.clone());
+    old.activate_account(TransportAccountActivation {
+        account_id: account.clone(),
+        inbox_endpoints: vec![endpoint.clone()],
+        group_subscriptions: groups[..1].to_vec(),
+        since: None,
+    })
+    .await
+    .unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    *relay.subscribe_gate.lock().unwrap() = Some((entered_tx, release_rx));
+    let pending = {
+        let old = old.clone();
+        let account = account.clone();
+        let groups = groups.to_vec();
+        tokio::spawn(async move {
+            old.sync_account_groups(TransportGroupSync {
+                account_id: account,
+                group_subscriptions: groups,
+                since: None,
+            })
+            .await
+        })
+    };
+    timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let replacement = plane.account_adapter(account.clone(), relay.clone());
+    assert_ne!(old.delivery_queue_id, replacement.delivery_queue_id);
+    release_tx.send(()).unwrap();
+    timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let route = account_deliveries_read(&plane.inner.transport.account_deliveries)
+        .get(&account)
+        .unwrap()
+        .clone();
+    for (group, id) in [(0, 1), (0, 2), (1, 3)] {
+        let mut delivery = queued_delivery(&account, id);
+        delivery.group_id_hint = Some(groups[group].group_id.clone());
+        delivery.message.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: groups[group].transport_group_id.clone(),
+        };
+        assert!(matches!(
+            route.sender.route_delivery(delivery, &route.overflow),
+            RouteAdmission::Accepted
+        ));
+    }
+    for expected in [1, 2, 3] {
+        let Some(AccountDeliveryReceive::Delivery(delivery)) =
+            replacement.receive_account_delivery().await.unwrap()
+        else {
+            panic!("replacement delivery");
+        };
+        assert_eq!(delivery.message.payload[0], expected);
+    }
+    plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn old_adapter_waiting_on_lifecycle_lock_cannot_claim_replacement_queue() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xAA; 32]);
+    let old = plane.account_adapter(account.clone(), relay.clone());
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let groups = [
+        TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xA1; 16]),
+            transport_group_id: vec![0x11; 32],
+            endpoints: vec![endpoint.clone()],
+        },
+        TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xB2; 16]),
+            transport_group_id: vec![0x22; 32],
+            endpoints: vec![endpoint.clone()],
+        },
+    ];
+    old.activate_account(TransportAccountActivation {
+        account_id: account.clone(),
+        inbox_endpoints: vec![endpoint],
+        group_subscriptions: groups[..1].to_vec(),
+        since: None,
+    })
+    .await
+    .unwrap();
+    let held = old.incremental_activation.lock().await;
+    let pending = {
+        let old = old.clone();
+        let account = account.clone();
+        let groups = groups.to_vec();
+        tokio::spawn(async move {
+            old.sync_account_groups(TransportGroupSync {
+                account_id: account,
+                group_subscriptions: groups,
+                since: None,
+            })
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
+    let replacement = plane.account_adapter(account.clone(), relay);
+    assert_ne!(old.delivery_queue_id, replacement.delivery_queue_id);
+    drop(held);
+    assert!(matches!(
+        timeout(Duration::from_secs(2), pending).await.unwrap().unwrap(),
+        Err(TransportAdapterError::AccountNotActive(id)) if id == account
+    ));
+    // The transport account remains active: the wrapper identity check, not
+    // an unrelated transport error, rejected the stale adapter.
+    plane
+        .inner
+        .transport
+        .adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account.clone(),
+            group_subscriptions: groups.to_vec(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    let route = account_deliveries_read(&plane.inner.transport.account_deliveries)
+        .get(&account)
+        .unwrap()
+        .clone();
+    for (group, id) in [(0, 1), (0, 2), (1, 3)] {
+        let mut delivery = queued_delivery(&account, id);
+        delivery.group_id_hint = Some(groups[group].group_id.clone());
+        delivery.message.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: groups[group].transport_group_id.clone(),
+        };
+        assert!(matches!(
+            route.sender.route_delivery(delivery, &route.overflow),
+            RouteAdmission::Accepted
+        ));
+    }
+    for expected in [1, 2, 3] {
+        let Some(AccountDeliveryReceive::Delivery(delivery)) =
+            replacement.receive_account_delivery().await.unwrap()
+        else {
+            panic!("replacement delivery");
+        };
+        assert_eq!(delivery.message.payload[0], expected);
+    }
+    plane.shutdown().await;
 }
 
 #[test]
@@ -3406,20 +3782,155 @@ async fn loss_authority_normal_close_does_not_invent_notification_loss() {
     plane.shutdown().await;
 }
 
+fn queued_delivery(account_id: &MemberId, id: u8) -> TransportDelivery {
+    TransportDelivery {
+        account_id: account_id.clone(),
+        group_id_hint: None,
+        message: TransportMessage {
+            id: MessageId::new(vec![id; 32]),
+            payload: vec![id],
+            timestamp: Timestamp(1),
+            causal_deps: Vec::new(),
+            source: TransportSource("nostr".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![0x11; 32],
+            },
+        },
+        received_at: Timestamp(1),
+        source: cgka_traits::TransportDeliverySource {
+            transport: TransportSource("nostr".into()),
+            plane: TransportDeliveryPlane::Group,
+            endpoint: Some(TransportEndpoint("wss://relay.example".into())),
+            subscription_id: None,
+            wire: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn forwarder_recovery_drains_suffix_while_marker_writer_finishes() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_id = MemberId::new(vec![0xA6; 32]);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let entered = StdMutex::new(Some(entered_tx));
+    let release = StdMutex::new(Some(release_rx));
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
+        entered.lock().unwrap().take().unwrap().send(()).unwrap();
+        release
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .blocking_recv()
+            .unwrap();
+        Ok(())
+    });
+    let adapter =
+        plane.account_adapter_with_recovery_marker(account_id.clone(), relay, Some(marker.clone()));
+    let route = account_deliveries_read(&plane.inner.transport.account_deliveries)
+        .get(&account_id)
+        .unwrap()
+        .clone();
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        assert!(matches!(
+            route
+                .sender
+                .route_delivery(queued_delivery(&account_id, 1), &route.overflow),
+            RouteAdmission::Accepted
+        ));
+    }
+    let RouteAdmission::Omitted {
+        signal_generation: Some(generation),
+        ..
+    } = route
+        .sender
+        .route_delivery(queued_delivery(&account_id, 2), &route.overflow)
+    else {
+        panic!("first omission reserves the marker position");
+    };
+    persist_queue_loss(&route.sender, &route.overflow, marker, Some(generation));
+    timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        adapter.receive_account_delivery().await.unwrap(),
+        Some(AccountDeliveryReceive::Delivery(_))
+    ));
+    assert!(matches!(
+        adapter.receive_account_delivery().await.unwrap(),
+        Some(AccountDeliveryReceive::Delivery(_))
+    ));
+    assert!(matches!(
+        route
+            .sender
+            .route_delivery(queued_delivery(&account_id, 3), &route.overflow),
+        RouteAdmission::Accepted
+    ));
+    recover_relay_notification_forwarder_scoped(
+        &plane.inner.transport,
+        RelayNotificationConsumerExit::Lagged(1),
+        Some(&account_id),
+    );
+    release_tx.send(()).unwrap();
+    drop(route);
+    let mut seen = Vec::new();
+    for _ in 2..ACCOUNT_DELIVERY_BUFFER + 1 {
+        let Some(AccountDeliveryReceive::Delivery(delivery)) =
+            timeout(Duration::from_secs(2), adapter.receive_account_delivery())
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("accepted suffix must drain before close");
+        };
+        seen.push(delivery.message.payload[0]);
+    }
+    assert_eq!(seen.pop(), Some(3));
+    assert!(seen.iter().all(|id| *id == 1));
+    assert!(
+        timeout(Duration::from_secs(2), adapter.receive_account_delivery())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    let pending = adapter.pending_delivery_overflow().unwrap();
+    assert_eq!(pending.dropped, 1);
+    assert_eq!(pending.notification_losses, 1);
+    assert!(adapter.delivery_overflow.marker_barrier_complete());
+    plane.shutdown().await;
+}
+
 #[tokio::test]
 async fn loss_authority_router_updates_a_marker_with_its_control_already_queued() {
     let overflow = Arc::new(AccountDeliveryOverflowState::default());
-    let (sender, mut receiver) = mpsc::channel(2);
+    let (sender, mut receiver) = AccountDeliverySender::channel();
     let latest = Arc::new(AtomicUsize::new(0));
     let observed = latest.clone();
     let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, count| {
         observed.store(count as usize, Ordering::SeqCst);
         Ok(())
     });
-    let signal = overflow.record_drop(1);
+    let account_id = MemberId::new(vec![0xA7; 32]);
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        assert!(matches!(
+            sender.route_delivery(queued_delivery(&account_id, 1), &overflow),
+            RouteAdmission::Accepted
+        ));
+    }
+    let RouteAdmission::Omitted {
+        signal_generation: signal,
+        ..
+    } = sender.route_delivery(queued_delivery(&account_id, 2), &overflow)
+    else {
+        panic!("first omission reserves control");
+    };
     persist_queue_loss(&sender, &overflow, marker.clone(), signal);
     timeout(Duration::from_secs(2), async {
-        while sender.capacity() == 2 {
+        while !overflow.marker_barrier_complete() {
             tokio::task::yield_now().await;
         }
     })
@@ -3435,12 +3946,18 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
     })
     .await
     .unwrap();
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        assert!(matches!(
+            receiver.recv().await,
+            Some(AccountDeliveryEvent::Delivery(_))
+        ));
+    }
     let AccountDeliveryEvent::Overflow { generation } = receiver.recv().await.unwrap() else {
         panic!("control record")
     };
     assert_eq!(overflow.consume_signal(generation).dropped, 2);
     assert!(
-        receiver.try_recv().is_err(),
+        receiver.try_recv().is_none(),
         "count updates do not enqueue duplicate controls"
     );
 }

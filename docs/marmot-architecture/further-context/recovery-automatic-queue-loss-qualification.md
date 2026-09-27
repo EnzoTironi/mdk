@@ -279,3 +279,44 @@ attempt, per-route comparison counts, and remaining outer deadline. A selected
 scope alone does not establish that an exact-ID request was issued or that the
 missing event was admitted. Failed relay comparisons and unattempted suffixes
 remain partial coverage with durable debt; they are not successful recovery.
+
+The account delivery queue now admits at most 1,024 ordinary items plus one
+reserved overflow control position. The first omission records its position
+with the account-local loss authority; when a durable marker is configured,
+its writer activates that position only after persistence or storage closure.
+The single account receiver alternates its FIFO head with the earliest
+different, locally validated group before that control position, without
+overtaking any event in the same group. Validation requires the exact locally
+installed group hint,
+transport route, and endpoint. Unknown, ambiguous, changed, and retired route
+keys remain FIFO barriers. An unchanged sanitized group sync preserves valid
+keys across its await; changed maps invalidate before the await. Activation
+still invalidates conservatively. Adapter lifecycle calls serialize on their
+shared lock, and queue identity and retirement prevent a stale adapter or
+completion from installing scheduling authority in a replacement queue.
+Forwarder recovery retires a pending or ready control position atomically
+with signal cancellation, so accepted items behind it drain and a late marker
+writer cannot recreate it. The pending loss evidence remains authoritative.
+
+The focused default and `test-policy-overrides` relay-plane suites each passed
+102 tests; both all-target `marmot-app` Clippy checks, formatting, and diff
+checks passed. Tests cover three-group progress and per-group order, overflow
+position and capacity, unknown/ambiguous/rebound FIFO, unchanged versus
+changed route sync, cancellation and close, marker completion on both sides of
+forwarder recovery, and stale adapter lookup/completion around replacement.
+The original, unchanged Receive fixture failed one local 43.26-second run:
+its ordinary stimulus was never sent because none of 277 checks saw an empty
+queue; the exact healthy event was accepted at 12,178 ms but dequeued at
+14,088 ms. A later single local 43.08-second run passed every strict fixture
+assertion. In that run one of 308 stimulus checks saw an empty, idle queue at
+13,607 ms; the active Receive attempt 8 entered the held target query at
+13,723 ms, and the healthy event was accepted and dequeued at 13,753 ms,
+ingested successfully at 13,761 ms, and observed by Alice at 13,771 ms.
+The target was returned and queued by that grant with no later grant; the
+durable QueueLoss marker and demand correctly remained pending. The passing
+run verifies the empty-queue timing path, not healthy cross-group service
+ahead of the original backlog: post-loss ordinary arrivals sit behind the
+reserved control and cannot overtake it. Neither local run classifies the 56
+recorded x86_64 failures across 14 prior heads; fresh-head CI and the open
+review blocker remain separate gates. No control promotion, recovery contract
+change, or fixture assertion change is included.
