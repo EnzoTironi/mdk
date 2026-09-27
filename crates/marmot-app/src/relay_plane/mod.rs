@@ -74,6 +74,15 @@ const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
 const RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const RELAY_NOTIFICATION_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME: Duration = Duration::from_secs(5);
+/// Notifications a relay consumer may queue for its event worker before the
+/// backlog counts as receiver loss. A catch-up rebuild replays every stored
+/// event inside the lookback window as a raw relay copy, plus a deduplicated
+/// delivery for events the SDK client has not seen, so ordinary catch-ups
+/// queue far more than a few hundred. Loss closes the account delivery route
+/// and sends the account worker through reconnect, so match the pinned SDK
+/// client's per-receiver notification buffer, which bounded the inline
+/// consumer this queue replaced.
+const RELAY_NOTIFICATION_EVENT_QUEUE_CAPACITY: usize = 4096;
 
 #[derive(Clone)]
 pub struct MarmotRelayPlane {
@@ -1781,6 +1790,9 @@ struct NotificationWorkerFailureHook {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
     fail_once: AtomicBool,
+    /// Hold the first notification like `fail_once`, then handle it normally:
+    /// a busy, not failed, event worker.
+    stall_once: AtomicBool,
 }
 
 struct SdkRelayNotificationSource {
@@ -2080,8 +2092,7 @@ async fn run_relay_notification_consumer_scoped(
     account_id: Option<MemberId>,
     source: Arc<dyn RelayNotificationSource>,
 ) -> RelayNotificationConsumerOutcome {
-    const EVENT_QUEUE_CAPACITY: usize = 256;
-    let (sender, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    let (sender, mut event_rx) = mpsc::channel(RELAY_NOTIFICATION_EVENT_QUEUE_CAPACITY);
     // Channel capacity returns to its maximum when a panicked worker drops
     // the receiver, even though queued work was discarded. Count admitted
     // items independently until each worker operation actually finishes.
@@ -2092,12 +2103,15 @@ async fn run_relay_notification_consumer_scoped(
     let mut worker = tokio::spawn(async move {
         while let Some(notification) = event_rx.recv().await {
             #[cfg(test)]
-            if let Some(hook) = &worker_failure_hook
-                && hook.fail_once.swap(false, Ordering::SeqCst)
-            {
-                hook.entered.notify_one();
-                hook.release.notified().await;
-                panic!("injected relay notification worker failure");
+            if let Some(hook) = &worker_failure_hook {
+                let fail = hook.fail_once.swap(false, Ordering::SeqCst);
+                if fail || hook.stall_once.swap(false, Ordering::SeqCst) {
+                    hook.entered.notify_one();
+                    hook.release.notified().await;
+                    if fail {
+                        panic!("injected relay notification worker failure");
+                    }
+                }
             }
             if handle_relay_notification(notification, &adapter, account_id.as_ref()).await {
                 worker_pending.fetch_sub(1, Ordering::SeqCst);

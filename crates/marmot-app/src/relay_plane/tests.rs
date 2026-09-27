@@ -440,15 +440,26 @@ struct QueuedWorkerFailureSource {
 
 impl QueuedWorkerFailureSource {
     fn new(loss: NostrSdkRelayClient) -> Self {
+        Self::with_hook(loss, 8, true)
+    }
+
+    /// The worker holds its first notification, then keeps working. The
+    /// receiver buffer matches the SDK client's per-receiver notifications.
+    fn busy(loss: NostrSdkRelayClient) -> Self {
+        Self::with_hook(loss, 4096, false)
+    }
+
+    fn with_hook(loss: NostrSdkRelayClient, capacity: usize, fail_once: bool) -> Self {
         Self {
-            sender: broadcast::channel(8).0,
+            sender: broadcast::channel(capacity).0,
             subscriptions: AtomicUsize::new(0),
             notifications_queued: AtomicUsize::new(0),
             loss,
             hook: Arc::new(NotificationWorkerFailureHook {
                 entered: Notify::new(),
                 release: Notify::new(),
-                fail_once: AtomicBool::new(true),
+                fail_once: AtomicBool::new(fail_once),
+                stall_once: AtomicBool::new(!fail_once),
             }),
         }
     }
@@ -582,6 +593,102 @@ async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
         .await
         .expect("supervisor stops after the replacement observes shutdown")
         .unwrap();
+    sdk.shutdown_accounts().await;
+}
+
+/// A catch-up rebuild replays every stored event inside the lookback window:
+/// a raw relay copy of each one, plus a deduplicated delivery for events this
+/// SDK client has not seen. A busy event worker must absorb that replay.
+/// Declaring it notification loss closes the account's delivery route and
+/// sends the account worker through reconnect, whose rejected commands fail
+/// with `transport_closed` (the nightly 1024-message backlog journeys).
+#[tokio::test]
+async fn busy_notification_worker_absorbs_rebuild_replay_without_loss() {
+    use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
+
+    // Unseen replay of a 1024-message backlog: delivery plus raw copy each.
+    const REPLAYED_NOTIFICATIONS: usize = 2 * 1024;
+    let sdk = NostrSdkRelayClient::multi_account();
+    let alice_keys = Keys::generate();
+    let alice = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+    let alice_client = sdk
+        .register_account(alice.clone(), Arc::new(alice_keys))
+        .await
+        .unwrap();
+    let alice_loss = sdk.notification_loss_for_account(&alice).await.unwrap();
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice_adapter = plane.account_adapter(alice.clone(), relay);
+    let source = Arc::new(QueuedWorkerFailureSource::busy(alice_client));
+    let supervisor = spawn_relay_notification_supervisor_scoped(
+        source.clone(),
+        plane.inner.transport.clone(),
+        Some(alice),
+    );
+    timeout(Duration::from_secs(2), async {
+        while source.subscriptions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the supervised consumer subscribes");
+    source.send_notice();
+    timeout(Duration::from_secs(2), source.hook.entered.notified())
+        .await
+        .expect("the event worker is busy with its first notification");
+
+    let stored = EventBuilder::new(Kind::MlsGroupMessage, "stored group message")
+        .tags([Tag::custom("h", [hex::encode([0xD4; 32])])])
+        .finalize(&Keys::generate())
+        .expect("sign stored group event");
+    let relay_url = RelayUrl::parse("wss://relay.example").unwrap();
+    let subscription_id = SubscriptionId::new("rebuilt-group-subscription");
+    for _ in 0..REPLAYED_NOTIFICATIONS {
+        source
+            .sender
+            .send(RelayPoolNotification::Message {
+                relay_url: relay_url.clone(),
+                message: Box::new(RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(subscription_id.clone()),
+                    event: std::borrow::Cow::Owned(stored.clone()),
+                }),
+            })
+            .expect("supervisor has an active receiver");
+    }
+    source
+        .sender
+        .send(RelayPoolNotification::Message {
+            relay_url,
+            message: Box::new(RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                subscription_id,
+            ))),
+        })
+        .expect("supervisor has an active receiver");
+
+    let health = &plane.inner.transport.notification_forwarder_health;
+    timeout(Duration::from_secs(10), async {
+        while health.snapshot().lag_incidents == 0
+            && source.notifications_queued.load(Ordering::SeqCst) < REPLAYED_NOTIFICATIONS + 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the consumer admits the replay or reports loss");
+    assert_eq!(
+        health.snapshot().lag_incidents,
+        0,
+        "an ordinary rebuild replay is not notification loss"
+    );
+    assert!(alice_loss.borrow().is_none());
+    assert!(
+        alice_adapter.pending_delivery_overflow().is_none(),
+        "the account delivery route stays open"
+    );
+
+    source.hook.release.notify_one();
+    supervisor.abort();
+    let _ = supervisor.await;
     sdk.shutdown_accounts().await;
 }
 
