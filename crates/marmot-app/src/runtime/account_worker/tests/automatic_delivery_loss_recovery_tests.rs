@@ -696,6 +696,13 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     gate.diagnostic_dropped.store(0, Ordering::SeqCst);
     *gate.target_gate_entry_ms.lock().unwrap() = None;
     let diagnostic_origin = std::time::Instant::now();
+    let live_path_witness = Arc::new(crate::relay_plane::TestLivePathWitness::new(
+        cgka_traits::MemberId::new(hex::decode(&alice.account_id_hex).unwrap()),
+        groups[1].clone(),
+        diagnostic_origin,
+    ));
+    app.relay_plane
+        .set_live_path_witness(Some(live_path_witness.clone()));
     *gate.diagnostic_origin.lock().unwrap() = Some(diagnostic_origin);
     *activity.diagnostic_origin.lock().unwrap() = Some(diagnostic_origin);
     // One low-rate observer on this fixture's current-thread Tokio runtime.
@@ -823,6 +830,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         let publish_started = Some(live_boundary());
         let mut publish_completed = None;
         let mut alice_observed = None;
+        let mut bob_inner_id = None;
         let probe = timeout(Duration::from_secs(2), async {
             let send = bob_client
                 .send_custom_event(
@@ -833,7 +841,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
                 )
                 .await;
             publish_completed = Some((live_boundary(), send.is_ok()));
-            send.unwrap();
+            bob_inner_id = send.unwrap().message_ids.into_iter().next();
             loop {
                 if app.messages(&alice.label).unwrap().iter().any(|message| {
                     message.kind == 22_226 && message.plaintext == "healthy live during loss"
@@ -851,12 +859,20 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
             publish_started,
             publish_completed,
             alice_observed,
+            bob_inner_id,
         )
     };
     let (
         (status_probe, status_after),
         (send_probe, send_after),
-        (live_ok, live_after, live_publish_started, live_publish_completed, live_alice_observed),
+        (
+            live_ok,
+            live_after,
+            live_publish_started,
+            live_publish_completed,
+            live_alice_observed,
+            bob_inner_id,
+        ),
     ) = tokio::join!(status_work, send_work, live_work);
     let status_ok = matches!(&status_probe, Ok(Ok(Ok(_))));
     let status_timed_out = status_probe.is_err();
@@ -882,6 +898,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     let active_jobs_at_release = activity.active_jobs.load(Ordering::SeqCst);
     let active_requests_at_release = activity.active_requests.load(Ordering::SeqCst);
     let wake_lag = wake_lag_probe.stop_and_snapshot();
+    live_path_witness.stop();
     gate.release();
     cost_probe.enabled.store(false, Ordering::SeqCst);
     let cost_window_ms = cost_window_started
@@ -924,6 +941,30 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
             after.in_flight,
         )
     });
+    // The sender's local timeline binds its returned inner ID to the exact
+    // published outer transport ID. Resolve it after the timed hold, then
+    // select only that ID from the bounded group-hint candidate witness.
+    let (live_correlation, live_exact_id) = match bob_inner_id.as_deref() {
+        None => ("no_inner_id", None),
+        Some(inner_id) => {
+            match app.timeline_message(&bob.label, &hex::encode(&groups[1]), inner_id) {
+                Err(_) => ("local_lookup_error", None),
+                Ok(None) => ("local_row_absent", None),
+                Ok(Some(row)) => match row.source_message_id_hex {
+                    None => ("source_unpublished", None),
+                    Some(source) => match hex::decode(source)
+                        .ok()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    {
+                        Some(id) => ("exact_local_source", Some(id)),
+                        None => ("malformed_local_source", None),
+                    },
+                },
+            }
+        }
+    };
+    let (live_group_candidates, live_group_observations_dropped, live_exact_path) =
+        live_path_witness.snapshot(live_exact_id);
     let selected = selections.lock().unwrap().clone();
     let route_outcomes = activity
         .route_outcomes
@@ -1040,6 +1081,9 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         cost_probe.directory_queries.snapshot(),
         cost_probe.directory_merge.snapshot(),
         cost_probe.directory_write_attempts.snapshot(),
+    );
+    eprintln!(
+        "loss_live_path: correlation={live_correlation}, bounded_group_hint_candidates={live_group_candidates}, dropped_group_hint_observations={live_group_observations_dropped}, exact_event_stage_aggregates={live_exact_path:?}; repeated event IDs retain per-stage counts and first timestamps, which do not link stages to the same copy; group-hint candidates are not exact-event evidence until correlated to the sender's local published source; absence after the timed probe is unknown, not proof of relay loss"
     );
     if status_timed_out {
         timeout(Duration::from_secs(30), status_rx)

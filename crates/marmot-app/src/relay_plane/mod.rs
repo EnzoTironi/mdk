@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::sync::{
     Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -106,6 +108,8 @@ struct RelayPlaneTransport {
     directory_client: Option<NostrSdkClient>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     account_deliveries: RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
+    #[cfg(test)]
+    live_path_witness: StdMutex<Option<Arc<TestLivePathWitness>>>,
     account_delivery_metrics: Arc<AccountDeliveryMetrics>,
     router: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder: Mutex<Option<JoinHandle<()>>>,
@@ -177,6 +181,164 @@ pub(crate) enum AccountDeliveryRecoveryMarkerError {
 enum AccountDeliveryEvent {
     Delivery(Box<TransportDelivery>),
     Overflow { generation: u64 },
+}
+
+/// Fixture-local, bounded group-hint candidates until the sender's exact outer
+/// transport ID is recovered after the timed probe. IDs never enter output.
+#[cfg(test)]
+pub(crate) struct TestLivePathWitness {
+    account_id: MemberId,
+    group_id_hint: cgka_traits::GroupId,
+    origin: Instant,
+    active: AtomicBool,
+    records: StdMutex<Vec<TestLivePathRecord>>,
+    dropped_observations: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestLivePathStage {
+    RouterArrival,
+    QueueAccepted,
+    QueueFull,
+    QueueClosed,
+    NoAccount,
+    Dequeued,
+    DuplicateSkipped,
+    IngestEntered,
+    IngestProjectionCallOk,
+    IngestProjectionCallError,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestLivePathRecord {
+    id: [u8; 32],
+    stages: TestLivePathSnapshot,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestLivePathObservation {
+    pub(crate) first_ms: Option<u64>,
+    pub(crate) count: u64,
+}
+
+#[cfg(test)]
+impl TestLivePathObservation {
+    fn observe(&mut self, ms: u64) {
+        self.first_ms.get_or_insert(ms);
+        self.count = self.count.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TestLivePathSnapshot {
+    pub(crate) router_arrival: TestLivePathObservation,
+    pub(crate) queue_accepted: TestLivePathObservation,
+    pub(crate) queue_full: TestLivePathObservation,
+    pub(crate) queue_closed: TestLivePathObservation,
+    pub(crate) no_account: TestLivePathObservation,
+    pub(crate) dequeued: TestLivePathObservation,
+    pub(crate) duplicate_skipped: TestLivePathObservation,
+    pub(crate) ingest_entered: TestLivePathObservation,
+    /// Call result only: Ok does not certify a visible row or final checkpoint.
+    /// A panic leaves both result fields absent rather than appearing as Err.
+    pub(crate) ingest_call_ok: TestLivePathObservation,
+    pub(crate) ingest_call_error: TestLivePathObservation,
+}
+
+#[cfg(test)]
+impl TestLivePathWitness {
+    const MAX_CANDIDATES: usize = 16;
+
+    pub(crate) fn new(
+        account_id: MemberId,
+        group_id_hint: cgka_traits::GroupId,
+        origin: Instant,
+    ) -> Self {
+        Self {
+            account_id,
+            group_id_hint,
+            origin,
+            active: AtomicBool::new(true),
+            records: StdMutex::new(Vec::new()),
+            dropped_observations: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        let _records = self.records.lock().unwrap();
+        self.active.store(false, Ordering::SeqCst);
+    }
+
+    fn match_id(&self, delivery: &TransportDelivery) -> Option<[u8; 32]> {
+        if !self.active.load(Ordering::SeqCst) || delivery.account_id != self.account_id {
+            return None;
+        }
+        if delivery.group_id_hint.as_ref() != Some(&self.group_id_hint)
+            || !matches!(
+                &delivery.message.envelope,
+                cgka_traits::transport::TransportEnvelope::GroupMessage { .. }
+            )
+        {
+            return None;
+        }
+        delivery.message.id.as_slice().try_into().ok()
+    }
+
+    fn record(&self, id: [u8; 32], stage: TestLivePathStage) {
+        if !self.active.load(Ordering::SeqCst) {
+            return;
+        }
+        let ms = self.origin.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let mut records = self.records.lock().unwrap();
+        if !self.active.load(Ordering::SeqCst) {
+            return;
+        }
+        let record = if let Some(record) = records.iter_mut().find(|record| record.id == id) {
+            record
+        } else {
+            if records.len() == Self::MAX_CANDIDATES {
+                self.dropped_observations.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            records.push(TestLivePathRecord {
+                id,
+                stages: TestLivePathSnapshot::default(),
+            });
+            records.last_mut().unwrap()
+        };
+        let observation = match stage {
+            TestLivePathStage::RouterArrival => &mut record.stages.router_arrival,
+            TestLivePathStage::QueueAccepted => &mut record.stages.queue_accepted,
+            TestLivePathStage::QueueFull => &mut record.stages.queue_full,
+            TestLivePathStage::QueueClosed => &mut record.stages.queue_closed,
+            TestLivePathStage::NoAccount => &mut record.stages.no_account,
+            TestLivePathStage::Dequeued => &mut record.stages.dequeued,
+            TestLivePathStage::DuplicateSkipped => &mut record.stages.duplicate_skipped,
+            TestLivePathStage::IngestEntered => &mut record.stages.ingest_entered,
+            TestLivePathStage::IngestProjectionCallOk => &mut record.stages.ingest_call_ok,
+            TestLivePathStage::IngestProjectionCallError => &mut record.stages.ingest_call_error,
+        };
+        observation.observe(ms);
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        id: Option<[u8; 32]>,
+    ) -> (usize, u64, Option<TestLivePathSnapshot>) {
+        let records = self.records.lock().unwrap();
+        let exact = id
+            .and_then(|id| records.iter().find(|record| record.id == id))
+            .map(|record| record.stages);
+        (
+            records.len(),
+            self.dropped_observations.load(Ordering::SeqCst),
+            exact,
+        )
+    }
 }
 
 /// Aggregate, privacy-safe description of one unresolved per-account queue
@@ -666,6 +828,35 @@ pub struct RelayPlaneHealth {
 }
 
 impl MarmotRelayPlane {
+    #[cfg(test)]
+    pub(crate) fn set_live_path_witness(&self, witness: Option<Arc<TestLivePathWitness>>) {
+        *self.inner.transport.live_path_witness.lock().unwrap() = witness;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_path_id(&self, delivery: &TransportDelivery) -> Option<[u8; 32]> {
+        self.inner
+            .transport
+            .live_path_witness
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|witness| witness.match_id(delivery))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_live_path_id(&self, id: [u8; 32], stage: TestLivePathStage) {
+        if let Some(witness) = self
+            .inner
+            .transport
+            .live_path_witness
+            .lock()
+            .unwrap()
+            .as_ref()
+        {
+            witness.record(id, stage);
+        }
+    }
     pub fn runtime_default(subscription_rebuild_lookback: Duration) -> Self {
         Self::from_sdk(Some(subscription_rebuild_lookback), false)
     }
@@ -763,6 +954,8 @@ impl MarmotRelayPlane {
             directory_client,
             directory_events: broadcast::channel(DIRECTORY_EVENT_BUFFER).0,
             account_deliveries: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            live_path_witness: StdMutex::new(None),
             account_delivery_metrics: Arc::new(AccountDeliveryMetrics::default()),
             router: Mutex::new(None),
             notification_forwarder: Mutex::new(None),
@@ -1513,6 +1706,14 @@ impl MarmotRelayPlane {
         let adapter = transport.adapter.clone();
         let handle = handle.spawn(async move {
             while let Ok(Some(delivery)) = adapter.receive().await {
+                #[cfg(test)]
+                let live_witness = transport.live_path_witness.lock().unwrap().clone();
+                #[cfg(test)]
+                let live_id = live_witness.as_ref().and_then(|witness| witness.match_id(&delivery));
+                #[cfg(test)]
+                if let (Some(witness), Some(id)) = (&live_witness, live_id) {
+                    witness.record(id, TestLivePathStage::RouterArrival);
+                }
                 let sender = account_deliveries_read(&transport.account_deliveries)
                     .get(&delivery.account_id)
                     .cloned();
@@ -1532,6 +1733,10 @@ impl MarmotRelayPlane {
                         .saturating_sub(route.sender.capacity());
                     route.overflow.observe_queue_depth(queue_depth);
                     if route.sender.capacity() <= 1 {
+                        #[cfg(test)]
+                        if let (Some(witness), Some(id)) = (&live_witness, live_id) {
+                            witness.record(id, TestLivePathStage::QueueFull);
+                        }
                         let signal_generation = route.overflow.record_drop(queue_depth);
                         if let Some(marker) = route.recovery_marker.clone() {
                             persist_queue_loss(&route.sender, &route.overflow, marker, signal_generation);
@@ -1551,6 +1756,10 @@ impl MarmotRelayPlane {
                         .try_send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
                     {
                         Ok(()) => {
+                            #[cfg(test)]
+                            if let (Some(witness), Some(id)) = (&live_witness, live_id) {
+                                witness.record(id, TestLivePathStage::QueueAccepted);
+                            }
                             let queue_depth = route
                                 .sender
                                 .max_capacity()
@@ -1558,6 +1767,10 @@ impl MarmotRelayPlane {
                             route.overflow.observe_queue_depth(queue_depth);
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            #[cfg(test)]
+                            if let (Some(witness), Some(id)) = (&live_witness, live_id) {
+                                witness.record(id, TestLivePathStage::QueueFull);
+                            }
                             // Only this router writes the route, and it reserves
                             // one control slot above, so reaching Full here
                             // indicates a violated queue invariant rather than
@@ -1569,7 +1782,17 @@ impl MarmotRelayPlane {
                                 "account delivery queue invariant failed",
                             );
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            #[cfg(test)]
+                            if let (Some(witness), Some(id)) = (&live_witness, live_id) {
+                                witness.record(id, TestLivePathStage::QueueClosed);
+                            }
+                        }
+                    }
+                } else {
+                    #[cfg(test)]
+                    if let (Some(witness), Some(id)) = (&live_witness, live_id) {
+                        witness.record(id, TestLivePathStage::NoAccount);
                     }
                 }
             }
@@ -2591,6 +2814,13 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
     ) -> Result<Option<AccountDeliveryReceive>, TransportAdapterError> {
         let event = self.delivery_rx.lock().await.recv().await;
+        #[cfg(test)]
+        if let Some(AccountDeliveryEvent::Delivery(delivery)) = &event
+            && let Some(id) = self.relay_plane.live_path_id(delivery)
+        {
+            self.relay_plane
+                .record_live_path_id(id, TestLivePathStage::Dequeued);
+        }
         Ok(event.map(|event| match event {
             AccountDeliveryEvent::Delivery(delivery) => AccountDeliveryReceive::Delivery(delivery),
             AccountDeliveryEvent::Overflow { generation } => {

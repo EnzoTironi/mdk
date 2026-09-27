@@ -25,6 +25,8 @@ use crate::groups::{
 };
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
+#[cfg(test)]
+use crate::relay_plane::TestLivePathStage;
 use crate::{
     AccountState, AppError, AppMessageProjection, AppPerformanceTelemetry, ClassifiedSyncFailure,
     EPOCH_BACKFILL_EOSE_WAIT, EPOCH_BACKFILL_EXECUTION_QUANTUM, SDK_DRAIN_WAIT,
@@ -2466,6 +2468,12 @@ impl AppClient {
             let event_id = hex::encode(delivery.message.id.as_slice());
             if self.transport_receipts()?.contains(&event_id) {
                 #[cfg(test)]
+                if let Some(id) = self.app.relay_plane.live_path_id(&delivery) {
+                    self.app
+                        .relay_plane
+                        .record_live_path_id(id, TestLivePathStage::DuplicateSkipped);
+                }
+                #[cfg(test)]
                 if let Some(probe) = self
                     .test_queue_drain_cost_probe
                     .as_ref()
@@ -2528,6 +2536,10 @@ impl AppClient {
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
+        #[cfg(test)]
+        let live_path_id = self.app.relay_plane.live_path_id(&delivery);
+        #[cfg(test)]
+        let live_path_relay_plane = self.app.relay_plane.clone();
         let receipts = self.transport_receipts().map_err(|error| {
             (
                 SyncSummary::default(),
@@ -2537,19 +2549,33 @@ impl AppClient {
                 SyncFailureStage::StatePersist,
             )
         })?;
-        let ingested = Self::ingest_delivery(receipts, delivery, &mut summary)
-            .await
-            .map_err(|error| {
-                // The inline drain did not merge this delivery's staged
-                // projection when ingest itself failed.
-                (
-                    SyncSummary::default(),
-                    false,
-                    false,
-                    error,
-                    SyncFailureStage::CgkaIngest,
-                )
-            })?;
+        #[cfg(test)]
+        if let Some(id) = live_path_id {
+            live_path_relay_plane.record_live_path_id(id, TestLivePathStage::IngestEntered);
+        }
+        let ingest_result = Self::ingest_delivery(receipts, delivery, &mut summary).await;
+        #[cfg(test)]
+        if let Some(id) = live_path_id {
+            self.app.relay_plane.record_live_path_id(
+                id,
+                if ingest_result.is_ok() {
+                    TestLivePathStage::IngestProjectionCallOk
+                } else {
+                    TestLivePathStage::IngestProjectionCallError
+                },
+            );
+        }
+        let ingested = ingest_result.map_err(|error| {
+            // The inline drain did not merge this delivery's staged
+            // projection when ingest itself failed.
+            (
+                SyncSummary::default(),
+                false,
+                false,
+                error,
+                SyncFailureStage::CgkaIngest,
+            )
+        })?;
         if self.delivery_loss_blocks_cursor() {
             // `record_drop` publishes this process-local fence at the exact
             // omission, before marker I/O or the reserved control record can
@@ -3018,6 +3044,10 @@ impl AppClient {
                     .config
                     .dev_fail_sync_before_delivery
                     .is_some_and(|limit| counts.deliveries >= limit);
+            #[cfg(test)]
+            let live_path_id = self.app.relay_plane.live_path_id(&delivery);
+            #[cfg(test)]
+            let live_path_relay_plane = self.app.relay_plane.clone();
             let receipts = match self.transport_receipts() {
                 Ok(receipts) => receipts,
                 Err(error) => {
@@ -3035,6 +3065,12 @@ impl AppClient {
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
             if receipts.contains(&event_id) {
+                #[cfg(test)]
+                if let Some(id) = live_path_id {
+                    self.app
+                        .relay_plane
+                        .record_live_path_id(id, TestLivePathStage::DuplicateSkipped);
+                }
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 state
                     .candidate_fence
@@ -3069,22 +3105,38 @@ impl AppClient {
             }
             let mut delivery_summary = SyncSummary::default();
             let source_event_id = delivery.message.id.clone();
-            let ingested =
-                match Self::ingest_delivery(receipts, *delivery, &mut delivery_summary).await {
-                    Ok(ingested) => ingested,
-                    Err(error) => {
-                        return Err(self
-                            .finish_failed_sync_drain(
-                                summary,
-                                routes_dirty,
-                                counts.clone(),
-                                StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
-                                drain_started,
-                                cursor_before_secs,
-                            )
-                            .await);
-                    }
-                };
+            #[cfg(test)]
+            if let Some(id) = live_path_id {
+                live_path_relay_plane.record_live_path_id(id, TestLivePathStage::IngestEntered);
+            }
+            let ingest_result =
+                Self::ingest_delivery(receipts, *delivery, &mut delivery_summary).await;
+            #[cfg(test)]
+            if let Some(id) = live_path_id {
+                self.app.relay_plane.record_live_path_id(
+                    id,
+                    if ingest_result.is_ok() {
+                        TestLivePathStage::IngestProjectionCallOk
+                    } else {
+                        TestLivePathStage::IngestProjectionCallError
+                    },
+                );
+            }
+            let ingested = match ingest_result {
+                Ok(ingested) => ingested,
+                Err(error) => {
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            counts.clone(),
+                            StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
+                }
+            };
             state.candidate_fence.observe(source_event_id.as_slice());
             if ingested.must_stay_fetchable {
                 counts.unpersisted = counts.unpersisted.saturating_add(1);

@@ -1938,6 +1938,199 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
 }
 
 #[tokio::test]
+async fn live_path_witness_distinguishes_exact_account_queue_admission_and_dequeue() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let bob = MemberId::new(vec![0xB2; 32]);
+    let alice_group = GroupId::new(vec![0xC3; 16]);
+    let bob_group = GroupId::new(vec![0xC4; 16]);
+    let alice_route = vec![0xD3; 32];
+    let bob_route = vec![0xD4; 32];
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+    let bob_adapter = plane.account_adapter(bob.clone(), relay);
+    for (adapter, account_id, group_id, route) in [
+        (
+            &alice_adapter,
+            alice.clone(),
+            alice_group.clone(),
+            alice_route.clone(),
+        ),
+        (&bob_adapter, bob, bob_group, bob_route.clone()),
+    ] {
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id,
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![TransportGroupSubscription {
+                    group_id,
+                    transport_group_id: route,
+                    endpoints: vec![endpoint.clone()],
+                }],
+                since: None,
+            })
+            .await
+            .unwrap();
+    }
+    let witness = Arc::new(TestLivePathWitness::new(alice, alice_group, Instant::now()));
+    let send = |event: NostrTransportEvent, subscription: &str| {
+        plane.handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(subscription.into()),
+            event,
+        })
+    };
+    for index in 0..ACCOUNT_DELIVERY_BUFFER - 1 {
+        send(
+            group_event(&format!("filler-{index}"), &alice_route),
+            "alice-group",
+        )
+        .await
+        .unwrap();
+    }
+    timeout(Duration::from_secs(2), async {
+        while plane.relay_health().await.account_delivery_queue_depth < ACCOUNT_DELIVERY_BUFFER - 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(witness.snapshot(None).0, 0, "disabled witness stays empty");
+    plane.set_live_path_witness(Some(witness.clone()));
+
+    let accepted = group_event("accepted-exact", &alice_route);
+    let accepted_id: [u8; 32] = hex::decode(&accepted.id).unwrap().try_into().unwrap();
+    send(accepted.clone(), "alice-group").await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while witness
+            .snapshot(Some(accepted_id))
+            .2
+            .is_none_or(|path| path.queue_accepted.count != 1)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // A replay with the same exact transport ID can encounter a different
+    // admission result. Neither observation may erase the other.
+    send(accepted, "alice-group").await.unwrap();
+    let omitted = group_event("omitted-exact", &alice_route);
+    let omitted_id: [u8; 32] = hex::decode(&omitted.id).unwrap().try_into().unwrap();
+    send(omitted, "alice-group").await.unwrap();
+    send(group_event("bob-only", &bob_route), "bob-group")
+        .await
+        .unwrap();
+    timeout(
+        Duration::from_secs(2),
+        bob_adapter.receive_account_delivery(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    timeout(Duration::from_secs(2), async {
+        while witness
+            .snapshot(Some(omitted_id))
+            .2
+            .is_none_or(|path| path.queue_full.count != 1)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        witness.snapshot(None).0,
+        2,
+        "other account and route stay outside the witness"
+    );
+    assert!(witness.snapshot(Some([0xFF; 32])).2.is_none());
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match alice_adapter
+                .receive_account_delivery()
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                AccountDeliveryReceive::Delivery(delivery)
+                    if delivery.message.id.as_slice() == accepted_id =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let accepted_path = witness.snapshot(Some(accepted_id)).2.unwrap();
+    assert_eq!(accepted_path.router_arrival.count, 2);
+    assert_eq!(accepted_path.queue_accepted.count, 1);
+    assert_eq!(accepted_path.queue_full.count, 1);
+    assert_eq!(accepted_path.dequeued.count, 1);
+    assert_eq!(accepted_path.ingest_entered.count, 0);
+    let omitted_path = witness.snapshot(Some(omitted_id)).2.unwrap();
+    assert_eq!(omitted_path.router_arrival.count, 1);
+    assert_eq!(omitted_path.dequeued.count, 0);
+    assert_eq!(omitted_path.queue_full.count, 1);
+    witness.stop();
+    plane.set_live_path_witness(None);
+}
+
+#[test]
+fn live_path_witness_keeps_repeat_ingest_outcomes_and_bounded_stop_accounting() {
+    let witness = TestLivePathWitness::new(
+        MemberId::new(vec![0xA1; 32]),
+        GroupId::new(vec![0xC3; 16]),
+        Instant::now(),
+    );
+    let exact_id = [0x11; 32];
+    for stage in [
+        TestLivePathStage::IngestEntered,
+        TestLivePathStage::IngestProjectionCallOk,
+        TestLivePathStage::DuplicateSkipped,
+        TestLivePathStage::IngestEntered,
+        TestLivePathStage::IngestProjectionCallError,
+    ] {
+        witness.record(exact_id, stage);
+    }
+    let path = witness.snapshot(Some(exact_id)).2.unwrap();
+    assert_eq!(path.ingest_entered.count, 2);
+    assert_eq!(path.ingest_call_ok.count, 1);
+    assert_eq!(path.ingest_call_error.count, 1);
+    assert_eq!(path.duplicate_skipped.count, 1);
+    assert!(path.ingest_call_ok.first_ms.is_some());
+    assert!(path.ingest_call_error.first_ms.is_some());
+
+    for value in 2..=16 {
+        witness.record([value; 32], TestLivePathStage::RouterArrival);
+    }
+    witness.record([0xFF; 32], TestLivePathStage::RouterArrival);
+    witness.record([0xFF; 32], TestLivePathStage::QueueFull);
+    let (candidates, dropped_observations, absent) = witness.snapshot(Some([0xFF; 32]));
+    assert_eq!(candidates, 16);
+    assert_eq!(dropped_observations, 2);
+    assert!(absent.is_none());
+    witness.stop();
+    witness.record(exact_id, TestLivePathStage::DuplicateSkipped);
+    assert_eq!(
+        witness
+            .snapshot(Some(exact_id))
+            .2
+            .unwrap()
+            .duplicate_skipped
+            .count,
+        1
+    );
+}
+
+#[tokio::test]
 async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());

@@ -234,6 +234,42 @@ attribution, directory freshness, and sender tests pass; new-head x86_64 CI
 has not yet run. A production directory optimization remains unproven, and
 the draft PR's recovery blocker remains open.
 
+Exact `8834a386a` CI added four failed x86_64 attempts, reaching 52 failed
+attempts across 13 heads. Rust jobs 2–4 passed. Both tries in job 5's Receive
+fixture and job 1's unstimulated fixture failed: the Receive first try reached
+the target gate at 16,858 ms, late in its 15,113–17,133 ms SDK route pass,
+with 719 ordinary deliveries queued. Bob's healthy live publish succeeded at
+16,914–17,023 ms, but Alice did not observe that plaintext within two seconds;
+the request and job were gone at release. The Receive second try still had 358
+deliveries queued at the 45-second gate, and the other three failed attempts
+never reached the held target gate. Useful target retention, epoch advance,
+and both dependent plaintexts appeared eventually in all four attempts. That
+later progress does not establish active acquisition or live delivery during
+the held grant. Directory work measured only about 0.62–1.51 seconds inclusive
+per window, with zero write attempts; it does not explain the missing live
+observation or justify a production optimization.
+
+A further fixture-only, default-disabled witness now records the healthy group
+event's existing path through router arrival, per-account queue admission
+(accepted, full, closed, or no account), dequeue, duplicate skip, and entry and
+return from the existing ingest/projection call. It is armed only for Alice's
+group-hint candidates during the timed probe and retains at most 16 transport
+IDs privately. After stopping the witness and releasing the hold, the fixture
+maps Bob's sent inner message ID to its locally published outer transport ID
+and selects that exact event's stage aggregates. Each stage retains its first
+timestamp and count, so repeated deliveries cannot erase an earlier accepted
+or successful observation. Stages do not identify which copy advanced to the
+next stage; an ingest call returning `Ok` does not certify a visible row or
+durable checkpoint. The overflow count is dropped stage observations, not
+distinct IDs. A missing sender mapping, unmatched candidate, or absent stage
+is unknown rather than proof of relay loss. The witness makes no extra storage
+read, synchronous health call, task, or sleep before the timed probe; it does
+not alter production routing, queue policy, fixture timing, or assertions.
+Focused default and feature tests exercise actual router admission/dequeue,
+repeated-ID accepted/full evidence, separate ingest outcomes, the candidate
+cap, and stopping. New-head x86_64 CI has not yet run, and the recovery
+blocker remains open.
+
 This is a focused local outcome, not proof for every account route shape,
 continuous traffic, relays without comparison support, process restart, or
 device delivery. The SDK's per-route negotiation and acquisition deadlines,
