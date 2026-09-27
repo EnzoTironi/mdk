@@ -3019,6 +3019,125 @@ fn modifier_edge_count(store: &SqliteAccountStorage, modifier_message_id_hex: &s
 }
 
 #[test]
+fn new_nonmodifiers_skip_edge_deletion_but_replays_and_modifiers_do_not() {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static EDGE_DELETES: AtomicUsize = AtomicUsize::new(0);
+    static EDGE_INSERTS: AtomicUsize = AtomicUsize::new(0);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "target"))
+        .unwrap();
+    EDGE_DELETES.store(0, Ordering::SeqCst);
+    EDGE_INSERTS.store(0, Ordering::SeqCst);
+    store.lock().unwrap().trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(|event| {
+            if let TraceEvent::Profile(statement, _) = event {
+                let sql = statement.sql();
+                if sql.contains("DELETE FROM message_modifier_edges") {
+                    EDGE_DELETES.fetch_add(1, Ordering::SeqCst);
+                }
+                if sql.contains("INSERT OR IGNORE INTO message_modifier_edges") {
+                    EDGE_INSERTS.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }),
+    );
+
+    let mut custom = chat("custom", "bob", 2, "filler");
+    custom.kind = 22_224;
+    store.record_app_event(&custom).unwrap();
+    let plain = chat("plain", "bob", 3, "plain");
+    store.record_app_event(&plain).unwrap();
+    assert_eq!(EDGE_DELETES.load(Ordering::SeqCst), 0);
+    assert_eq!(EDGE_INSERTS.load(Ordering::SeqCst), 0);
+
+    store.record_app_event(&plain).unwrap();
+    assert_eq!(EDGE_DELETES.load(Ordering::SeqCst), 1);
+    store
+        .record_app_event(&reaction("new-reaction", "bob", "target", 4, "+"))
+        .unwrap();
+    assert_eq!(EDGE_DELETES.load(Ordering::SeqCst), 2);
+    assert_eq!(EDGE_INSERTS.load(Ordering::SeqCst), 1);
+    store
+        .lock()
+        .unwrap()
+        .trace_v2(TraceEventCodes::empty(), None);
+    assert_eq!(modifier_edge_count(&store, "new-reaction"), 1);
+}
+
+#[test]
+fn projection_failure_after_edge_insert_rolls_back_app_timeline_and_edge() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "target"))
+        .unwrap();
+    let before_reactions: String = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT reactions_json FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = 'target'",
+            [&"11".repeat(32)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // This fires during target reprojection only after the new edge exists.
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TEMP TRIGGER abort_after_edge_insert
+             BEFORE UPDATE ON message_timeline
+             WHEN NEW.message_id_hex = 'target' AND EXISTS (
+                 SELECT 1 FROM message_modifier_edges
+                 WHERE group_id_hex = NEW.group_id_hex
+                   AND modifier_message_id_hex = 'new-reaction'
+                   AND target_message_id_hex = 'target'
+             )
+             BEGIN SELECT RAISE(ABORT, 'edge inserted before timeline failure'); END;",
+        )
+        .unwrap();
+
+    let event = reaction("new-reaction", "bob", "target", 2, "+");
+    let error = store.record_app_event(&event).unwrap_err();
+    assert!(format!("{error}").contains("edge inserted before timeline failure"));
+    let conn = store.lock().unwrap();
+    let app_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = 'new-reaction'",
+            [&"11".repeat(32)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let after_reactions: String = conn
+        .query_row(
+            "SELECT reactions_json FROM message_timeline WHERE group_id_hex = ?1 AND message_id_hex = 'target'",
+            [&"11".repeat(32)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(app_count, 0);
+    assert_eq!(after_reactions, before_reactions);
+    drop(conn);
+    assert_eq!(modifier_edge_count(&store, "new-reaction"), 0);
+
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER abort_after_edge_insert")
+        .unwrap();
+    store.record_app_event(&event).unwrap();
+    assert_eq!(modifier_edge_count(&store, "new-reaction"), 1);
+    let target = list(&store)
+        .into_iter()
+        .find(|message| message.message_id_hex == "target")
+        .unwrap();
+    assert_eq!(target.reactions.user_reactions.len(), 1);
+}
+
+#[test]
 fn reaction_appears_in_summary_via_indexed_edge() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store

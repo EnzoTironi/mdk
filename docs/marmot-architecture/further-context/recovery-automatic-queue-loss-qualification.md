@@ -493,6 +493,38 @@ the reference and retirement state remain unchanged. A successful same-ID
 media-to-plain transition retires the reference, and a conflicting replay
 retains the original source epoch. Focused app source-epoch tests pass with
 default and `test-policy-overrides` features; storage and app all-target
-Clippy checks pass in both configurations. No post-change x86_64 timing or
-strict fixture result exists yet. Speedup and strict recovery qualification
-remain unmeasured; the PR stays draft.
+Clippy checks pass in both configurations. The next `ea842568` CI provides
+post-change x86_64 evidence below; it does not establish a controlled speedup
+or strict recovery qualification.
+
+Exact `ea842568` CI added four more failed x86_64 QueueLoss attempts, reaching
+82 across 21 heads. Receive and Maintenance-required each failed strict active
+acquisition twice; Rust jobs 3–5 passed. During the held probe, all four had
+no selected grant, active NEG, or network job and deferred 718–753 selections.
+Status, send, and healthy live probes passed, and useful target retention,
+epoch advance, and dependent plaintext appeared under a later grant with debt
+still pending. The Receive wakes were accepted, dequeued, and ingested. The
+matched Alice source/timeline calls totaled 6.10–8.38 seconds, inclusive
+chat-list refresh 5.04–7.49 seconds, and closure-exit to transaction-return
+envelopes 1.11–4.27 seconds across 718–753 completed calls per run. Those
+boundaries do not isolate SQL, CPU, fsync, or exclusive wall time. A prior
+Maintenance pass at `c908b323` and first-pass startup and online epoch-gap
+tests on this head do not explain these failures or resolve earlier causes.
+
+The next narrow storage change skips modifier-edge replacement only when the
+app event is brand-new and its kind cannot create modifier edges. All existing
+message IDs still take the original replacement path, including a replay that
+changes from a modifier to a non-modifier; fresh modifiers still insert edges.
+The existing app-event and chat-list transaction and projection paths remain.
+A connection-local SQL trace confirms no edge delete for new custom-kind and
+chat events, and confirms the delete for an existing non-modifier replay and
+the delete and insert for a new modifier. Existing retarget, modifier-to-chat,
+and prune regressions pass. A test-triggered target timeline failure fires
+only after it sees the newly inserted edge; the enclosing transaction rolls
+back that edge and the app-event insert while leaving the target timeline row
+unchanged. Focused app projection tests, formatting, and default and feature
+all-target storage/app Clippy checks pass. This one avoided no-op delete has
+no measured contribution to the source/timeline envelope, and it does not
+account for chat-list work or the unassigned claim-to-ingest time. No x86_64
+strict fixture result exists for this change yet; speedup and strict recovery
+qualification remain unmeasured. The PR stays draft.

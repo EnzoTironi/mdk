@@ -827,7 +827,11 @@ impl SqliteAccountStorage {
             {
                 replace_encrypted_media_secret_references_tx(&conn, event)?;
             }
-            upsert_message_modifier_edges_tx(&conn, event)?;
+            // A new non-modifier has no edges to remove or insert. Replays
+            // still replace edges, including modifier-to-non-modifier changes.
+            if existing_event.is_some() || is_modifier_edge_kind(event.kind) {
+                upsert_message_modifier_edges_tx(&conn, event)?;
+            }
             for message_id in &affected_message_ids {
                 upsert_message_timeline_projection_for_message_tx(
                     &conn,
@@ -2170,16 +2174,7 @@ fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> 
         params![&event.group_id_hex, &event.message_id_hex],
     )
     .storage()?;
-    if !matches!(
-        event.kind,
-        MARMOT_APP_EVENT_KIND_REACTION
-            | MARMOT_APP_EVENT_KIND_DELETE
-            | MARMOT_APP_EVENT_KIND_EDIT
-            | MARMOT_APP_EVENT_KIND_REPORT
-            | MARMOT_APP_EVENT_KIND_REVIEW
-            | MARMOT_APP_EVENT_KIND_REMOVE
-            | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
-    ) {
+    if !is_modifier_edge_kind(event.kind) {
         return Ok(());
     }
     let kind = u64_to_i64(event.kind)?;
@@ -2203,6 +2198,19 @@ fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> 
         .storage()?;
     }
     Ok(())
+}
+
+fn is_modifier_edge_kind(kind: u64) -> bool {
+    matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_REACTION
+            | MARMOT_APP_EVENT_KIND_DELETE
+            | MARMOT_APP_EVENT_KIND_EDIT
+            | MARMOT_APP_EVENT_KIND_REPORT
+            | MARMOT_APP_EVENT_KIND_REVIEW
+            | MARMOT_APP_EVENT_KIND_REMOVE
+            | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
+    )
 }
 
 fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> StorageResult<()> {
