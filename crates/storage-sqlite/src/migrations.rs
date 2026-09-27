@@ -194,6 +194,8 @@ mod migration_0093_recovery_route_snapshot;
 mod migration_0094_qualified_stall_observations;
 #[path = "migrations/0095_recovery_comparison.rs"]
 mod migration_0095_recovery_comparison;
+#[path = "migrations/0096_chat_list_activity_indexes.rs"]
+mod migration_0096_chat_list_activity_indexes;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -684,6 +686,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 95,
         name: "0095_recovery_comparison",
         apply: migration_0095_recovery_comparison::apply,
+    },
+    Migration {
+        version: 96,
+        name: "0096_chat_list_activity_indexes",
+        apply: migration_0096_chat_list_activity_indexes::apply,
     },
 ];
 
@@ -1623,6 +1630,77 @@ mod tests {
             .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
             .unwrap();
         connection
+    }
+
+    #[test]
+    fn chat_activity_index_upgrade_preserves_rows_and_rolls_back_interruption() {
+        fn interrupted(tx: &Transaction<'_>) -> StorageResult<()> {
+            migration_0096_chat_list_activity_indexes::apply(tx)?;
+            Err(StorageError::Backend(
+                "injected chat activity index interruption".into(),
+            ))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat-activity-index.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..95]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_groups(group_id_hex,endpoint,updated_at,archived,self_membership)
+                 VALUES('aa','relay',0,0,'member');
+             INSERT INTO app_events(group_id_hex,message_id_hex,source_message_id_hex,
+                 direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
+                 VALUES('aa','old-chat','source-chat','received','remote','chat',9,'[]',1,1),
+                       ('aa','custom','source-custom','received','remote','custom',22224,'[]',2,2);
+             INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,
+                 direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json)
+                 VALUES('aa','old-chat','source-chat','received','remote','chat',9,'[]',1,1,'[]'),
+                       ('aa','custom','source-custom','received','remote','custom',22224,'[]',2,2,'[]');",
+        )
+        .unwrap();
+        let aborted = Migration {
+            version: 96,
+            name: "0096_chat_list_activity_indexes",
+            apply: interrupted,
+        };
+        assert!(apply_migration(&mut conn, &aborted).is_err());
+        let index_count = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='index' AND name IN (
+                   'idx_message_timeline_chat_activity_preview',
+                   'idx_app_events_chat_activity_order',
+                   'idx_app_events_accepted_chat_activity_order')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(index_count(&conn), 0);
+        assert_eq!(applied_name(&conn, 96).unwrap(), None);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM app_events", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        run(&mut conn, MIGRATIONS).unwrap();
+        assert_eq!(index_count(&conn), 3);
+        drop(conn);
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(applied_migrations(&store), expected_migrations());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM app_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        store.close().unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(applied_migrations(&reopened), expected_migrations());
     }
 
     fn seed_file_backed_v1_database(path: &Path, message_count: u8) -> Vec<MessageRecord> {

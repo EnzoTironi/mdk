@@ -1140,16 +1140,26 @@ pub(crate) fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
     )
 }
 
+/// Static superset used by the partial candidate indexes. The full activity
+/// predicate still decides group-system eligibility from tags and group state.
+fn chat_list_activity_kind_filter_sql(column_prefix: &str) -> String {
+    format!(
+        "{column_prefix}kind IN ({MARMOT_APP_EVENT_KIND_CHAT}, {MARMOT_APP_EVENT_KIND_POLL}, {MARMOT_APP_EVENT_KIND_GROUP_SYSTEM})"
+    )
+}
+
 fn accepted_activity_order_sql(group_id_expression: &str) -> String {
     let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
+    let source_kind_filter = chat_list_activity_kind_filter_sql("accepted_source.");
     // Walk newest insertions first; the first eligible row is the high water.
     // CROSS JOIN keeps the ordered source index outside the timeline lookup.
     format!(
         "SELECT accepted_source.insert_order
-         FROM app_events AS accepted_source INDEXED BY idx_app_events_accepted_insert_order
+         FROM app_events AS accepted_source INDEXED BY idx_app_events_accepted_chat_activity_order
          CROSS JOIN message_timeline AS accepted
          WHERE accepted_source.group_id_hex = {group_id_expression}
            AND (accepted_source.direction != 'sent' OR accepted_source.source_message_id_hex IS NOT NULL)
+           AND {source_kind_filter}
            AND accepted.group_id_hex = accepted_source.group_id_hex
            AND accepted.message_id_hex = accepted_source.message_id_hex
            AND {accepted_activity_filter}
@@ -1189,6 +1199,8 @@ pub(crate) fn chat_list_preview_eligibility_sql(
 ) -> String {
     let accepted_high_water = accepted_activity_insert_order_high_water_sql(group_id_expression);
     let activity_filter = chat_list_activity_filter_sql("candidate.");
+    let candidate_kind_filter = chat_list_activity_kind_filter_sql("candidate.");
+    let source_kind_filter = chat_list_activity_kind_filter_sql("source.");
     let preview_order = chat_list_preview_order_desc("candidate.");
     let preview_class = preview_rank_sql("candidate.");
     format!(
@@ -1197,8 +1209,9 @@ pub(crate) fn chat_list_preview_eligibility_sql(
                 SELECT newest.rowid
                 FROM (
                     SELECT candidate.rowid, candidate.message_id_hex
-                    FROM message_timeline AS candidate INDEXED BY idx_message_timeline_chat_preview
+                    FROM message_timeline AS candidate INDEXED BY idx_message_timeline_chat_activity_preview
                     WHERE candidate.group_id_hex = {group_id_expression}
+                      AND {candidate_kind_filter}
                       AND ({preview_class}) = 2
                       AND {activity_filter}
                     ORDER BY candidate.timeline_order_class DESC,
@@ -1214,9 +1227,10 @@ pub(crate) fn chat_list_preview_eligibility_sql(
                   AND source.insert_order >= {accepted_high_water}
             ), (
                 SELECT candidate.rowid
-                FROM app_events AS source INDEXED BY idx_app_events_group_insert_order
+                FROM app_events AS source INDEXED BY idx_app_events_chat_activity_order
                 CROSS JOIN message_timeline AS candidate
                 WHERE source.group_id_hex = {group_id_expression}
+                  AND {source_kind_filter}
                   AND source.insert_order >= {accepted_high_water}
                   AND candidate.group_id_hex = source.group_id_hex
                   AND candidate.message_id_hex = source.message_id_hex
@@ -1230,8 +1244,9 @@ pub(crate) fn chat_list_preview_eligibility_sql(
             UNION ALL
             SELECT rowid FROM (
                 SELECT candidate.rowid
-                FROM message_timeline AS candidate INDEXED BY idx_message_timeline_chat_preview
+                FROM message_timeline AS candidate INDEXED BY idx_message_timeline_chat_activity_preview
                 WHERE candidate.group_id_hex = {group_id_expression}
+                  AND {candidate_kind_filter}
                   AND ({preview_class}) < 2
                   AND {activity_filter}
                   AND (candidate.invalidation_status IS NULL OR (
@@ -1266,7 +1281,7 @@ pub(crate) fn chat_list_preview_order_desc(column_prefix: &str) -> String {
     )
 }
 
-/// Keep this row-local rank aligned with migration 0062's preview index.
+/// Keep this row-local rank aligned with migrations 0062 and 0096's preview indexes.
 fn preview_rank_sql(column_prefix: &str) -> String {
     format!(
         "CASE

@@ -458,6 +458,402 @@ fn preview_query_work() {
     }
 }
 
+#[test]
+fn custom_event_prefix_chat_list_query_work() {
+    use crate::query_work_test_support::measure;
+
+    for has_older_chat in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("custom prefix query work").unwrap();
+        let store =
+            SqliteAccountStorage::open_encrypted(dir.path().join("account.sqlite3"), &key).unwrap();
+        store
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    groups: vec![group()],
+                    ..StoredAccountState::default()
+                },
+                256,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+        if has_older_chat {
+            store
+                .record_app_event(&chat("older-chat", REMOTE, 1, "eligible"))
+                .unwrap();
+        }
+        let mut seeded = 0;
+        for count in [0, 256, 1_024] {
+            cgka_traits::StorageProvider::with_transaction(&store, |store| {
+                for index in seeded..count {
+                    let mut event = chat(&format!("custom-{index}"), REMOTE, index + 2, "custom");
+                    event.kind = 22_224;
+                    store.record_app_event(&event)?;
+                }
+                Ok::<_, cgka_traits::StorageError>(())
+            })
+            .unwrap();
+            seeded = count;
+            let (latest, preview_steps) = measure(&store, || {
+                latest_chat_list_activity_tx(&store.lock().unwrap(), GROUP).unwrap()
+            });
+            let (high_water, high_water_steps) = measure(&store, || {
+                latest_accepted_activity_insert_order_tx(&store.lock().unwrap(), GROUP).unwrap()
+            });
+            assert_eq!(
+                latest.map(|message| message.preview.message_id_hex),
+                has_older_chat.then(|| "older-chat".to_owned())
+            );
+            assert_eq!(high_water, has_older_chat.then_some(1));
+            assert_original_activity_selection(&store);
+            eprintln!(
+                "older_chat={has_older_chat} custom_prefix={count} preview_vm_steps={preview_steps} high_water_vm_steps={high_water_steps}"
+            );
+            assert!(preview_steps < 512, "preview scanned custom prefix");
+            assert!(high_water_steps < 128, "high water scanned custom prefix");
+        }
+    }
+}
+
+// Frozen pre-0096 query shapes are an independent selection oracle. Keep their
+// original index hints: these general indexes remain available after upgrade.
+fn original_accepted_activity_order_sql(group_id_expression: &str) -> String {
+    let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
+    format!(
+        "SELECT accepted_source.insert_order
+         FROM app_events AS accepted_source INDEXED BY idx_app_events_accepted_insert_order
+         CROSS JOIN message_timeline AS accepted
+         WHERE accepted_source.group_id_hex = {group_id_expression}
+           AND (accepted_source.direction != 'sent' OR accepted_source.source_message_id_hex IS NOT NULL)
+           AND accepted.group_id_hex = accepted_source.group_id_hex
+           AND accepted.message_id_hex = accepted_source.message_id_hex
+           AND {accepted_activity_filter}
+           AND accepted.invalidation_status IS NULL
+           AND NOT (
+               accepted.direction = 'sent'
+               AND accepted.source_message_id_hex IS NULL
+           )
+         ORDER BY accepted_source.insert_order DESC
+         LIMIT 1"
+    )
+}
+
+fn original_accepted_high_water_sql(group_id_expression: &str) -> String {
+    let latest = original_accepted_activity_order_sql(group_id_expression);
+    format!(
+        "MAX(
+            COALESCE((
+                SELECT boundary.accepted_activity_insert_order
+                FROM chat_list_rows AS boundary
+                WHERE boundary.group_id_hex = {group_id_expression}
+            ), 0),
+            COALESCE(({latest}), 0)
+         )"
+    )
+}
+
+fn original_preview_eligibility_sql(column_prefix: &str, group_id_expression: &str) -> String {
+    let accepted_high_water = original_accepted_high_water_sql(group_id_expression);
+    let activity_filter = chat_list_activity_filter_sql("candidate.");
+    let preview_order = chat_list_preview_order_desc("candidate.");
+    let preview_class = preview_rank_sql("candidate.");
+    format!(
+        "{column_prefix}rowid IN (
+            SELECT COALESCE((
+                SELECT newest.rowid
+                FROM (
+                    SELECT candidate.rowid, candidate.message_id_hex
+                    FROM message_timeline AS candidate INDEXED BY idx_message_timeline_chat_preview
+                    WHERE candidate.group_id_hex = {group_id_expression}
+                      AND ({preview_class}) = 2
+                      AND {activity_filter}
+                    ORDER BY candidate.timeline_order_class DESC,
+                             candidate.timeline_order_primary DESC,
+                             candidate.timeline_order_phase DESC,
+                             candidate.timeline_order_at DESC,
+                             candidate.message_id_hex DESC
+                    LIMIT 1
+                ) AS newest
+                CROSS JOIN app_events AS source
+                WHERE source.group_id_hex = {group_id_expression}
+                  AND source.message_id_hex = newest.message_id_hex
+                  AND source.insert_order >= {accepted_high_water}
+            ), (
+                SELECT candidate.rowid
+                FROM app_events AS source INDEXED BY idx_app_events_group_insert_order
+                CROSS JOIN message_timeline AS candidate
+                WHERE source.group_id_hex = {group_id_expression}
+                  AND source.insert_order >= {accepted_high_water}
+                  AND candidate.group_id_hex = source.group_id_hex
+                  AND candidate.message_id_hex = source.message_id_hex
+                  AND candidate.direction = 'sent'
+                  AND candidate.source_message_id_hex IS NULL
+                  AND candidate.invalidation_status IS NULL
+                  AND {activity_filter}
+                ORDER BY {preview_order}
+                LIMIT 1
+            ))
+            UNION ALL
+            SELECT rowid FROM (
+                SELECT candidate.rowid
+                FROM message_timeline AS candidate INDEXED BY idx_message_timeline_chat_preview
+                WHERE candidate.group_id_hex = {group_id_expression}
+                  AND ({preview_class}) < 2
+                  AND {activity_filter}
+                  AND (candidate.invalidation_status IS NULL OR (
+                      candidate.direction = 'sent'
+                      AND candidate.invalidation_status = 'local_publish_failed'
+                  ))
+                ORDER BY {preview_order}
+                LIMIT 1
+            )
+         )"
+    )
+}
+
+fn assert_original_activity_selection(store: &SqliteAccountStorage) {
+    let conn = store.lock().unwrap();
+    let old_high_water: Option<i64> = conn
+        .query_row_cached(
+            &original_accepted_activity_order_sql("?1"),
+            [GROUP],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    let old_preview: Option<String> = conn
+        .query_row_cached(
+            &format!(
+                "SELECT preview.message_id_hex
+                 FROM message_timeline AS preview NOT INDEXED
+                 WHERE preview.group_id_hex = ?1
+                   AND {}
+                   AND {}
+                   AND (preview.invalidation_status IS NULL OR (
+                       preview.direction = 'sent'
+                       AND preview.invalidation_status = 'local_publish_failed'
+                   ))
+                 ORDER BY {} LIMIT 1",
+                chat_list_activity_filter_sql("preview."),
+                original_preview_eligibility_sql("preview.", "?1"),
+                chat_list_preview_order_desc("preview."),
+            ),
+            [GROUP],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        latest_accepted_activity_insert_order_tx(&conn, GROUP).unwrap(),
+        old_high_water
+    );
+    assert_eq!(
+        latest_chat_list_activity_tx(&conn, GROUP)
+            .unwrap()
+            .map(|latest| latest.preview.message_id_hex),
+        old_preview
+    );
+}
+
+fn assert_incremental_and_rebuild_match(store: &SqliteAccountStorage, id: &str) {
+    assert_original_activity_selection(store);
+    let mut incremental = store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &[id.to_owned()], &no_mentions)
+        .unwrap()
+        .unwrap();
+    let mut rebuilt = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    // A rebuild intentionally re-stamps its freshness clock.
+    incremental.updated_at = 0;
+    rebuilt.updated_at = 0;
+    assert_eq!(incremental, rebuilt);
+    assert_original_activity_selection(store);
+}
+
+#[test]
+fn activity_indexes_match_original_selection_across_replay_and_preview_states() {
+    let store = setup_store();
+    assert_incremental_and_rebuild_match(&store, "missing");
+
+    store
+        .record_app_event(&chat("accepted", REMOTE, 100, "accepted"))
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "accepted");
+
+    let mut custom = chat("changing", REMOTE, 110, "custom");
+    custom.kind = 22_224;
+    store.record_app_event(&custom).unwrap();
+    assert_incremental_and_rebuild_match(&store, "changing");
+    store
+        .record_app_event(&chat("changing", REMOTE, 110, "now chat"))
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "changing");
+    store.record_app_event(&custom).unwrap();
+    assert_incremental_and_rebuild_match(&store, "changing");
+
+    let mut pending = chat("pending", LOCAL, 500, "optimistic");
+    pending.source_message_id_hex = None;
+    store.record_app_event(&pending).unwrap();
+    assert_incremental_and_rebuild_match(&store, "pending");
+    // Later insertion with an older receipt time still advances the accepted
+    // high water and can displace an unresolved pending preview.
+    store
+        .record_app_event(&chat("accepted-later", REMOTE, 90, "later insertion"))
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "accepted-later");
+    store
+        .invalidate_app_event_by_message_id(GROUP, "pending", "local_publish_failed")
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "pending");
+
+    let mut poll = chat("poll", REMOTE, 120, "question");
+    poll.kind = cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
+    store.record_app_event(&poll).unwrap();
+    assert_incremental_and_rebuild_match(&store, "poll");
+    store
+        .invalidate_app_event_by_message_id(GROUP, "poll", "withdrawn")
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "poll");
+
+    store
+        .record_app_event(&group_system(
+            "membership",
+            REMOTE,
+            130,
+            GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+            "member added",
+        ))
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "membership");
+    store
+        .record_app_event(&group_system(
+            "metadata",
+            REMOTE,
+            140,
+            GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+            "renamed",
+        ))
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "metadata");
+}
+
+#[test]
+fn activity_indexes_keep_group_system_eligibility_dynamic() {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    let store = setup_store_with_group(direct.clone());
+    store
+        .record_app_event(&group_system(
+            "membership",
+            REMOTE,
+            100,
+            GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+            "member added",
+        ))
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "membership");
+    assert!(
+        latest_chat_list_activity_tx(&store.lock().unwrap(), GROUP)
+            .unwrap()
+            .is_none()
+    );
+
+    direct.member_count = Some(3);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct.clone()],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "membership");
+    assert_eq!(
+        latest_chat_list_activity_tx(&store.lock().unwrap(), GROUP)
+            .unwrap()
+            .unwrap()
+            .preview
+            .message_id_hex,
+        "membership"
+    );
+    direct.member_count = Some(2);
+    direct.profile_name = "named group".to_owned();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert_incremental_and_rebuild_match(&store, "membership");
+}
+
+#[test]
+fn activity_index_lookup_failure_rolls_back_source_timeline_and_chat_row() {
+    let store = setup_store();
+    store
+        .record_app_event(&chat("older-chat", REMOTE, 1, "eligible"))
+        .unwrap();
+    let before = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_activity_refresh BEFORE UPDATE ON chat_list_rows
+             BEGIN SELECT RAISE(ABORT, 'injected chat row failure'); END;",
+        )
+        .unwrap();
+    let mut custom = chat("custom", REMOTE, 2, "custom");
+    custom.kind = 22_224;
+    let result = cgka_traits::StorageProvider::with_transaction(&store, |storage| {
+        storage.record_app_event(&custom)?;
+        storage.refresh_chat_list_row_for_messages(
+            LOCAL,
+            GROUP,
+            &["custom".to_owned()],
+            &no_mentions,
+        )?;
+        Ok::<_, cgka_traits::StorageError>(())
+    });
+    assert!(result.is_err());
+    let conn = store.lock().unwrap();
+    for table in ["app_events", "message_timeline"] {
+        assert_eq!(
+            conn.query_row(
+                &format!("SELECT count(*) FROM {table} WHERE message_id_hex='custom'"),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "{table} must roll back with the chat row"
+        );
+    }
+    drop(conn);
+    assert_eq!(store.chat_list_row(GROUP).unwrap().unwrap(), before);
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_activity_refresh")
+        .unwrap();
+    store.record_app_event(&custom).unwrap();
+    assert_incremental_and_rebuild_match(&store, "custom");
+}
+
 fn avatar_url_component(url: &str) -> StoredAccountGroupComponent {
     let bytes = encode_group_avatar_url_v1(&GroupAvatarUrlV1 {
         url: url.to_owned(),

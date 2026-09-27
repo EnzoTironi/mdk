@@ -558,3 +558,48 @@ seconds, and secure prune about 0.296 seconds per run; the remaining time
 contains several operations and does not yet identify route refresh cost.
 The new measurement has no x86_64 result yet. Strict recovery, same-held-grant
 progress, and platform qualification remain open; the PR stays draft.
+
+Exact `565338902` Core CI added three failed x86_64 QueueLoss attempts, for
+**89 across 23 heads**. The stimulated Receive fixture failed twice at strict
+same-held-grant selection; the Maintenance-required fixture failed first and
+passed its retry. Failed holds selected no grant, NEG comparison, or network
+job and deferred 733–825 selections. Concurrent status, send, and live delivery
+passed, while useful target, epoch, and plaintext progress appeared only under
+a later grant with marker and debt pending. The Maintenance retry is a positive
+result for that attempt, not a cause or consistency closure. Route refresh
+took 0.726–1.308 seconds inclusive within 43.265–44.494-second completed
+claim-to-ingest intervals, so it is not the dominant measured child. The
+separate scheduled post-convergence comparison test failed its first attempt
+at the attempt-serial assertion on line 451 and passed its retry; attribution
+and cause remain unresolved.
+
+The next local storage candidate adds migration 0096 with three partial
+activity indexes and constrains chat-list preview and accepted high-water
+candidate walks to the static kind superset: chat, poll, and group-system.
+The full existing activity predicate still decides group-system eligibility
+from tags and group state, so many ineligible kind-1210 rows can still be
+scanned. The rank, pending fallback, and insertion-order high water remain;
+the existing general indexes, including migration 0062's preview index, are
+retained. In a file-backed SQLCipher test with
+1,024 newer custom-kind events, preview selection used 38,121 SQLite VM steps
+before this change and 233 after; accepted high-water selection used 17,442
+and 34 steps respectively. With no older eligible chat, the same comparison
+was 38,002 to 79 preview steps and 17,427 to 20 high-water steps. These are
+query-work counts for that fixture, not elapsed latency, a general bound for
+group-system rows, or proof of a 45-second recovery outcome.
+
+The new tests compare selected preview and high water against the original
+SQL on each database snapshot, and compare incremental and rebuild rows across
+same-ID kind replay, pending and failed sends, poll invalidation, and dynamic
+group-system eligibility. A forced chat-row write failure proves rollback of
+source, timeline, and chat row inside a storage-level outer transaction; it
+does not execute a `MarmotApp` integration failure. App `custom_intent` tests
+cover API and intent behavior in default and `test-policy-overrides` modes.
+Migration interruption rolls back index creation and preserves populated
+rows; upgrade and encrypted reopen pass locally. Migration 0096 initially
+scans existing rows to build its indexes, and eligible writes maintain three
+additional indexes. Open-time migration duration, index storage, and write
+costs remain unmeasured. Existing schema guards cause binaries that know only
+through migration 0095 to refuse an upgraded database; no downgrade
+compatibility is claimed. Strict x86_64 recovery, device, and platform
+qualification remain open; PR #2060 stays draft.
