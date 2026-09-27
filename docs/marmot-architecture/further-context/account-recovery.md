@@ -42,6 +42,14 @@ The simulator comes first; Jeff validates on a phone.
    - Unknown-scope loss completes when every *required* relay finished an untruncated NIP-77
      comparison over the frozen window, and every difference was admitted or terminally
      disposed.
+   - That window must cover the obligation's whole goal. A queue or notification loss goal
+     starts at the live subscription floor, minus the NIP-59 overlap on the inbox route.
+     Pending loss holds the cursor fence, so the current checkpoint floor is a safe lower
+     bound. A goal that reaches below the retained-inventory floor, or has no lower bound
+     (an epoch gap whose commit time is unknown), cannot be certified by comparison. The
+     comparison still fetches every difference inside the window. The obligation completes
+     only on its own evidence, for example the missing epoch arriving, or it parks for
+     explicit deep repair.
    - Otherwise, after **3 completed attempts that make no progress**, the obligation parks.
      It shows "history may be incomplete" and offers an explicit deep repair. There are no
      further automatic retries.
@@ -215,12 +223,13 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 - Spill write latency under a burst, and cursor safety while writes are pending (covered by
   tests).
-- Truncated comparisons. The adapter asks for at most 16,384 items per NIP-77 request, the
-  inventory cap. The whitenoise relays' own match-set cap is 5,000,000, so the adapter limit
-  is the binding one. `NostrReconciliationSummary` reports only aggregate relay success and
-  failure, with no truncation outcome. Until the fork reports one, step 2 counts an endpoint
-  whose relay-side set reaches the adapter limit as failed, so a possibly truncated
-  comparison never certifies a route.
+- Truncated comparisons. The whitenoise relays' own match-set cap is 5,000,000, so the
+  adapter's request limit is the binding one. `NostrReconciliationSummary` reports only
+  aggregate relay success and failure, with no truncation outcome. The adapter therefore
+  asks for one item more than the inventory cap (16,385). A relay set that fills that limit
+  may be truncated, so that endpoint counts as failed and cannot certify the route. A set of
+  at most 16,384 is complete, including a busy route that sits exactly on the cap, and can
+  certify it. A per-relay truncation flag from the fork would replace this inference.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.
