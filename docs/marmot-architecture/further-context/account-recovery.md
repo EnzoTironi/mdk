@@ -1,7 +1,7 @@
 ---
 title: Account history recovery
 updated: 2026-09-27
-status: Proposed design (v2). Replaces the 23 recovery design, ledger and qualification notes.
+status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
 # Account history recovery
@@ -9,6 +9,10 @@ status: Proposed design (v2). Replaces the 23 recovery design, ledger and qualif
 Tracks #1945 (outcome), #1947 (bounded acquisition) and #1948 (assurance). The durable
 owner from #1946 stays. This document covers what changes, what is deleted, and how we
 will know it worked.
+
+The notes this replaces, including the #1946 ownership design, its integration ledger and
+the 13395cc1 checkpoint evidence, remain in git history at
+[`9489bb091`](https://github.com/marmot-protocol/mdk/tree/9489bb091/docs/marmot-architecture/further-context).
 
 ## Goal and scorecard
 
@@ -64,23 +68,28 @@ New behavior, with each tier falling back to the next:
 router ─► account queue (1,024, memory) ─► worker ingest
    │ full
    ▼
-durable spill (encrypted DB, capped: 16 MiB / 8,192 events) ─► worker ingest, bounded turns
-   │ full
-   ▼
-dropped IDs (capped: 4,096) ─► known-event obligations ─► exact-ID fetch
+durable spill (encrypted DB, capped: 16 MiB / 8,192 events) ─► worker ingest, alternating with live
    │ full
    ▼
 unknown-scope loss (today's behavior) ─► comparison obligation
 ```
+
+Recording dropped IDs as a middle tier, turning them into known-event obligations for
+exact-ID fetch, is deferred. The spill is sized so that tier is rarely reached, and
+NIP-77 comparison covers what remains.
 
 - The spill writer extends the already-approved off-worker loss writer. It writes spill rows
   and loss evidence only, never engine or receipt state. The hand-off from the router is a
   bounded in-memory buffer, so the router never blocks.
 - A spilled event counts as retained for cursor safety once its write is durable. The live
   cursor never passes an event that is neither admitted nor durably spilled.
-- The worker admits spilled events after the in-memory queue drains, a few per turn. Order
-  is not guaranteed; the engine already handles reordered input (deferral and retained
-  input), and a test will pin this.
+- While spilled rows remain, the worker alternates them with live deliveries, and yields
+  between them, so neither a busy live queue nor a large spill starves the other. Order is
+  not guaranteed; the engine already handles reordered input (deferral and retained input).
+- A row is removed only once its event is in the seen index. A row whose ingest left no
+  durable trace is retried with a doubling delay, from one minute up to an hour. After 8
+  attempts it is removed and recorded as queue loss in the same transaction, so recovery
+  keeps an obligation.
 - In the incident, overflow came from replaying history the device already had. Under this
   design that costs no network at all: the spilled events are admitted as duplicates and
   dropped cheaply.
@@ -96,8 +105,8 @@ automatic recovery.
 
 | Cause | Source of work |
 | --- | --- |
-| Spill over its cap, released receipts | Known event IDs |
-| SDK notification loss, spill-and-ID overflow, epoch gap, cold-start incremental history, explicit repair | NIP-77 comparison of the affected routes over the retained-inventory window (explicit repair may use a wider window) |
+| Released receipts | Known event IDs |
+| Spill overflow, SDK notification loss, epoch gap, cold-start incremental history, explicit repair | NIP-77 comparison of the affected routes over the retained-inventory window (explicit repair may use a wider window) |
 
 Every cause runs the same job:
 
@@ -138,7 +147,8 @@ window is cheap once we are caught up.
 - Three recovery job slots and their yield flags in the worker loop, replaced by one.
 - The approved exception for unbounded retention of unresolved-loss rows. Loss records are
   now capped at every tier.
-- The 23 recovery docs, replaced by this one.
+- The 22 recovery notes, replaced by this one. The bounded-acquisition interface contract
+  stays in its own document.
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
 Each PR reports exact before/after line counts. The goal is a large net reduction across
@@ -158,10 +168,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 ## Storage
 
-- Forward-only migration 0096 adds the spill table: event ID unique, route hint, delivery
-  blob, received time, size.
-- Dropped IDs become ordinary known-event obligations; the table for those already exists.
-  They get their first production producer, since today only tests create them.
+- Forward-only migration 0096 adds the spill table: event ID unique, payload, metadata
+  blob with a format version, size, retry attempts and retry time.
 - Existing pending QueueLoss, notification-loss, epoch-gap, incremental and explicit rows
   run on the new path as unknown-scope comparisons.
 - Tables that no code reads any more are dropped in a later migration, once their rows have
@@ -186,11 +194,11 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 ## Delivery
 
-| Step | Contents | Merge policy |
+| Step | Contents | Status |
 | --- | --- | --- |
-| 0 (tonight) | Fix the production-policy nightly; close #2060 with an evidence summary; slim the docs to this file; scorecard harness and a baseline on current master | Merge after self-review |
-| 1 | Spill and dropped-ID tiers, direct worker admission for recovered events, known-event producer | Built and self-reviewed tonight; merged after we talk |
-| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | Tomorrow onward |
+| 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Nightly and #2060 done; docs and scorecard in review |
+| 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | In review |
+| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | Not started |
 
 ## Risks and open items
 
