@@ -9,7 +9,10 @@ use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, TransportDelivery, TransportGroupSubscription};
 use tokio::sync::Notify;
 
-use super::{ACCOUNT_DELIVERY_BUFFER, AccountDeliveryEvent, AccountDeliveryOverflowState};
+use super::{
+    ACCOUNT_DELIVERY_BUFFER, AccountDeliveryEvent, AccountDeliveryOverflow,
+    AccountDeliveryOverflowState,
+};
 
 const QUEUE_CAPACITY: usize = ACCOUNT_DELIVERY_BUFFER + 1;
 
@@ -104,6 +107,63 @@ impl AccountDeliverySender {
 
     pub(super) fn capacity(&self) -> usize {
         QUEUE_CAPACITY - self.inner.state.lock().unwrap().items.len()
+    }
+
+    /// Read the live control reservation under queue -> overflow lock order.
+    /// A notification signal alone does not establish a queue position.
+    pub(super) fn queued_overflow_marker_token(
+        &self,
+        overflow: &AccountDeliveryOverflowState,
+    ) -> Option<u64> {
+        let queue = self.inner.state.lock().unwrap();
+        if !queue.receiver_alive || queue.routes_retired {
+            return None;
+        }
+        let loss = overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (loss.pending
+            && loss.signal_queued
+            && loss.dropped > 0
+            && queue.items.iter().any(|item| {
+                matches!(item, QueueItem::Overflow { generation, .. } if *generation == loss.generation)
+            }))
+        .then_some(loss.marker_token)
+    }
+
+    /// Inspect the same live queue identity after a control was consumed.
+    /// There is no longer a reservation to find, so match its generation and
+    /// marker against the still-pending process-local loss authority.
+    pub(super) fn consumed_control_still_current(
+        &self,
+        overflow: &AccountDeliveryOverflowState,
+        generation: u64,
+        marker_token: u64,
+    ) -> bool {
+        let queue = self.inner.state.lock().unwrap();
+        if !queue.receiver_alive || queue.routes_retired {
+            return false;
+        }
+        let loss = overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loss.pending && loss.generation == generation && loss.marker_token == marker_token
+    }
+
+    /// Keep the historical consume operation for old receivers, but only a
+    /// receiver belonging to the current nonretired queue may yield a hint.
+    pub(super) fn consume_control(
+        &self,
+        overflow: &AccountDeliveryOverflowState,
+        generation: u64,
+    ) -> AccountDeliveryOverflow {
+        let queue = self.inner.state.lock().unwrap();
+        let current = queue.receiver_alive && !queue.routes_retired;
+        let mut observed = overflow.consume_signal(generation);
+        observed.consumed_current_control &= current;
+        observed
     }
 
     /// A route mutation invalidates all previously admitted scheduling keys.
@@ -442,6 +502,61 @@ mod tests {
             AccountDeliveryEvent::Delivery(delivery) => delivery.message.payload[0],
             AccountDeliveryEvent::Overflow { .. } => panic!("unexpected control"),
         }
+    }
+
+    #[test]
+    fn exact_queue_reservation_excludes_notification_cancel_and_retirement() {
+        let (sender, mut receiver) = AccountDeliverySender::channel();
+        let overflow = AccountDeliveryOverflowState::default();
+        let notification_generation = overflow.record_notification_loss().unwrap();
+        assert_eq!(sender.queued_overflow_marker_token(&overflow), None);
+        overflow.cancel_signal(notification_generation);
+        for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+            sender.route_delivery(delivery(1, 11, 1), &overflow);
+        }
+        let RouteAdmission::Omitted {
+            signal_generation: Some(generation),
+            ..
+        } = sender.route_delivery(delivery(1, 11, 2), &overflow)
+        else {
+            panic!("first omitted delivery reserves a control");
+        };
+        let token = overflow.pending_snapshot().unwrap().marker_token;
+        assert_eq!(sender.queued_overflow_marker_token(&overflow), Some(token));
+        sender
+            .try_send(AccountDeliveryEvent::Overflow { generation })
+            .unwrap();
+        assert_eq!(sender.queued_overflow_marker_token(&overflow), Some(token));
+        for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+            assert_eq!(pop_id(&mut receiver), 1);
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Some(AccountDeliveryEvent::Overflow { generation: observed }) if observed == generation
+        ));
+        assert!(overflow.consume_signal(generation).consumed_current_control);
+        assert_eq!(sender.queued_overflow_marker_token(&overflow), None);
+        // The same pending generation can later acquire a notification signal
+        // with dropped > 0, but that signal has no queue reservation.
+        let notification_again = overflow.record_notification_loss().unwrap();
+        assert_eq!(sender.queued_overflow_marker_token(&overflow), None);
+        overflow.cancel_signal(notification_again);
+        for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+            sender.route_delivery(delivery(1, 11, 3), &overflow);
+        }
+        let RouteAdmission::Omitted {
+            signal_generation: Some(next),
+            ..
+        } = sender.route_delivery(delivery(1, 11, 4), &overflow)
+        else {
+            panic!("later loss reserves another control in the same generation");
+        };
+        assert_eq!(next, generation);
+        assert_eq!(sender.queued_overflow_marker_token(&overflow), Some(token));
+        sender.cancel_overflow_signal(&overflow, next);
+        assert_eq!(sender.queued_overflow_marker_token(&overflow), None);
+        sender.retire_routes();
+        assert_eq!(sender.queued_overflow_marker_token(&overflow), None);
     }
 
     #[test]

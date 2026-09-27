@@ -731,6 +731,8 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     cost_probe.enabled.store(true, Ordering::SeqCst);
     pause_release_tx.send(true).unwrap();
     let mut stimulated_receive = false;
+    let mut stimulus_inner_id = None;
+    let mut stimulus_send_backlog = None;
     let mut stimulus_checks = 0u64;
     let mut stimulus_first = None;
     let mut stimulus_last = None;
@@ -743,9 +745,10 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
                 _ = &mut entered => break true,
                 _ = sleep(Duration::from_millis(20)) => {
                     // An online terminal is not guaranteed before this wake.
-                    // Once the ordinary queue has capacity and no network job
-                    // is active, enqueue a real event; the worker chooses its
-                    // Receive seam when that delivery is actually claimed.
+                    // Publish the real wake while this queue still has a
+                    // backlog and capacity, with no network job active.
+                    // Correlate its exact queue admission after the probe;
+                    // Receive selection occurs only if the worker claims it.
                     if stimulate_receive && !stimulated_receive {
                         let queue_depth = app.relay_plane.relay_health().await.account_delivery_queue_depth;
                         let active_jobs = activity.active_jobs.load(Ordering::SeqCst);
@@ -755,8 +758,12 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
                         stimulus_last = Some(check);
                         stimulus_zero_queue += u64::from(queue_depth == 0);
                         stimulus_idle_jobs += u64::from(active_jobs == 0);
-                        if queue_depth == 0 && active_jobs == 0 {
-                            bob_client
+                        if queue_depth > 0
+                            && queue_depth < crate::relay_plane::ACCOUNT_DELIVERY_BUFFER
+                            && active_jobs == 0
+                        {
+                            stimulus_send_backlog = Some(check);
+                            stimulus_inner_id = bob_client
                                 .send_custom_event(
                                     &groups[1],
                                     22_227,
@@ -764,7 +771,10 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
                                     "ordinary Receive wake after loss".into(),
                                 )
                                 .await
-                                .unwrap();
+                                .unwrap()
+                                .message_ids
+                                .into_iter()
+                                .next();
                             stimulated_receive = true;
                         }
                     }
@@ -944,7 +954,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     // The sender's local timeline binds its returned inner ID to the exact
     // published outer transport ID. Resolve it after the timed hold, then
     // select only that ID from the bounded group-hint candidate witness.
-    let (live_correlation, live_exact_id) = match bob_inner_id.as_deref() {
+    let correlate_outer_id = |inner_id: Option<&str>| match inner_id {
         None => ("no_inner_id", None),
         Some(inner_id) => {
             match app.timeline_message(&bob.label, &hex::encode(&groups[1]), inner_id) {
@@ -963,6 +973,10 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
             }
         }
     };
+    let (stimulus_correlation, stimulus_exact_id) =
+        correlate_outer_id(stimulus_inner_id.as_deref());
+    let (_, _, stimulus_exact_path) = live_path_witness.snapshot(stimulus_exact_id);
+    let (live_correlation, live_exact_id) = correlate_outer_id(bob_inner_id.as_deref());
     let (live_group_candidates, live_group_observations_dropped, live_exact_path) =
         live_path_witness.snapshot(live_exact_id);
     let selected = selections.lock().unwrap().clone();
@@ -1060,7 +1074,7 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         gate.neg_max_items.load(Ordering::SeqCst),
     );
     eprintln!(
-        "loss_timing: target_gate_entry_ms={target_gate_entry_ms:?}, observer_entry_ms={observer_entry_ms:?}, stimulus_checks={stimulus_checks}, stimulus_first={stimulus_first:?}, stimulus_last={stimulus_last:?}, stimulus_zero_queue={stimulus_zero_queue}, stimulus_idle_jobs={stimulus_idle_jobs}, live_publish_started={live_publish_started:?}, live_publish_completed={live_publish_completed:?}, live_alice_observed={live_alice_observed:?}"
+        "loss_timing: target_gate_entry_ms={target_gate_entry_ms:?}, observer_entry_ms={observer_entry_ms:?}, stimulus_checks={stimulus_checks}, stimulus_first={stimulus_first:?}, stimulus_last={stimulus_last:?}, stimulus_send_backlog={stimulus_send_backlog:?}, stimulus_zero_queue={stimulus_zero_queue}, stimulus_idle_jobs={stimulus_idle_jobs}, live_publish_started={live_publish_started:?}, live_publish_completed={live_publish_completed:?}, live_alice_observed={live_alice_observed:?}"
     );
     eprintln!(
         "loss_cost: window_ms={}, alice_direct_receive_dequeued={}, alice_direct_receive_completed_ingest={}, alice_direct_receive_duplicate_skips={}, inventory_count_total_us_max_us={:?}, scoped_admission_count_total_us_max_us={:?}, direct_receive_followup_elapsed_including_suspension_count_total_us_max_us={:?}, runtime_wide_completed_sum_ms_inflight_before_after={runtime_cost_delta:?}; online recovery drain deliveries are absent from direct receive counts; nested/runtime-wide ms are separately rounded and cannot be added or subtracted into a wall-time partition; boundary-straddling operations may be absent from deltas",
@@ -1084,6 +1098,9 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
     );
     eprintln!(
         "loss_live_path: correlation={live_correlation}, bounded_group_hint_candidates={live_group_candidates}, dropped_group_hint_observations={live_group_observations_dropped}, exact_event_stage_aggregates={live_exact_path:?}; repeated event IDs retain per-stage counts and first timestamps, which do not link stages to the same copy; group-hint candidates are not exact-event evidence until correlated to the sender's local published source; absence after the timed probe is unknown, not proof of relay loss"
+    );
+    eprintln!(
+        "loss_stimulus_path: correlation={stimulus_correlation}, exact_event_stage_aggregates={stimulus_exact_path:?}; send backlog is an advisory snapshot, while exact queue acceptance and dequeue come from the correlated outer ID"
     );
     if status_timed_out {
         timeout(Duration::from_secs(30), status_rx)
@@ -1257,6 +1274,16 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         assert!(
             stimulated_receive,
             "a real inbound delivery must wake Receive"
+        );
+        assert!(
+            stimulus_exact_path.is_some_and(|path| {
+                path.router_arrival.count > 0
+                    && path.queue_accepted.count > 0
+                    && path.dequeued.count > 0
+                    && path.queue_full.count == 0
+                    && path.queue_closed.count == 0
+            }),
+            "the exact ordinary wake must be admitted and dequeued: {stimulus_correlation}, {stimulus_exact_path:?}"
         );
         assert!(
             selected.iter().any(|selection| {

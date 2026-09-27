@@ -2322,6 +2322,7 @@ async fn run_app_runtime_account_worker(
                                                 &mut client,
                                                 &shared,
                                                 EpochBackfillExecutionSeam::Maintenance,
+                                                None,
                                             ).await {
                                                 PendingComparisonExecution::Offloaded {
                                                     grant, subscription_attempt, network,
@@ -2508,7 +2509,7 @@ async fn run_app_runtime_account_worker(
                     Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
                         (client.ingest_received_delivery(*delivery).await, false)
                     }
-                    Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(_)) => {
+                    Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(overflow)) => {
                         let backfill_armed = client.has_pending_epoch_backfill();
                         let observation = backfill_armed.then(|| shared.product_analytics.begin(
                             crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
@@ -2517,6 +2518,9 @@ async fn run_app_runtime_account_worker(
                             &mut client,
                             &shared,
                             EpochBackfillExecutionSeam::Receive,
+                            overflow
+                                .consumed_current_control
+                                .then_some((overflow.generation, overflow.marker_token)),
                         ).await {
                             PendingComparisonExecution::OnlineEpochGap { recovery, network } => {
                                 online_epoch_gap = Some(OnlineEpochGapJob {
@@ -2633,6 +2637,7 @@ async fn run_app_runtime_account_worker(
                                 } else {
                                     execute_pending_comparison_or_inline(
                                         &mut client, &shared, EpochBackfillExecutionSeam::Receive,
+                                        None,
                                     ).await
                                 };
                                 #[cfg(test)]
@@ -3168,6 +3173,7 @@ async fn run_app_runtime_account_worker(
                     &mut client,
                     &shared,
                     EpochBackfillExecutionSeam::Maintenance,
+                    None,
                 )
                 .await
                 {
@@ -3249,6 +3255,7 @@ async fn execute_pending_comparison_or_inline(
     client: &mut AppClient,
     shared: &RuntimeSharedServices,
     seam: EpochBackfillExecutionSeam,
+    consumed_control: Option<(u64, u64)>,
 ) -> PendingComparisonExecution {
     let mut credit = bounded_recovery::try_acquire_recovery_credit(&shared.recovery_credit_pool());
     let selection = if credit.is_none()
@@ -3259,7 +3266,7 @@ async fn execute_pending_comparison_or_inline(
     {
         Ok(crate::client::PendingRecoverySelection::Deferred)
     } else {
-        client.select_pending_epoch_backfill(seam)
+        client.select_pending_epoch_backfill_with_control_skip(seam, consumed_control)
     };
     match selection {
         Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
@@ -7062,6 +7069,94 @@ fn finish_direct_overflow_recovery(
     }
 }
 
+/// Drive the real inline direct-overflow selection and its existing Receive
+/// continuation with a control popped from the account adapter. The test owns
+/// the adapter, so it calls these worker helpers in the same order as the
+/// steady-state Receive arm without starting a competing account worker.
+#[cfg(test)]
+pub(crate) async fn exercise_direct_overflow_receive_for_test(
+    client: &mut AppClient,
+    runtime: &super::MarmotAppRuntime,
+    overflow: crate::relay_plane::AccountDeliveryOverflow,
+) -> (SyncSummary, bool) {
+    let shared = runtime.shared_services();
+    let events = &runtime.events;
+    let account_id_hex = hex::encode(client.adapter.account_id().as_slice());
+    let account_label = client.state.label.clone();
+    let backfill_armed = client.has_pending_epoch_backfill();
+    let observation = backfill_armed
+        .then(|| {
+            shared.product_analytics.begin(
+                crate::ProductFamily::Recovery,
+                "backfill",
+                crate::ProductUnit::Attempt,
+            )
+        })
+        .flatten();
+    let receive_observation = shared
+        .app_performance_telemetry()
+        .observe(RuntimeOp::WorkerReceive);
+    let selection = execute_pending_comparison_or_inline(
+        client,
+        &shared,
+        EpochBackfillExecutionSeam::Receive,
+        overflow
+            .consumed_current_control
+            .then_some((overflow.generation, overflow.marker_token)),
+    )
+    .await;
+    let PendingComparisonExecution::Inline(result) = selection else {
+        panic!("queued control must defer before offload");
+    };
+    assert!(matches!(result, Ok(EpochBackfillRunOutcome::Deferred)));
+    let (summary, incomplete) = finish_direct_overflow_recovery(
+        client,
+        result,
+        backfill_armed,
+        observation,
+        EpochBackfillReportContext {
+            events,
+            account_id_hex: &account_id_hex,
+            account_label: &account_label,
+            shared: &shared,
+        },
+    )
+    .unwrap();
+    receive_observation.finish_app(&Ok(summary.clone()));
+    publish_app_runtime_summary_with_v5(client, events, &account_id_hex, &account_label, &summary);
+    publish_client_pending_projection_updates(client, events, &account_id_hex, &account_label);
+    start_post_join_history_after_visibility(
+        client,
+        &summary,
+        events,
+        &account_id_hex,
+        &account_label,
+    )
+    .await;
+    let mut scheduled_convergence = ScheduledConvergence::new(Duration::from_secs(1));
+    schedule_pending_convergence_groups(&mut scheduled_convergence, client);
+    let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
+    let retry_push_registration = !summary.joined_groups.is_empty();
+    assert!(incomplete, "deferred work skips the Receive follow-up");
+    let mut scheduled_push_retry = ScheduledPushRegistrationRetry::new();
+    let (command_tx, _command_rx) = mpsc::channel(1);
+    finish_receive_after_recovery(
+        client,
+        ReceiveTailContext {
+            events,
+            account_id_hex: &account_id_hex,
+            account_label: &account_label,
+            shared: &shared,
+            scheduled_push_retry: &mut scheduled_push_retry,
+            command_tx: &command_tx,
+        },
+        audit_tracker_update,
+        retry_push_registration,
+    )
+    .await;
+    (summary, incomplete)
+}
+
 async fn finish_online_recovery(
     client: &mut AppClient,
     job: OnlineEpochGapJob,
@@ -7886,6 +7981,48 @@ mod tests {
         assert!(
             !trace.lock().unwrap().contains(&"direct_overflow_followup"),
             "incomplete owned overflow must keep its debt for a later seam"
+        );
+
+        trace.lock().unwrap().clear();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = watch::channel(false);
+        *runtime
+            .shared_services()
+            .next_worker_loop_pause
+            .lock()
+            .unwrap() = Some(crate::runtime::WorkerLoopPause {
+            account_label: "alice".to_owned(),
+            entered: entered_tx,
+            release: release_rx,
+            completed_direct_overflow: Some(Ok(EpochBackfillRunOutcome::Deferred)),
+            arm_epoch_backfill: None,
+        });
+        let (respond, _) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        release_tx.send(true).unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !trace
+                .lock()
+                .unwrap()
+                .contains(&"direct_overflow_receive_tail")
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deferred control still runs the original Receive tail");
+        assert!(
+            !trace.lock().unwrap().contains(&"direct_overflow_followup"),
+            "deferred control must wait for a later natural selection"
         );
 
         let (entered_tx, entered_rx) = oneshot::channel();

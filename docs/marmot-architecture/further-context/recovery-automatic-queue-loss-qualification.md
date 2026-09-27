@@ -320,3 +320,49 @@ reserved control and cannot overtake it. Neither local run classifies the 56
 recorded x86_64 failures across 14 prior heads; fresh-head CI and the open
 review blocker remain separate gates. No control promotion, recovery contract
 change, or fixture assertion change is included.
+
+The current follow-up defers a sole automatically eligible QueueLoss before
+retry reservation while its exact control remains in the current adapter's
+queue. A consumed control supplies a one-shot hint for that Receive call only;
+the adapter identity, generation, and marker are checked again before owner
+selection. The owner matches the selected demand's ID, revision, cause, and
+marker against the final post-rearm eligible fence. Conservative mode checks
+the full eligible fence before truncating to one winner. Parked history debt
+retains its ticket and eligibility; any other eligible demand, pending
+comparison, live caller, or still-pending maintenance observation bypasses
+the defer. Explicit, Startup, and required-ID selection also bypass it. This
+hint grants no coverage or completion authority and changes no durable retry
+state. A composed LocalRelay/AppClient test retains real parked bootstrap debt,
+persists a queue omission, drains the admitted prefix, and passes the actual
+consumed control through production selection and Receive-continuation helpers.
+That helper composition does not itself run the worker loop or a natural
+Maintenance tick.
+
+One **unchanged-original** local macOS Receive run failed in 42.80 seconds
+(`/tmp/mdk-2060-eligible-control-receive.log`). Its observer never saw the
+old simultaneous empty-queue/no-job condition, so it never published the
+ordinary Receive stimulus. A Maintenance QueueLoss grant instead held the
+target request and returned and queued the missing event; the separate healthy
+event was exactly correlated through queue acceptance, dequeue, ingest, and
+Alice's plaintext observation. Useful progress under that Maintenance grant
+does not satisfy the fixture's strict Receive-seam assertion. The original
+failed log remains separate evidence.
+
+The fixture now publishes that same single valid ordinary wake at the first
+observed positive queue depth below the existing 1,024-item capacity while no
+network job is active. It records the sampled backlog and correlates the
+wake's sender inner ID to its published outer transport ID before reading the
+bounded router/queue/ingest witness. The strict Receive, active-phase,
+response-time, durable target, epoch, plaintext, and pending-debt assertions
+are unchanged. The **revised-stimulus** local macOS run passed in 56.79 seconds
+(`/tmp/mdk-2060-eligible-control-receive-revised.log`): the send sampled
+depth 1,023; the exact wake was accepted at 97 ms, dequeued at 13,938 ms,
+and ingested at 13,947 ms. Receive attempt 5 held the target query, returned
+and queued the missing event without a later grant, and passed the useful
+state and concurrent status/send/live bounds. The separate healthy event was
+accepted and dequeued at 14,075 ms, ingested at 14,083 ms, and observed by
+Alice at 14,088 ms. The QueueLoss marker and demand remained pending. Queue
+depth is an advisory sample, and neither log timestamps the exact control
+pop. This single revised local pass does not close the prior 60 failed x86_64
+attempts across 15 heads, the open review blocker, or fresh CI. The PR remains
+draft without merge, device qualification, default activation, or release.

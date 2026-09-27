@@ -353,6 +353,7 @@ impl AccountRecoveryOwner {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn select_authorized_attempt(
         &mut self,
         storage: &SqliteAccountStorage,
@@ -366,6 +367,7 @@ impl AccountRecoveryOwner {
     /// A bounded executor may accept only its exact selected obligation. The
     /// owner still applies its normal ordering and pacing; a different winner
     /// returns before a retry reservation is spent.
+    #[cfg(test)]
     pub(crate) fn select_authorized_attempt_for(
         &mut self,
         storage: &SqliteAccountStorage,
@@ -373,6 +375,25 @@ impl AccountRecoveryOwner {
         now: Instant,
         explicit: Option<&mut ExplicitRecoveryPermit>,
         required: Option<[u8; 16]>,
+    ) -> StorageResult<Option<AttemptGrant>> {
+        self.select_authorized_attempt_for_with_queue_loss_gate(
+            storage,
+            readiness,
+            now,
+            explicit,
+            required,
+            &[],
+        )
+    }
+
+    fn select_authorized_attempt_for_with_queue_loss_gate(
+        &mut self,
+        storage: &SqliteAccountStorage,
+        readiness: RecoveryReadiness,
+        now: Instant,
+        explicit: Option<&mut ExplicitRecoveryPermit>,
+        required: Option<[u8; 16]>,
+        deferred_control_tokens: &[u64],
     ) -> StorageResult<Option<AttemptGrant>> {
         if self.active.upgrade().is_some() {
             return Ok(None);
@@ -413,6 +434,7 @@ impl AccountRecoveryOwner {
             {
                 return Ok::<_, StorageError>(None);
             }
+            let eligible_before_single_winner;
             if self.mode == RecoveryExecutorMode::Normal && required.is_none() {
                 let maintenance = self
                     .maintenance_observations
@@ -421,6 +443,7 @@ impl AccountRecoveryOwner {
                     .collect::<Vec<_>>();
                 storage.rearm_recovery_maintenance_for_activation(&maintenance)?;
                 fence = storage.recovery_eligible_revision_fence(immediate)?;
+                eligible_before_single_winner = fence.obligations.clone();
             } else {
                 // One predicate owns this grant. Restore other physical sessions
                 // without re-completing their predicates or restarting grace.
@@ -439,6 +462,12 @@ impl AccountRecoveryOwner {
                 if required.is_none() {
                     storage.rearm_recovery_maintenance_for_activation(&displaced)?;
                 }
+                // A conservative owner later truncates to one winner. Inspect
+                // every currently eligible obligation after any rearm so an
+                // independent runnable demand cannot disappear from the gate.
+                eligible_before_single_winner = storage
+                    .recovery_eligible_revision_fence(immediate)?
+                    .obligations;
                 let mut ordered = fence
                     .obligations
                     .iter()
@@ -479,6 +508,39 @@ impl AccountRecoveryOwner {
                     || fence.obligations[0].0 != id
             }) {
                 return Ok(None);
+            }
+            // A sole automatically eligible QueueLoss must not spend retry
+            // state while its exact control fences admitted deliveries.
+            // Parked durable debt remains pending and untouched; live callers,
+            // maintenance observations, and all other runnable work bypass.
+            // The caller also supplies a one-shot token for the control's own
+            // Receive invocation. Neither is durable coverage authority.
+            if !immediate
+                && required.is_none()
+                && !deferred_control_tokens.is_empty()
+                && comparison_revision.is_none()
+                && !storage.recovery_comparison()?.pending()
+                && fence.obligations.len() == 1
+                && eligible_before_single_winner.as_slice() == fence.obligations.as_slice()
+            {
+                let demands = storage.pending_recovery_demands()?;
+                if !demands.iter().any(|demand| demand.caller_waiting)
+                    && !self.maintenance_observations.values().any(|observation| {
+                        demands
+                            .iter()
+                            .any(|demand| demand.ticket.id == observation.id)
+                    })
+                    && demands.iter().any(|demand| {
+                        demand.ticket.id == fence.obligations[0].0
+                            && demand.ticket.revision == fence.obligations[0].1
+                            && demand.cause == storage_sqlite::RecoveryCause::QueueLoss
+                            && demand
+                                .marker_token
+                                .is_some_and(|token| deferred_control_tokens.contains(&token))
+                    })
+                {
+                    return Ok(None);
+                }
             }
             let reservation = storage.reserve_recovery_work(
                 &fence,
@@ -1154,9 +1216,19 @@ impl AppClient {
 
     pub(crate) fn authorize_account_recovery_for(
         &mut self,
+        explicit: Option<&mut ExplicitRecoveryPermit>,
+        seam: marmot_forensics::EpochBackfillExecutionSeam,
+        required: Option<[u8; 16]>,
+    ) -> Result<Option<AttemptGrant>, AppError> {
+        self.authorize_account_recovery_for_with_control_skip(explicit, seam, required, None)
+    }
+
+    pub(crate) fn authorize_account_recovery_for_with_control_skip(
+        &mut self,
         mut explicit: Option<&mut ExplicitRecoveryPermit>,
         seam: marmot_forensics::EpochBackfillExecutionSeam,
         required: Option<[u8; 16]>,
+        consumed_control: Option<(u64, u64)>,
     ) -> Result<Option<AttemptGrant>, AppError> {
         // Wake collection retains the loaded live floor and leaves recovery
         // debt/pacing to an Advance runtime. Only the separate full-history
@@ -1209,22 +1281,42 @@ impl AppClient {
         } else {
             RecoveryReadiness::Waiting
         };
-        let selected = if required.is_some() {
-            self.recovery_owner.select_authorized_attempt_for(
+        // This is a process-local scheduling hint read after loss import and
+        // before the storage transaction. Later omissions remain protected by
+        // the existing revision fence and generation/count completion guard.
+        let mut deferred_control_tokens = Vec::new();
+        if explicit.is_none()
+            && required.is_none()
+            && matches!(
+                seam,
+                marmot_forensics::EpochBackfillExecutionSeam::Receive
+                    | marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+            )
+        {
+            if let Some(token) = self.adapter.queued_overflow_marker_token() {
+                deferred_control_tokens.push(token);
+            }
+            // The receipt was qualified at pop under the registry lock. A
+            // replacement may happen before this later owner selection, so
+            // require the same live queue and generation again here.
+            if let Some((generation, token)) = consumed_control
+                && self
+                    .adapter
+                    .consumed_control_still_current(generation, token)
+            {
+                deferred_control_tokens.push(token);
+            }
+        }
+        let selected = self
+            .recovery_owner
+            .select_authorized_attempt_for_with_queue_loss_gate(
                 &storage,
                 readiness,
                 Instant::now(),
                 explicit.as_deref_mut(),
                 required,
-            )?
-        } else {
-            self.recovery_owner.select_authorized_attempt(
-                &storage,
-                readiness,
-                Instant::now(),
-                explicit.as_deref_mut(),
-            )?
-        };
+                &deferred_control_tokens,
+            )?;
         self.record_unavailable_epoch_observation(&storage)?;
         let Some(mut grant) = selected else {
             return Ok(None);
@@ -1595,6 +1687,421 @@ mod tests {
         let now = Instant::now();
         let owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
         (storage, owner, now)
+    }
+
+    #[test]
+    fn queued_loss_gate_spends_no_retry_and_preserves_other_owner_work() {
+        for mode in [
+            RecoveryExecutorMode::Normal,
+            RecoveryExecutorMode::Conservative,
+        ] {
+            let (storage, mut owner, now) = fixture();
+            owner.select_executor_mode(mode);
+            let before_retry = storage.recovery_retry_state().unwrap();
+            let before = storage.pending_recovery_demands().unwrap();
+            assert_eq!(before.len(), 1);
+            assert_eq!(before[0].marker_token, Some(1));
+            assert!(
+                owner
+                    .select_authorized_attempt_for_with_queue_loss_gate(
+                        &storage,
+                        RecoveryReadiness::Ready,
+                        now,
+                        None,
+                        None,
+                        &[1],
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(storage.recovery_retry_state().unwrap(), before_retry);
+            let after = storage.pending_recovery_demands().unwrap();
+            assert_eq!(after[0].ticket.id, before[0].ticket.id);
+            assert_eq!(after[0].ticket.revision, before[0].ticket.revision);
+            assert!(
+                owner
+                    .select_authorized_attempt_for_with_queue_loss_gate(
+                        &storage,
+                        RecoveryReadiness::Ready,
+                        now,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .is_some(),
+                "post-control maintenance may claim the unchanged debt"
+            );
+
+            let (storage, mut owner, now) = fixture();
+            owner.select_executor_mode(mode);
+            assert!(
+                owner
+                    .select_authorized_attempt_for_with_queue_loss_gate(
+                        &storage,
+                        RecoveryReadiness::Ready,
+                        now,
+                        None,
+                        None,
+                        &[2],
+                    )
+                    .unwrap()
+                    .is_some(),
+                "a different or reopened marker cannot gate this debt"
+            );
+
+            let (storage, mut owner, now) = fixture();
+            owner.select_executor_mode(mode);
+            storage
+                .request_recovery(
+                    storage_sqlite::RecoveryRequest::IncrementalHistory,
+                    1_000_000,
+                )
+                .unwrap();
+            assert!(
+                owner
+                    .select_authorized_attempt_for_with_queue_loss_gate(
+                        &storage,
+                        RecoveryReadiness::Ready,
+                        now,
+                        None,
+                        None,
+                        &[1],
+                    )
+                    .unwrap()
+                    .is_some(),
+                "independent debt must keep owner ordering"
+            );
+
+            let (storage, mut owner, now) = fixture();
+            owner.select_executor_mode(mode);
+            storage
+                .join_recovery_comparison(&[1; 16], 1_000_000, &[comparison_goal()])
+                .unwrap();
+            assert!(
+                owner
+                    .select_authorized_attempt_for_with_queue_loss_gate(
+                        &storage,
+                        RecoveryReadiness::Ready,
+                        now,
+                        None,
+                        None,
+                        &[1],
+                    )
+                    .unwrap()
+                    .is_some(),
+                "pending comparison must bypass the gate"
+            );
+
+            let (storage, mut owner, now) = fixture();
+            owner.select_executor_mode(mode);
+            let mut explicit = ExplicitRecoveryPermit::default();
+            assert!(
+                owner
+                    .select_authorized_attempt_for_with_queue_loss_gate(
+                        &storage,
+                        RecoveryReadiness::Ready,
+                        now,
+                        Some(&mut explicit),
+                        None,
+                        &[1],
+                    )
+                    .unwrap()
+                    .is_some(),
+                "explicit repair does not wait for a queue control"
+            );
+        }
+
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        storage.ensure_account_projection("alice").unwrap();
+        storage
+            .record_account_recovery_loss(
+                "alice",
+                storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                1,
+                1,
+                1,
+            )
+            .unwrap();
+        storage.synchronize_account_delivery_loss("alice").unwrap();
+        let now = Instant::now();
+        let mut owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+        assert!(
+            owner
+                .select_authorized_attempt_for_with_queue_loss_gate(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    now,
+                    None,
+                    None,
+                    &[1],
+                )
+                .unwrap()
+                .is_some(),
+            "notification-only debt has no queue prefix"
+        );
+    }
+
+    #[test]
+    fn conservative_queue_loss_winner_does_not_hide_other_eligible_work() {
+        // Both obligations have no scope snapshots, so the conservative
+        // tie-breaker uses their generated IDs. Pick a fixture where QueueLoss
+        // is the winner; otherwise the test could pass for the wrong reason.
+        let (storage, mut owner, queue) = (0..128)
+            .find_map(|_| {
+                let storage = SqliteAccountStorage::in_memory().unwrap();
+                storage.ensure_account_projection("alice").unwrap();
+                let incremental = storage
+                    .request_recovery(
+                        storage_sqlite::RecoveryRequest::IncrementalHistory,
+                        1_000_000,
+                    )
+                    .unwrap();
+                let now = Instant::now();
+                let mut owner =
+                    AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+                let first = owner
+                    .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    first.fence.obligations,
+                    vec![(incremental.id, incremental.revision)]
+                );
+                drop(first);
+                owner.test_advance_to_retry(&storage);
+                storage
+                    .mark_account_delivery_recovery("alice", 1, 1)
+                    .unwrap();
+                let queue = storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .into_iter()
+                    .find(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+                    .unwrap();
+                (queue.ticket.id < incremental.id).then_some((storage, owner, queue))
+            })
+            .expect("generated a QueueLoss conservative winner");
+        assert_eq!(
+            storage
+                .recovery_eligible_revision_fence(false)
+                .unwrap()
+                .obligations
+                .len(),
+            2
+        );
+        assert!(owner.select_executor_mode(RecoveryExecutorMode::Conservative));
+        assert!(owner.test_retry_remaining(&storage).is_zero());
+        let next = owner
+            .select_authorized_attempt_for_with_queue_loss_gate(
+                &storage,
+                RecoveryReadiness::Ready,
+                Instant::now(),
+                None,
+                None,
+                &[1],
+            )
+            .unwrap()
+            .expect("second eligible obligation prevents QueueLoss defer");
+        assert_eq!(next.fence.obligations.len(), 1);
+        assert_eq!(next.fence.obligations[0].0, queue.ticket.id);
+    }
+
+    #[test]
+    fn parked_history_stays_parked_until_route_change_rearms_it() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        storage.ensure_account_projection("alice").unwrap();
+        storage.observe_recovery_route_snapshot([1; 32]).unwrap();
+        let now = Instant::now();
+        let mut owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+        let history = storage
+            .request_recovery(
+                storage_sqlite::RecoveryRequest::IncrementalHistory,
+                1_000_000,
+            )
+            .unwrap();
+        let fence = storage.recovery_revision_fence().unwrap();
+        let attempt = storage
+            .reserve_recovery_attempt(&fence, 1_000_000, 1, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !storage
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt.attempt_serial,
+                    history.id,
+                    &[],
+                    storage_sqlite::RecoveryEligibility::NeedsDeepRepair,
+                )
+                .unwrap()
+        );
+        storage
+            .mark_account_delivery_recovery("alice", 1, 1)
+            .unwrap();
+        owner.test_advance_to_retry(&storage);
+        let before_retry = storage.recovery_retry_state().unwrap();
+        let parked = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.ticket.id == history.id)
+            .unwrap();
+        assert_eq!(
+            parked.eligibility,
+            storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+        );
+        assert_eq!(
+            storage
+                .recovery_eligible_revision_fence(false)
+                .unwrap()
+                .obligations
+                .len(),
+            1
+        );
+        assert!(
+            owner
+                .select_authorized_attempt_for_with_queue_loss_gate(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    Instant::now(),
+                    None,
+                    None,
+                    &[1],
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap(), before_retry);
+        let unchanged = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.ticket.id == history.id)
+            .unwrap();
+        assert_eq!(unchanged.ticket.revision, parked.ticket.revision);
+        assert_eq!(unchanged.eligibility, parked.eligibility);
+
+        let group = cgka_traits::GroupId::new(vec![7; 16]);
+        owner.maintenance_observations.insert(
+            group.clone(),
+            MaintenanceRecoveryObservation {
+                fence: storage.recovery_revision_fence().unwrap(),
+                attempt_serial: 0,
+                id: history.id,
+                scopes: Vec::new(),
+            },
+        );
+        assert!(
+            owner
+                .select_authorized_attempt_for_with_queue_loss_gate(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    Instant::now(),
+                    None,
+                    None,
+                    &[1],
+                )
+                .unwrap()
+                .is_some(),
+            "still-pending maintenance observation bypasses the gate"
+        );
+        owner.maintenance_observations.remove(&group);
+        owner.test_advance_to_retry(&storage);
+
+        assert!(storage.observe_recovery_route_snapshot([2; 32]).unwrap());
+        assert_eq!(
+            storage
+                .recovery_eligible_revision_fence(false)
+                .unwrap()
+                .obligations
+                .len(),
+            2
+        );
+        assert!(
+            owner
+                .select_authorized_attempt_for_with_queue_loss_gate(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    Instant::now(),
+                    None,
+                    None,
+                    &[1],
+                )
+                .unwrap()
+                .is_some(),
+            "route rearm makes independent history eligible again"
+        );
+    }
+
+    #[test]
+    fn parked_live_explicit_caller_bypasses_queue_loss_gate() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        storage.ensure_account_projection("alice").unwrap();
+        let now = Instant::now();
+        let mut owner = AccountRecoveryOwner::open(&storage, 1_000_000, now, policy()).unwrap();
+        let operation = [9; 16];
+        let caller = storage
+            .request_recovery(
+                storage_sqlite::RecoveryRequest::ExplicitHistory {
+                    operation_id: &operation,
+                },
+                1_000_000,
+            )
+            .unwrap();
+        let fence = storage.recovery_revision_fence().unwrap();
+        let attempt = storage
+            .reserve_recovery_attempt(&fence, 1_000_000, 1, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !storage
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt.attempt_serial,
+                    caller.id,
+                    &[],
+                    storage_sqlite::RecoveryEligibility::NeedsDeepRepair,
+                )
+                .unwrap()
+        );
+        storage
+            .mark_account_delivery_recovery("alice", 1, 1)
+            .unwrap();
+        owner.test_advance_to_retry(&storage);
+        let waiting = storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.ticket.id == caller.id)
+            .unwrap();
+        assert!(waiting.caller_waiting);
+        assert_eq!(
+            waiting.eligibility,
+            storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+        );
+        assert_eq!(
+            storage
+                .recovery_eligible_revision_fence(false)
+                .unwrap()
+                .obligations
+                .len(),
+            1
+        );
+        assert!(
+            owner
+                .select_authorized_attempt_for_with_queue_loss_gate(
+                    &storage,
+                    RecoveryReadiness::Ready,
+                    Instant::now(),
+                    None,
+                    None,
+                    &[1],
+                )
+                .unwrap()
+                .is_some(),
+            "live caller is excluded even while parked"
+        );
     }
 
     #[test]

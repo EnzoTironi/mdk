@@ -298,6 +298,9 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     // handoff, which now forbids this transition while a writer is in flight.
     overflow.inner.lock().unwrap().pending = false;
     let new_generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    let stale = overflow.consume_signal(old_generation);
+    assert_eq!(stale.generation, new_generation);
+    assert!(!stale.consumed_current_control);
     overflow.consume_signal(new_generation);
     assert!(overflow.start_marker_persistence());
 
@@ -3808,6 +3811,361 @@ fn queued_delivery(account_id: &MemberId, id: u8) -> TransportDelivery {
 }
 
 #[tokio::test]
+async fn retired_adapter_control_pop_cannot_defer_replacement_queue() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA8; 32]);
+    let old = plane.account_adapter(account.clone(), relay.clone());
+    let old_route = account_deliveries_read(&plane.inner.transport.account_deliveries)
+        .get(&account)
+        .unwrap()
+        .clone();
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        old_route
+            .sender
+            .route_delivery(queued_delivery(&account, 1), &old_route.overflow);
+    }
+    let RouteAdmission::Omitted {
+        signal_generation: Some(old_generation),
+        ..
+    } = old_route
+        .sender
+        .route_delivery(queued_delivery(&account, 2), &old_route.overflow)
+    else {
+        panic!("old queue reserves control");
+    };
+    old_route
+        .sender
+        .try_send(AccountDeliveryEvent::Overflow {
+            generation: old_generation,
+        })
+        .unwrap();
+    let replacement = plane.account_adapter(account.clone(), relay);
+    assert_ne!(old.delivery_queue_id, replacement.delivery_queue_id);
+    assert_eq!(old.queued_overflow_marker_token(), None);
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        assert!(matches!(
+            old.receive_account_delivery().await.unwrap(),
+            Some(AccountDeliveryReceive::Delivery(_))
+        ));
+    }
+    let Some(AccountDeliveryReceive::Overflow(stale)) =
+        old.receive_account_delivery().await.unwrap()
+    else {
+        panic!("old receiver drains its original control");
+    };
+    assert_eq!(stale.generation, old_generation);
+    assert!(!stale.consumed_current_control);
+    assert!(!old.consumed_control_still_current(stale.generation, stale.marker_token));
+
+    let current_route = account_deliveries_read(&plane.inner.transport.account_deliveries)
+        .get(&account)
+        .unwrap()
+        .clone();
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        current_route
+            .sender
+            .route_delivery(queued_delivery(&account, 3), &current_route.overflow);
+    }
+    let RouteAdmission::Omitted {
+        signal_generation: Some(current_generation),
+        ..
+    } = current_route
+        .sender
+        .route_delivery(queued_delivery(&account, 4), &current_route.overflow)
+    else {
+        panic!("replacement queue reserves its own control");
+    };
+    current_route
+        .sender
+        .try_send(AccountDeliveryEvent::Overflow {
+            generation: current_generation,
+        })
+        .unwrap();
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        assert!(matches!(
+            replacement.receive_account_delivery().await.unwrap(),
+            Some(AccountDeliveryReceive::Delivery(_))
+        ));
+    }
+    let Some(AccountDeliveryReceive::Overflow(current)) =
+        replacement.receive_account_delivery().await.unwrap()
+    else {
+        panic!("replacement receiver consumes its own control");
+    };
+    assert!(current.consumed_current_control);
+    assert!(replacement.consumed_control_still_current(current.generation, current.marker_token));
+    let after_current =
+        plane.account_adapter(account.clone(), Arc::new(RecordingRelayClient::default()));
+    assert_ne!(
+        replacement.delivery_queue_id,
+        after_current.delivery_queue_id
+    );
+    assert!(!replacement.consumed_control_still_current(current.generation, current.marker_token));
+    assert_eq!(after_current.queued_overflow_marker_token(), None);
+    plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn queued_loss_control_keeps_mixed_wrapper_selection_available() {
+    use crate::client::PendingRecoverySelection;
+    use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
+    use marmot_forensics::EpochBackfillExecutionSeam;
+    use storage_sqlite::{RecoveryCause, RecoveryLossCause};
+
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let account_id = client.adapter.account_id.clone();
+    let route = account_deliveries_read(&app.relay_plane.inner.transport.account_deliveries)
+        .get(&account_id)
+        .unwrap()
+        .clone();
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        assert!(matches!(
+            route
+                .sender
+                .route_delivery(queued_delivery(&account_id, 1), &route.overflow),
+            RouteAdmission::Accepted
+        ));
+    }
+    let RouteAdmission::Omitted {
+        signal_generation: Some(generation),
+        ..
+    } = route
+        .sender
+        .route_delivery(queued_delivery(&account_id, 2), &route.overflow)
+    else {
+        panic!("first omission reserves the control position");
+    };
+    let token = route.overflow.pending_snapshot().unwrap().marker_token;
+    assert_eq!(client.adapter.queued_overflow_marker_token(), Some(token));
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .record_account_recovery_loss("alice", RecoveryLossCause::Queue, token, 1, 1)
+        .unwrap();
+    storage.synchronize_account_delivery_loss("alice").unwrap();
+    let before_demand = storage.pending_recovery_demands().unwrap();
+    assert_eq!(before_demand.len(), 2);
+    assert!(
+        before_demand
+            .iter()
+            .any(|d| d.cause == RecoveryCause::QueueLoss)
+    );
+    assert!(
+        before_demand
+            .iter()
+            .any(|d| d.cause == RecoveryCause::IncrementalHistory)
+    );
+    assert!(matches!(
+        client
+            .select_pending_epoch_backfill(EpochBackfillExecutionSeam::Receive)
+            .unwrap(),
+        PendingRecoverySelection::Grant(_)
+    ));
+    assert_eq!(client.adapter.queued_overflow_marker_token(), Some(token));
+    assert_eq!(
+        generation,
+        route.overflow.pending_snapshot().unwrap().generation
+    );
+}
+
+#[tokio::test]
+async fn real_adapter_queue_loss_defers_with_parked_bootstrap_debt() {
+    use crate::client::PendingRecoverySelection;
+    use crate::tests::client_on_app_relay_plane;
+    use marmot_forensics::EpochBackfillExecutionSeam;
+    use nostr_relay_builder::{LocalRelay, RelayBuilder};
+    use storage_sqlite::{RecoveryCause, RecoveryEligibility, RecoveryLossCause};
+
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        relay.url().await.to_string(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    client.create_group("local route", &[]).await.unwrap();
+    assert!(matches!(
+        client
+            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .unwrap(),
+        crate::EpochBackfillRunOutcome::Incomplete(_)
+    ));
+    let storage = app.account_storage("alice").unwrap();
+    let bootstrap = storage.pending_recovery_demands().unwrap();
+    assert_eq!(bootstrap.len(), 1);
+    assert_eq!(bootstrap[0].cause, RecoveryCause::IncrementalHistory);
+    assert_eq!(
+        bootstrap[0].eligibility,
+        RecoveryEligibility::NeedsDeepRepair
+    );
+    assert!(!bootstrap[0].caller_waiting);
+    assert!(!storage.recovery_comparison().unwrap().pending());
+    client.recovery_owner.test_advance_to_retry(&storage);
+
+    let account = client.adapter.account_id.clone();
+    let route = account_deliveries_read(&app.relay_plane.inner.transport.account_deliveries)
+        .get(&account)
+        .unwrap()
+        .clone();
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        assert!(matches!(
+            route
+                .sender
+                .route_delivery(queued_delivery(&account, 1), &route.overflow),
+            RouteAdmission::Accepted
+        ));
+    }
+    let RouteAdmission::Omitted {
+        signal_generation: Some(generation),
+        ..
+    } = route
+        .sender
+        .route_delivery(queued_delivery(&account, 2), &route.overflow)
+    else {
+        panic!("first omission reserves the exact control");
+    };
+    persist_queue_loss(
+        &route.sender,
+        &route.overflow,
+        route.recovery_marker.clone().unwrap(),
+        Some(generation),
+    );
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if route.overflow.marker_barrier_complete()
+                && !storage
+                    .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                    .unwrap()
+                    .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real marker writer persists the omission");
+    storage.synchronize_account_delivery_loss("alice").unwrap();
+    let demands = storage.pending_recovery_demands().unwrap();
+    assert_eq!(demands.len(), 2);
+    let loss = demands
+        .iter()
+        .find(|demand| demand.cause == RecoveryCause::QueueLoss)
+        .unwrap();
+    let marker_token = route.overflow.pending_snapshot().unwrap().marker_token;
+    assert_eq!(loss.marker_token, Some(marker_token));
+    assert_eq!(
+        client.adapter.queued_overflow_marker_token(),
+        Some(marker_token)
+    );
+    assert_eq!(
+        storage
+            .recovery_eligible_revision_fence(false)
+            .unwrap()
+            .obligations
+            .len(),
+        1
+    );
+    let retry = storage.recovery_retry_state().unwrap();
+    assert!(matches!(
+        client
+            .select_pending_epoch_backfill(EpochBackfillExecutionSeam::Receive)
+            .unwrap(),
+        PendingRecoverySelection::Deferred
+    ));
+    assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+    let retained = storage.pending_recovery_demands().unwrap();
+    assert_eq!(retained.len(), 2);
+    let retained_bootstrap = retained
+        .iter()
+        .find(|demand| demand.cause == RecoveryCause::IncrementalHistory)
+        .unwrap();
+    assert_eq!(retained_bootstrap.ticket.id, bootstrap[0].ticket.id);
+    assert_eq!(
+        retained_bootstrap.ticket.revision,
+        bootstrap[0].ticket.revision
+    );
+    assert_eq!(retained_bootstrap.eligibility, bootstrap[0].eligibility);
+    assert_eq!(
+        retained
+            .iter()
+            .find(|d| d.cause == RecoveryCause::QueueLoss)
+            .unwrap()
+            .ticket
+            .revision,
+        loss.ticket.revision
+    );
+
+    for _ in 0..ACCOUNT_DELIVERY_BUFFER {
+        assert!(matches!(
+            client.adapter.receive_account_delivery().await.unwrap(),
+            Some(AccountDeliveryReceive::Delivery(_))
+        ));
+    }
+    let AccountDeliveryReceive::Overflow(control) =
+        timeout(Duration::from_secs(5), client.receive_next_delivery())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("current control follows the admitted queue prefix");
+    };
+    assert!(control.consumed_current_control);
+    let (summary, incomplete) =
+        crate::runtime::account_worker::exercise_direct_overflow_receive_for_test(
+            &mut client,
+            &runtime,
+            control,
+        )
+        .await;
+    assert!(incomplete);
+    assert_eq!(summary, crate::SyncSummary::default());
+    assert!(
+        runtime
+            .shared_services()
+            .comparison_test_trace
+            .lock()
+            .unwrap()
+            .contains(&"selection_deferred")
+    );
+    assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+    let grant = client
+        .select_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
+        .unwrap();
+    let PendingRecoverySelection::Grant(grant) = grant else {
+        panic!("existing Maintenance seam claims the post-control QueueLoss");
+    };
+    assert_eq!(grant.plan().unwrap().len(), 1);
+    assert_eq!(grant.plan().unwrap()[0].cause, RecoveryCause::QueueLoss);
+    let final_bootstrap = storage
+        .pending_recovery_demands()
+        .unwrap()
+        .into_iter()
+        .find(|demand| demand.cause == RecoveryCause::IncrementalHistory)
+        .unwrap();
+    assert_eq!(
+        final_bootstrap.ticket.revision,
+        bootstrap[0].ticket.revision
+    );
+    assert_eq!(final_bootstrap.eligibility, bootstrap[0].eligibility);
+    drop(grant);
+    relay.shutdown();
+}
+
+#[tokio::test]
 async fn forwarder_recovery_drains_suffix_while_marker_writer_finishes() {
     let relay = Arc::new(RecordingRelayClient::default());
     let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -3855,6 +4213,8 @@ async fn forwarder_recovery_drains_suffix_while_marker_writer_finishes() {
         .await
         .unwrap()
         .unwrap();
+    let marker_token = route.overflow.pending_snapshot().unwrap().marker_token;
+    assert_eq!(adapter.queued_overflow_marker_token(), Some(marker_token));
     assert!(matches!(
         adapter.receive_account_delivery().await.unwrap(),
         Some(AccountDeliveryReceive::Delivery(_))
@@ -3874,6 +4234,7 @@ async fn forwarder_recovery_drains_suffix_while_marker_writer_finishes() {
         RelayNotificationConsumerExit::Lagged(1),
         Some(&account_id),
     );
+    assert_eq!(adapter.queued_overflow_marker_token(), None);
     release_tx.send(()).unwrap();
     drop(route);
     let mut seen = Vec::new();

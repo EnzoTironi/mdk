@@ -356,6 +356,8 @@ pub(crate) struct AccountDeliveryOverflow {
     pub(crate) notification_token: u64,
     pub(crate) queue_depth: usize,
     pub(crate) elapsed_ms: u64,
+    /// True only on the receive that consumed this generation's live control.
+    pub(crate) consumed_current_control: bool,
 }
 
 #[derive(Debug)]
@@ -649,10 +651,13 @@ impl AccountDeliveryOverflowState {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let consumed_current_control = state.generation == generation && state.signal_queued;
         if state.generation == generation {
             state.signal_queued = false;
         }
-        Self::snapshot(&state)
+        let mut observed = Self::snapshot(&state);
+        observed.consumed_current_control = consumed_current_control;
+        observed
     }
 
     fn start_recovery(&self, durable_marker_token: u64) -> AccountDeliveryOverflow {
@@ -775,6 +780,7 @@ impl AccountDeliveryOverflowState {
                 .started_at
                 .map(|started| started.elapsed().as_millis() as u64)
                 .unwrap_or_default(),
+            consumed_current_control: false,
         }
     }
 }
@@ -2806,7 +2812,24 @@ impl MarmotRelayPlaneAccountAdapter {
         Ok(event.map(|event| match event {
             AccountDeliveryEvent::Delivery(delivery) => AccountDeliveryReceive::Delivery(delivery),
             AccountDeliveryEvent::Overflow { generation } => {
-                AccountDeliveryReceive::Overflow(self.delivery_overflow.consume_signal(generation))
+                // Serialize current-queue ownership with adapter replacement.
+                // The old receiver still consumes its shared loss signal, but
+                // cannot authorize a one-shot scheduling defer for the new one.
+                let routes =
+                    account_deliveries_read(&self.relay_plane.inner.transport.account_deliveries);
+                let observed = if let Some(route) = routes
+                    .get(&self.account_id)
+                    .filter(|route| route.sender.identity() == self.delivery_queue_id)
+                {
+                    route
+                        .sender
+                        .consume_control(&self.delivery_overflow, generation)
+                } else {
+                    let mut observed = self.delivery_overflow.consume_signal(generation);
+                    observed.consumed_current_control = false;
+                    observed
+                };
+                AccountDeliveryReceive::Overflow(observed)
             }
         }))
     }
@@ -2838,6 +2861,36 @@ impl MarmotRelayPlaneAccountAdapter {
 
     pub(crate) fn pending_delivery_overflow(&self) -> Option<AccountDeliveryOverflow> {
         self.delivery_overflow.pending_snapshot()
+    }
+
+    /// Snapshot only an actual control in this adapter's current queue. The
+    /// caller releases every queue/registry lock before entering storage.
+    pub(crate) fn queued_overflow_marker_token(&self) -> Option<u64> {
+        account_deliveries_read(&self.relay_plane.inner.transport.account_deliveries)
+            .get(&self.account_id)
+            .filter(|route| route.sender.identity() == self.delivery_queue_id)
+            .and_then(|route| {
+                route
+                    .sender
+                    .queued_overflow_marker_token(&self.delivery_overflow)
+            })
+    }
+
+    pub(crate) fn consumed_control_still_current(
+        &self,
+        generation: u64,
+        marker_token: u64,
+    ) -> bool {
+        account_deliveries_read(&self.relay_plane.inner.transport.account_deliveries)
+            .get(&self.account_id)
+            .filter(|route| route.sender.identity() == self.delivery_queue_id)
+            .is_some_and(|route| {
+                route.sender.consumed_control_still_current(
+                    &self.delivery_overflow,
+                    generation,
+                    marker_token,
+                )
+            })
     }
 
     /// Begin (or resume after process restart) the unfloored replay required by

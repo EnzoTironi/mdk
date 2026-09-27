@@ -4556,6 +4556,14 @@ impl AppClient {
         &mut self,
         seam: EpochBackfillExecutionSeam,
     ) -> Result<PendingRecoverySelection, AppError> {
+        self.select_pending_epoch_backfill_with_control_skip(seam, None)
+    }
+
+    pub(crate) fn select_pending_epoch_backfill_with_control_skip(
+        &mut self,
+        seam: EpochBackfillExecutionSeam,
+        consumed_control: Option<(u64, u64)>,
+    ) -> Result<PendingRecoverySelection, AppError> {
         self.drop_terminal_epoch_backfill_intents();
         let storage = self.app.account_storage(&self.state.label)?;
         if storage.pending_recovery_demands()?.is_empty()
@@ -4567,7 +4575,13 @@ impl AppClient {
         }
         let mut explicit = ExplicitRecoveryPermit::default();
         let permit = (seam == EpochBackfillExecutionSeam::ExplicitCatchUp).then_some(&mut explicit);
-        let Some(grant) = self.authorize_account_recovery(permit, seam)? else {
+        let Some(grant) = self.authorize_account_recovery_for_with_control_skip(
+            permit,
+            seam,
+            None,
+            consumed_control,
+        )?
+        else {
             return Ok(PendingRecoverySelection::Deferred);
         };
         #[cfg(test)]
