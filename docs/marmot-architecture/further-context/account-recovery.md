@@ -80,9 +80,15 @@ NIP-77 comparison covers what remains.
 
 - The spill writer extends the already-approved off-worker loss writer. It writes spill rows
   and loss evidence only, never engine or receipt state. The hand-off from the router is a
-  bounded in-memory buffer, so the router never blocks.
+  bounded in-memory buffer (4 MiB and 4,096 deliveries), so the router never blocks.
+- A delivery the account has already seen, and whose receipt was not released for
+  redelivery, is discarded before it uses spill capacity. Replaying history the device
+  already holds therefore fills neither the spill nor the network.
+- A delivery that misses the hand-off or spill limits becomes queue loss, as today: the
+  cursor stays fenced until recovery settles that loss, and live input keeps flowing.
 - A spilled event counts as retained for cursor safety once its write is durable. The live
-  cursor never passes an event that is neither admitted nor durably spilled.
+  cursor never passes an event that is neither admitted, durably spilled, nor covered by
+  pending queue loss.
 - While spilled rows remain, the worker alternates them with live deliveries, and yields
   between them, so neither a busy live queue nor a large spill starves the other. Order is
   not guaranteed; the engine already handles reordered input (deferral and retained input).
@@ -128,8 +134,9 @@ Every cause runs the same job:
 The worker never awaits the network. There is one recovery job per account.
 
 Rules kept from the current design: complete coverage with a still-stuck engine means no
-replay; the blocked reason is recorded; escalation happens after three distinct
-observations.
+replay; the blocked reason is recorded; the existing one-shot wedge report still escalates
+after three distinct local observations and starts no acquisition. That report is separate
+from decision 1's budget, which parks an obligation after three passes without progress.
 
 NIP-77 cost scales with the difference, not the set size, so comparing the whole retained
 window is cheap once we are caught up.
@@ -196,7 +203,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 | Step | Contents | Status |
 | --- | --- | --- |
-| 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Nightly and #2060 done; docs and scorecard in review |
+| 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Nightly and #2060 done; docs in review; scorecard in progress |
 | 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | In review |
 | 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | Not started |
 
