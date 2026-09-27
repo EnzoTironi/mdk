@@ -14432,6 +14432,14 @@ fn source_epoch_retention_is_app_visible_and_returns_media_hashes_when_expired()
     })
     .unwrap();
     let media_hash = "ef".repeat(32);
+    let projection_probe = std::sync::Arc::new(crate::client::TestQueueDrainCostProbe::default());
+    projection_probe.start_direct_receive_timing();
+    let direct_id = projection_probe.direct_receive_claim().unwrap();
+    assert_eq!(
+        projection_probe.direct_app_projection_started(),
+        Some(direct_id)
+    );
+    let projection_scope = crate::TestAppProjectionScope::enter(&projection_probe, direct_id);
     app.record_account_app_event_at(
         "alice",
         &AppMessageProjection {
@@ -14457,6 +14465,17 @@ fn source_epoch_retention_is_app_visible_and_returns_media_hashes_when_expired()
         100,
     )
     .unwrap();
+    drop(projection_scope);
+    projection_probe.direct_app_projection_finished(direct_id, true);
+    projection_probe.direct_receive_ingested(direct_id, true);
+    let projection_timing = projection_probe.stop_direct_receive_timing();
+    assert_eq!(projection_timing.app_projection_call_inclusive.0, 1);
+    assert_eq!(
+        projection_timing.app_projection_stages.map(|stage| stage.0),
+        [1; 6]
+    );
+    assert_eq!(projection_timing.app_projection_stage_errors, [0; 6]);
+    assert_eq!(projection_timing.app_projection_closure_not_entered, 0);
     let stored = app.messages("alice").unwrap();
     assert_eq!(stored[0].recorded_at, 10);
     assert_eq!(stored[0].received_at, 100);

@@ -1100,12 +1100,55 @@ async fn run_app_runtime_account_worker(
                 .unwrap()
                 .as_ref()
                 .and_then(|(label, witness)| (label == &account_label).then(|| witness.clone()));
+            #[cfg(all(test, feature = "test-policy-overrides"))]
+            let mut startup_branch =
+                crate::client::TestComparisonActivityWitness::startup_branch_for_target(
+                    activity_witness.as_ref(),
+                    || {
+                        let plan = grant.as_ref().and_then(AttemptGrant::plan);
+                        crate::client::TestStartupBranchWitness {
+                            branch: "not_selected",
+                            eligibility: "not_evaluated",
+                            credit_available: credit.is_some(),
+                            attempt_serial: grant
+                                .as_ref()
+                                .map(|selected| selected.reservation.attempt_serial),
+                            plan_items: plan.map_or(0, |items| items.len()),
+                            non_incremental_items: plan.map_or(0, |items| {
+                                items
+                                    .iter()
+                                    .filter(|item| {
+                                        item.cause
+                                            != storage_sqlite::RecoveryCause::IncrementalHistory
+                                    })
+                                    .count()
+                            }),
+                        }
+                    },
+                );
             if let Some(selected) = grant.as_ref()
-                && client
-                    .comparison_offload_eligible(selected)
-                    .unwrap_or(false)
+                && {
+                    let eligibility = client.comparison_offload_eligible(selected);
+                    #[cfg(all(test, feature = "test-policy-overrides"))]
+                    {
+                        if let Some(branch) = startup_branch.as_mut() {
+                            branch.eligibility = match &eligibility {
+                                Ok(true) => "eligible",
+                                Ok(false) => "excluded",
+                                Err(_) => "error",
+                            };
+                        }
+                    }
+                    eligibility.unwrap_or(false)
+                }
                 && let Some(credit) = credit.take()
             {
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                if let (Some(witness), Some(branch)) = (&activity_witness, startup_branch.as_mut())
+                {
+                    branch.branch = "offload_activation";
+                    witness.record_startup_branch(branch.clone());
+                }
                 // An attempted activation has side effects even when it fails.
                 // Surface that first failure as the old inline startup did;
                 // falling through would issue a second subscription attempt
@@ -1120,12 +1163,18 @@ async fn run_app_runtime_account_worker(
                             SyncFailureStage::TransportActivation,
                         )
                     })?;
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                if let (Some(witness), Some(branch)) = (&activity_witness, startup_branch.as_mut())
+                {
+                    branch.branch = "offload_network_start";
+                    witness.record_startup_branch(branch.clone());
+                }
                 let network = ComparisonNetworkJob::start(
                     &client,
                     selected,
                     credit,
                     #[cfg(test)]
-                    activity_witness,
+                    activity_witness.clone(),
                 )
                 .map_err(|error| {
                     ClassifiedSyncFailure::at_stage(
@@ -1134,6 +1183,11 @@ async fn run_app_runtime_account_worker(
                         SyncFailureStage::Unknown,
                     )
                 })?;
+                #[cfg(all(test, feature = "test-policy-overrides"))]
+                if let (Some(witness), Some(mut branch)) = (&activity_witness, startup_branch) {
+                    branch.branch = "offload_network_created";
+                    witness.record_startup_branch(branch);
+                }
                 return Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Network {
                     grant: Box::new(grant.take().expect("selected startup grant")),
                     subscription_attempt,
@@ -1142,6 +1196,11 @@ async fn run_app_runtime_account_worker(
             }
             // A grant with no off-worker request keeps the same inline path,
             // but must not hold a speculative process credit across its wait.
+            #[cfg(all(test, feature = "test-policy-overrides"))]
+            if let (Some(witness), Some(mut branch)) = (&activity_witness, startup_branch) {
+                branch.branch = "inline";
+                witness.record_startup_branch(branch);
+            }
             drop(credit.take());
             let summary = client
                 .execute_prepared_sync(grant, Some(&startup_stage_telemetry), false)

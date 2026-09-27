@@ -145,31 +145,36 @@ impl TestQueueDrainCostProbe {
             unfinished,
             nested_runtime_unfinished_us,
             app_projection_unfinished_us,
+            app_projection_stage_unfinished_us,
             secure_prune_unfinished_us,
         ) = match timing.phase {
-            TestDirectReceivePhase::Idle => (None, None, None, None),
+            TestDirectReceivePhase::Idle => (None, None, None, [None; 6], None),
             TestDirectReceivePhase::Ingest {
                 since,
                 runtime_since,
                 app_projection_since,
+                app_projection_stage_since,
                 secure_prune_since,
                 ..
             } => (
                 Some(("claim_to_ingest", elapsed_us(since, now))),
                 runtime_since.map(|started| elapsed_us(started, now)),
                 app_projection_since.map(|started| elapsed_us(started, now)),
+                app_projection_stage_since.map(|started| started.map(|at| elapsed_us(at, now))),
                 secure_prune_since.map(|started| elapsed_us(started, now)),
             ),
             TestDirectReceivePhase::PostIngest { since, .. } => (
                 Some(("ingest_to_tail", elapsed_us(since, now))),
                 None,
                 None,
+                [None; 6],
                 None,
             ),
             TestDirectReceivePhase::Between { since } => (
                 Some(("between_claims", elapsed_us(since, now))),
                 None,
                 None,
+                [None; 6],
                 None,
             ),
         };
@@ -180,6 +185,11 @@ impl TestQueueDrainCostProbe {
             runtime_ingest_child: timing.runtime_ingest_child.snapshot(),
             app_projection_call_inclusive: timing.app_projection_call_inclusive.snapshot(),
             app_projection_error_exits: timing.app_projection_error_exits,
+            app_projection_stages: timing
+                .app_projection_stages
+                .map(TestDirectTimingStage::snapshot),
+            app_projection_stage_errors: timing.app_projection_stage_errors,
+            app_projection_closure_not_entered: timing.app_projection_closure_not_entered,
             secure_prune_call_inclusive: timing.secure_prune_call_inclusive.snapshot(),
             secure_prune_error_exits: timing.secure_prune_error_exits,
             handoff_excluded: timing.handoff_excluded,
@@ -190,6 +200,7 @@ impl TestQueueDrainCostProbe {
             unfinished,
             nested_runtime_unfinished_us,
             app_projection_unfinished_us,
+            app_projection_stage_unfinished_us,
             secure_prune_unfinished_us,
         };
         timing.phase = TestDirectReceivePhase::Idle;
@@ -220,6 +231,7 @@ impl TestQueueDrainCostProbe {
             since: now,
             runtime_since: None,
             app_projection_since: None,
+            app_projection_stage_since: [None; 6],
             secure_prune_since: None,
         };
         Some(id)
@@ -239,6 +251,7 @@ impl TestQueueDrainCostProbe {
             since,
             runtime_since,
             app_projection_since,
+            app_projection_stage_since,
             secure_prune_since,
         } = timing.phase
             && current == id
@@ -246,6 +259,7 @@ impl TestQueueDrainCostProbe {
             if success
                 && runtime_since.is_none()
                 && app_projection_since.is_none()
+                && app_projection_stage_since.iter().all(Option::is_none)
                 && secure_prune_since.is_none()
             {
                 timing.claim_to_ingest.record(since, now);
@@ -387,13 +401,79 @@ impl TestQueueDrainCostProbe {
         if let TestDirectReceivePhase::Ingest {
             id: current,
             app_projection_since,
+            app_projection_stage_since,
             ..
         } = &mut timing.phase
             && *current == id
             && let Some(since) = app_projection_since.take()
         {
+            let closure_not_entered = u64::from(
+                app_projection_stage_since[TestAppProjectionStage::TransactionEntry as usize]
+                    .is_some(),
+            );
+            *app_projection_stage_since = [None; 6];
+            timing.app_projection_closure_not_entered += closure_not_entered;
             timing.app_projection_call_inclusive.record(since, now);
             timing.app_projection_error_exits += u64::from(!success);
+        }
+    }
+
+    pub(crate) fn direct_app_projection_stage_started(
+        &self,
+        id: u64,
+        stage: TestAppProjectionStage,
+    ) {
+        self.direct_app_projection_stage_started_at(id, stage, Instant::now());
+    }
+
+    fn direct_app_projection_stage_started_at(
+        &self,
+        id: u64,
+        stage: TestAppProjectionStage,
+        now: Instant,
+    ) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if timing.enabled
+            && let TestDirectReceivePhase::Ingest {
+                id: current,
+                app_projection_since: Some(_),
+                app_projection_stage_since,
+                ..
+            } = &mut timing.phase
+            && *current == id
+        {
+            app_projection_stage_since[stage as usize] = Some(now);
+        }
+    }
+
+    pub(crate) fn direct_app_projection_stage_finished(
+        &self,
+        id: u64,
+        stage: TestAppProjectionStage,
+        success: bool,
+    ) {
+        self.direct_app_projection_stage_finished_at(id, stage, success, Instant::now());
+    }
+
+    fn direct_app_projection_stage_finished_at(
+        &self,
+        id: u64,
+        stage: TestAppProjectionStage,
+        success: bool,
+        now: Instant,
+    ) {
+        let mut timing = self.direct_receive.lock().unwrap();
+        if timing.enabled
+            && let TestDirectReceivePhase::Ingest {
+                id: current,
+                app_projection_stage_since,
+                ..
+            } = &mut timing.phase
+            && *current == id
+            && let Some(since) = app_projection_stage_since[stage as usize].take()
+        {
+            timing.app_projection_stages[stage as usize].record(since, now);
+            timing.app_projection_stage_errors[stage as usize] += u64::from(!success);
         }
     }
 
@@ -472,6 +552,17 @@ impl TestDirectTimingStage {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TestAppProjectionStage {
+    AccountStorageSetup,
+    TransactionEntry,
+    SourceTimeline,
+    ChatListRefresh,
+    PresentationHydration,
+    TransactionReturn,
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 enum TestDirectReceivePhase {
     #[default]
@@ -481,6 +572,7 @@ enum TestDirectReceivePhase {
         since: Instant,
         runtime_since: Option<Instant>,
         app_projection_since: Option<Instant>,
+        app_projection_stage_since: [Option<Instant>; 6],
         secure_prune_since: Option<Instant>,
     },
     PostIngest {
@@ -504,6 +596,9 @@ struct TestDirectReceiveTiming {
     runtime_ingest_child: TestDirectTimingStage,
     app_projection_call_inclusive: TestDirectTimingStage,
     app_projection_error_exits: u64,
+    app_projection_stages: [TestDirectTimingStage; 6],
+    app_projection_stage_errors: [u64; 6],
+    app_projection_closure_not_entered: u64,
     secure_prune_call_inclusive: TestDirectTimingStage,
     secure_prune_error_exits: u64,
     handoff_excluded: u64,
@@ -523,6 +618,9 @@ pub(crate) struct TestDirectReceiveTimingSnapshot {
     pub(crate) runtime_ingest_child: (u64, u64, u64),
     pub(crate) app_projection_call_inclusive: (u64, u64, u64),
     pub(crate) app_projection_error_exits: u64,
+    pub(crate) app_projection_stages: [(u64, u64, u64); 6],
+    pub(crate) app_projection_stage_errors: [u64; 6],
+    pub(crate) app_projection_closure_not_entered: u64,
     pub(crate) secure_prune_call_inclusive: (u64, u64, u64),
     pub(crate) secure_prune_error_exits: u64,
     pub(crate) handoff_excluded: u64,
@@ -533,6 +631,7 @@ pub(crate) struct TestDirectReceiveTimingSnapshot {
     pub(crate) unfinished: Option<(&'static str, u64)>,
     pub(crate) nested_runtime_unfinished_us: Option<u64>,
     pub(crate) app_projection_unfinished_us: Option<u64>,
+    pub(crate) app_projection_stage_unfinished_us: [Option<u64>; 6],
     pub(crate) secure_prune_unfinished_us: Option<u64>,
 }
 use super::audit::EpochBackfillTerminalAudit;
@@ -783,6 +882,8 @@ impl Drop for TestRecoveryPhaseGuard {
 mod comparison_job;
 #[cfg(test)]
 pub(crate) use comparison_job::TestComparisonActivityWitness;
+#[cfg(all(test, feature = "test-policy-overrides"))]
+pub(crate) use comparison_job::TestStartupBranchWitness;
 pub(crate) use comparison_job::{
     ComparisonNetworkJob, ComparisonNetworkResult, EpochGapQueueJob, RouteSubmission,
 };
@@ -6698,11 +6799,17 @@ impl AppClient {
         #[cfg(test)]
         let direct_projection_id =
             direct_probe.and_then(|probe| probe.direct_app_projection_started());
+        #[cfg(test)]
+        let projection_scope = direct_probe
+            .zip(direct_projection_id)
+            .map(|(probe, id)| crate::TestAppProjectionScope::enter(probe, id));
         let projection_result = self.app.record_account_app_event_at(
             &self.state.label,
             &message_projection,
             message.received_at,
         );
+        #[cfg(test)]
+        drop(projection_scope);
         #[cfg(test)]
         if let (Some(probe), Some(id)) = (direct_probe, direct_projection_id) {
             probe.direct_app_projection_finished(id, projection_result.is_ok());
@@ -7844,9 +7951,9 @@ mod tests {
     use super::DrainCounts;
     use super::{
         DrainVerdict, EpochBackfillReplayOutcome, RecoveryDrainState,
-        TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS, TestQueueDrainCostProbe,
-        TransportReconciliationWork, backfill_drain_verdict, epoch_backfill_terminal_rows,
-        incomplete_full_history_repair, order_reconciliation_pass,
+        TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS, TestAppProjectionStage,
+        TestQueueDrainCostProbe, TransportReconciliationWork, backfill_drain_verdict,
+        epoch_backfill_terminal_rows, incomplete_full_history_repair, order_reconciliation_pass,
         reconciliation_start_after_cursor, recovery_investigation_ended,
         transport_reconciliation_record,
     };
@@ -7953,6 +8060,17 @@ mod tests {
             probe.direct_app_projection_started_at(t + Duration::from_millis(1)),
             Some(failed)
         );
+        probe.direct_app_projection_stage_started_at(
+            failed,
+            TestAppProjectionStage::SourceTimeline,
+            t + Duration::from_millis(1),
+        );
+        probe.direct_app_projection_stage_finished_at(
+            failed,
+            TestAppProjectionStage::SourceTimeline,
+            false,
+            t + Duration::from_millis(2),
+        );
         probe.direct_app_projection_finished_at(failed, false, t + Duration::from_millis(3));
         probe.direct_receive_ingested_at(failed, false, t + Duration::from_millis(4));
         let interrupted = probe
@@ -7966,10 +8084,112 @@ mod tests {
         probe.direct_app_projection_finished_at(interrupted, true, t + Duration::from_millis(8));
         assert_eq!(frozen.app_projection_call_inclusive, (1, 2_000, 2_000));
         assert_eq!(frozen.app_projection_error_exits, 1);
+        assert_eq!(frozen.app_projection_stage_errors[2], 1);
         assert_eq!(frozen.app_projection_unfinished_us, Some(1_000));
         assert_eq!(frozen.unfinished, Some(("claim_to_ingest", 2_000)));
         assert_eq!(
             probe.stop_direct_receive_timing_at(t + Duration::from_millis(9)),
+            frozen
+        );
+    }
+
+    #[test]
+    fn direct_app_projection_boundaries_count_completed_calls_and_unentered_closure() {
+        let probe = TestQueueDrainCostProbe::default();
+        let t = Instant::now();
+        probe.start_direct_receive_timing();
+        let first = probe.direct_receive_claim_at(t).unwrap();
+        assert_eq!(
+            probe.direct_app_projection_started_at(t + Duration::from_millis(1)),
+            Some(first)
+        );
+        for (stage, start, end) in [
+            (TestAppProjectionStage::AccountStorageSetup, 2, 3),
+            (TestAppProjectionStage::TransactionEntry, 3, 4),
+            (TestAppProjectionStage::SourceTimeline, 4, 5),
+            (TestAppProjectionStage::ChatListRefresh, 5, 7),
+            (TestAppProjectionStage::PresentationHydration, 5, 6),
+            (TestAppProjectionStage::TransactionReturn, 7, 8),
+        ] {
+            probe.direct_app_projection_stage_started_at(
+                first,
+                stage,
+                t + Duration::from_millis(start),
+            );
+            probe.direct_app_projection_stage_finished_at(
+                first,
+                stage,
+                true,
+                t + Duration::from_millis(end),
+            );
+        }
+        probe.direct_app_projection_finished_at(first, true, t + Duration::from_millis(9));
+        probe.direct_receive_ingested_at(first, true, t + Duration::from_millis(10));
+        probe.direct_receive_tail_finished_at(first, t + Duration::from_millis(11));
+
+        let second = probe
+            .direct_receive_claim_at(t + Duration::from_millis(12))
+            .unwrap();
+        assert_eq!(
+            probe.direct_app_projection_started_at(t + Duration::from_millis(13)),
+            Some(second)
+        );
+        probe.direct_app_projection_stage_started_at(
+            second,
+            TestAppProjectionStage::AccountStorageSetup,
+            t + Duration::from_millis(14),
+        );
+        probe.direct_app_projection_stage_finished_at(
+            second,
+            TestAppProjectionStage::AccountStorageSetup,
+            true,
+            t + Duration::from_millis(15),
+        );
+        probe.direct_app_projection_stage_started_at(
+            second,
+            TestAppProjectionStage::TransactionEntry,
+            t + Duration::from_millis(15),
+        );
+        probe.direct_app_projection_finished_at(second, false, t + Duration::from_millis(17));
+        probe.direct_receive_ingested_at(second, false, t + Duration::from_millis(18));
+
+        let frozen = probe.stop_direct_receive_timing_at(t + Duration::from_millis(19));
+        assert_eq!(frozen.app_projection_stages[0], (2, 2_000, 1_000));
+        assert_eq!(frozen.app_projection_stages[1], (1, 1_000, 1_000));
+        assert_eq!(frozen.app_projection_stages[2], (1, 1_000, 1_000));
+        assert_eq!(frozen.app_projection_stages[3], (1, 2_000, 2_000));
+        assert_eq!(frozen.app_projection_stages[4], (1, 1_000, 1_000));
+        assert_eq!(frozen.app_projection_stages[5], (1, 1_000, 1_000));
+        assert_eq!(frozen.app_projection_error_exits, 1);
+        assert_eq!(frozen.app_projection_closure_not_entered, 1);
+        assert_eq!(frozen.app_projection_stage_unfinished_us, [None; 6]);
+    }
+
+    #[test]
+    fn direct_app_projection_stage_stop_freezes_and_rejects_late_completion() {
+        let probe = TestQueueDrainCostProbe::default();
+        let t = Instant::now();
+        probe.start_direct_receive_timing();
+        let id = probe.direct_receive_claim_at(t).unwrap();
+        probe.direct_app_projection_started_at(t + Duration::from_millis(1));
+        probe.direct_app_projection_stage_started_at(
+            id,
+            TestAppProjectionStage::SourceTimeline,
+            t + Duration::from_millis(2),
+        );
+        let frozen = probe.stop_direct_receive_timing_at(t + Duration::from_millis(4));
+        probe.direct_app_projection_stage_finished_at(
+            id,
+            TestAppProjectionStage::SourceTimeline,
+            true,
+            t + Duration::from_millis(5),
+        );
+        probe.direct_app_projection_finished_at(id, true, t + Duration::from_millis(6));
+        assert_eq!(frozen.app_projection_stage_unfinished_us[2], Some(2_000));
+        assert_eq!(frozen.app_projection_stages[2], (0, 0, 0));
+        assert_eq!(frozen.app_projection_unfinished_us, Some(3_000));
+        assert_eq!(
+            probe.stop_direct_receive_timing_at(t + Duration::from_millis(7)),
             frozen
         );
     }

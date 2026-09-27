@@ -1117,6 +1117,13 @@ async fn run_automatic_queue_loss_fixture(stimulate_receive: bool) {
         direct_timing.secure_prune_unfinished_us,
     );
     eprintln!(
+        "loss_app_projection_boundaries: order=[account_storage_setup, transaction_call_entry_to_closure_entry, source_timeline_call, chat_list_refresh_call_inclusive, presentation_hydration_nested_in_refresh, closure_exit_to_transaction_return], completed_count_total_us_max_us={:?}, result_error_exits={:?}, closure_not_entered={}, unfinished_at_frozen_stop_us={:?}; transaction entry includes owner wait/begin, return includes commit/rollback, callbacks and owner release; neither is SQL-only, fsync-only, or an additive partition",
+        direct_timing.app_projection_stages,
+        direct_timing.app_projection_stage_errors,
+        direct_timing.app_projection_closure_not_entered,
+        direct_timing.app_projection_stage_unfinished_us,
+    );
+    eprintln!(
         "loss_live_path: correlation={live_correlation}, bounded_group_hint_candidates={live_group_candidates}, dropped_group_hint_observations={live_group_observations_dropped}, exact_event_stage_aggregates={live_exact_path:?}; repeated event IDs retain per-stage counts and first timestamps, which do not link stages to the same copy; group-hint candidates are not exact-event evidence until correlated to the sender's local published source; absence after the timed probe is unknown, not proof of relay loss"
     );
     eprintln!(

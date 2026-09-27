@@ -486,6 +486,36 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         );
     }
     assert!(gate.active.load(Ordering::SeqCst) > 0);
+    let observed_jobs = activity.active_jobs.load(Ordering::SeqCst);
+    if observed_jobs != 1 {
+        let relay_active = gate.active.load(Ordering::SeqCst);
+        let (snapshot_jobs, snapshot_requests, snapshot_attempt, branch) =
+            activity.startup_failure_snapshot();
+        // This durable snapshot is deliberately taken only after a failed
+        // witness check; it is not atomic with the frozen in-memory witness.
+        let retry_attempt = reopened_app
+            .account_storage(&alice.label)
+            .and_then(|storage| storage.recovery_retry_state().map_err(AppError::from))
+            .map(|state| state.attempt_serial);
+        let retry_value = retry_attempt.as_ref().ok().copied();
+        let retry_error = retry_attempt.err().map(|error| error.privacy_safe_kind());
+        panic!(
+            "startup held relay request without one comparison task: relay_active={} observed_failed_jobs={} snapshot_jobs={} snapshot_requests={} snapshot_attempt={} branch={:?} eligibility={:?} credit_available={:?} selected_attempt={:?} plan_items={:?} non_incremental_items={:?} retry_attempt_after_failure={:?} retry_snapshot_error_kind={:?}; retry snapshot is later and non-atomic",
+            relay_active,
+            observed_jobs,
+            snapshot_jobs,
+            snapshot_requests,
+            snapshot_attempt,
+            branch.as_ref().map(|record| record.branch),
+            branch.as_ref().map(|record| record.eligibility),
+            branch.as_ref().map(|record| record.credit_available),
+            branch.as_ref().and_then(|record| record.attempt_serial),
+            branch.as_ref().map(|record| record.plan_items),
+            branch.as_ref().map(|record| record.non_incremental_items),
+            retry_value,
+            retry_error,
+        );
+    }
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
     assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
     assert!(activity.attempt_serial.load(Ordering::SeqCst) > 0);

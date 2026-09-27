@@ -87,6 +87,59 @@ mod audit_log;
 pub mod audit_otlp_sender;
 mod chat_presentation;
 mod client;
+#[cfg(test)]
+thread_local! {
+    static TEST_APP_PROJECTION_SCOPE: std::cell::RefCell<Option<(Arc<client::TestQueueDrainCostProbe>, u64)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestAppProjectionScope(Option<(Arc<client::TestQueueDrainCostProbe>, u64)>);
+
+#[cfg(test)]
+impl TestAppProjectionScope {
+    pub(crate) fn enter(probe: &Arc<client::TestQueueDrainCostProbe>, id: u64) -> Self {
+        let previous =
+            TEST_APP_PROJECTION_SCOPE.with(|scope| scope.replace(Some((probe.clone(), id))));
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestAppProjectionScope {
+    fn drop(&mut self) {
+        TEST_APP_PROJECTION_SCOPE.with(|scope| {
+            scope.replace(self.0.take());
+        });
+    }
+}
+
+#[cfg(test)]
+fn test_app_projection_stage_started(stage: client::TestAppProjectionStage) {
+    TEST_APP_PROJECTION_SCOPE.with(|scope| {
+        if let Some((probe, id)) = scope.borrow().as_ref() {
+            probe.direct_app_projection_stage_started(*id, stage);
+        }
+    });
+}
+
+#[cfg(test)]
+fn test_app_projection_stage_finished(stage: client::TestAppProjectionStage, success: bool) {
+    TEST_APP_PROJECTION_SCOPE.with(|scope| {
+        if let Some((probe, id)) = scope.borrow().as_ref() {
+            probe.direct_app_projection_stage_finished(*id, stage, success);
+        }
+    });
+}
+
+#[cfg(test)]
+struct TestAppProjectionClosureExit;
+
+#[cfg(test)]
+impl Drop for TestAppProjectionClosureExit {
+    fn drop(&mut self) {
+        test_app_projection_stage_started(client::TestAppProjectionStage::TransactionReturn);
+    }
+}
 mod config;
 pub mod conversation_presentation;
 mod conversions;
@@ -2806,7 +2859,14 @@ impl MarmotApp {
                 message_ids_hex,
                 &classifier,
             )?;
+        #[cfg(test)]
+        test_app_projection_stage_started(client::TestAppProjectionStage::PresentationHydration);
         self.hydrate_chat_list_row(row.as_mut());
+        #[cfg(test)]
+        test_app_projection_stage_finished(
+            client::TestAppProjectionStage::PresentationHydration,
+            true,
+        );
         Ok((row, content_changed))
     }
 
@@ -5647,15 +5707,54 @@ impl MarmotApp {
     ) -> Result<AppProjectionUpdate, AppError> {
         // Keep source/retention and chat-list refresh atomic: a refresh failure
         // must leave the accepted fanout able to reconstruct its completion.
-        let storage = self.account_storage(label)?;
-        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-            let storage_update = storage.record_app_event_with_source(
+        #[cfg(test)]
+        test_app_projection_stage_started(client::TestAppProjectionStage::AccountStorageSetup);
+        let storage_result = self.account_storage(label);
+        #[cfg(test)]
+        test_app_projection_stage_finished(
+            client::TestAppProjectionStage::AccountStorageSetup,
+            storage_result.is_ok(),
+        );
+        let storage = storage_result?;
+        #[cfg(test)]
+        test_app_projection_stage_started(client::TestAppProjectionStage::TransactionEntry);
+        let result = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            #[cfg(test)]
+            test_app_projection_stage_finished(
+                client::TestAppProjectionStage::TransactionEntry,
+                true,
+            );
+            #[cfg(test)]
+            let _closure_exit = TestAppProjectionClosureExit;
+            #[cfg(test)]
+            test_app_projection_stage_started(client::TestAppProjectionStage::SourceTimeline);
+            let storage_result = storage.record_app_event_with_source(
                 &stored_app_event_from_projection(message, received_at),
                 message.retention,
                 message.authority,
-            )?;
-            self.app_projection_update(label, storage_update)
-        })
+            );
+            #[cfg(test)]
+            test_app_projection_stage_finished(
+                client::TestAppProjectionStage::SourceTimeline,
+                storage_result.is_ok(),
+            );
+            let storage_update = storage_result?;
+            #[cfg(test)]
+            test_app_projection_stage_started(client::TestAppProjectionStage::ChatListRefresh);
+            let update = self.app_projection_update(label, storage_update);
+            #[cfg(test)]
+            test_app_projection_stage_finished(
+                client::TestAppProjectionStage::ChatListRefresh,
+                update.is_ok(),
+            );
+            update
+        });
+        #[cfg(test)]
+        test_app_projection_stage_finished(
+            client::TestAppProjectionStage::TransactionReturn,
+            result.is_ok(),
+        );
+        result
     }
 
     /// Reconcile a local publication with its engine-stamped source authority.

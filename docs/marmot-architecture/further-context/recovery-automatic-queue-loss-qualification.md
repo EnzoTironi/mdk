@@ -395,8 +395,9 @@ invalidated explicitly.
 
 At head `05fa4924`, the stimulated Receive fixture and the nonstimulated
 Maintenance-required fixture each failed strict active acquisition on its
-first x86_64 attempt and configured retry: four failures total. All four had a healthy live delivery accepted,
-dequeued, ingested, and observed by Alice; both Receive wakes were ingested.
+first x86_64 attempt and configured retry: four failures total. All four had
+a healthy live delivery accepted, dequeued, ingested, and observed by Alice;
+both Receive wakes were ingested.
 The owner deferred 723–786 selections per run, selected no grant during the
 hold, and later made useful target/epoch/plaintext progress under a later
 grant while retaining pending debt. These four failures bring the record to
@@ -431,14 +432,36 @@ Its inclusive elapsed total was 0.282–0.302 seconds, about 0.65–0.70% of the
 matching 43.37–43.52-second completed claim-to-ingest parent total. This does
 not support a production no-expiry fast path as the dominant cost.
 
-The next test-only Alice measurement times the existing
-`record_account_app_event_at` call during direct received-message projection.
-Its inclusive elapsed time covers account/storage setup, atomic raw-event,
-timeline, and chat-list work, and hydration of the returned update; it is not
-SQL-only time, a commit count, or CPU time. It reports completed count/total/max,
-result error exits, and any call unfinished at the frozen stop. A completed
-child can belong to a parent later excluded or unfinished, so comparisons
-require matched counts and boundaries and these aggregates are not an additive
-partition. The probe does not claim to count panics. New-head x86_64 evidence
-for this call is pending. The PR remains draft without merge, device
-qualification, default activation, or release.
+At head `c908b323`, the stimulated Receive fixture failed strict active
+acquisition on both x86_64 attempts despite accepted/dequeued/ingested wakes,
+healthy live delivery, and later useful target/epoch/plaintext progress. The
+owner selected no grant during the hold and deferred 728 and 758 selections;
+debt remained pending. These two failures bring the QueueLoss record to 74
+failed x86_64 attempts across 19 heads. The Maintenance-required fixture
+passed its first attempt in 92.957 seconds; that positive result does not
+identify why the Receive acquisition failed. Separately, the startup-gap
+acceptance fixture failed its first attempt at the active-job assertion after
+15.544 seconds, then passed its retry in 17.711 seconds. The held relay
+handler is a different lifetime from the comparison task witness, so the
+startup failure's cause remains unresolved.
+
+The `c908b323` test-only Alice measurement timed the existing
+`record_account_app_event_at` call for 728 and 758 matched completed direct
+messages. Its inclusive elapsed totals were 16.815 and 16.849 seconds,
+about 39% of the respective 43.314-second and 43.394-second completed
+claim-to-ingest parents. The call covers account/storage setup, atomic
+raw-event, timeline, and chat-list work, and hydration of the returned
+update. This total alone does not isolate SQL, transaction commit, or CPU
+time. The next test-only
+split records account/storage setup, transaction-call entry to actual closure
+entry, source/timeline call, inclusive chat-list refresh with nested
+presentation hydration, and closure exit to transaction return. The entry
+envelope includes owner wait and begin; the return envelope includes
+commit/rollback, callbacks, and owner release, and must not be called pure
+commit or fsync. Each boundary reports completed count/total/max, result
+errors, and unfinished work at the frozen stop; closure-not-entered is counted
+separately. Completed children may belong to excluded or unfinished parents,
+so comparisons need matched counts and boundaries, not additive subtraction.
+The probe does not claim to count panics. Fresh x86_64 evidence for the split
+is pending. The PR remains draft without merge, device qualification,
+default activation, or release.

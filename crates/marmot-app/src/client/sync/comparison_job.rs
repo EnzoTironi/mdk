@@ -19,6 +19,8 @@ pub(crate) struct TestComparisonActivityWitness {
     pub(crate) attempt_serial: Arc<AtomicU64>,
     pub(crate) active_jobs: Arc<AtomicUsize>,
     pub(crate) active_requests: Arc<AtomicUsize>,
+    #[cfg(feature = "test-policy-overrides")]
+    pub(crate) startup_branch: Arc<Mutex<Option<TestStartupBranchWitness>>>,
     pub(crate) network_deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
     pub(crate) target_event_id: Arc<Mutex<Option<String>>>,
     #[cfg(feature = "test-policy-overrides")]
@@ -33,6 +35,45 @@ pub(crate) struct TestComparisonActivityWitness {
     pub(crate) matching_events: Arc<AtomicUsize>,
     pub(crate) matching_queued_deliveries: Arc<AtomicUsize>,
     pub(crate) panic_after_queue_submission: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+#[derive(Clone, Debug)]
+pub(crate) struct TestStartupBranchWitness {
+    pub(crate) branch: &'static str,
+    pub(crate) eligibility: &'static str,
+    pub(crate) credit_available: bool,
+    pub(crate) attempt_serial: Option<u64>,
+    pub(crate) plan_items: usize,
+    pub(crate) non_incremental_items: usize,
+}
+
+#[cfg(all(test, feature = "test-policy-overrides"))]
+impl TestComparisonActivityWitness {
+    pub(crate) fn startup_branch_for_target<F>(
+        target: Option<&Self>,
+        make: F,
+    ) -> Option<TestStartupBranchWitness>
+    where
+        F: FnOnce() -> TestStartupBranchWitness,
+    {
+        target.map(|_| make())
+    }
+
+    pub(crate) fn record_startup_branch(&self, branch: TestStartupBranchWitness) {
+        *self.startup_branch.lock().unwrap() = Some(branch);
+    }
+
+    pub(crate) fn startup_failure_snapshot(
+        &self,
+    ) -> (usize, usize, u64, Option<TestStartupBranchWitness>) {
+        (
+            self.active_jobs.load(Ordering::SeqCst),
+            self.active_requests.load(Ordering::SeqCst),
+            self.attempt_serial.load(Ordering::SeqCst),
+            self.startup_branch.lock().unwrap().clone(),
+        )
+    }
 }
 
 #[cfg(all(test, feature = "test-policy-overrides"))]
@@ -1100,6 +1141,63 @@ mod tests {
     use std::future::Future as _;
     use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
+
+    #[cfg(feature = "test-policy-overrides")]
+    #[test]
+    fn startup_branch_capture_is_target_gated_and_failure_snapshot_is_frozen() {
+        let constructed = std::cell::Cell::new(false);
+        let disabled = TestComparisonActivityWitness::startup_branch_for_target(None, || {
+            constructed.set(true);
+            unreachable!("disabled target must not inspect the plan")
+        });
+        assert!(disabled.is_none());
+        assert!(!constructed.get());
+
+        let witness = TestComparisonActivityWitness::default();
+        let mut branch =
+            TestComparisonActivityWitness::startup_branch_for_target(Some(&witness), || {
+                TestStartupBranchWitness {
+                    branch: "not_selected",
+                    eligibility: "excluded",
+                    credit_available: true,
+                    attempt_serial: Some(7),
+                    plan_items: 2,
+                    non_incremental_items: 1,
+                }
+            })
+            .unwrap();
+        branch.branch = "inline";
+        witness.record_startup_branch(branch);
+        witness.active_jobs.store(0, Ordering::SeqCst);
+        witness.active_requests.store(1, Ordering::SeqCst);
+        witness.attempt_serial.store(7, Ordering::SeqCst);
+        let (jobs, requests, attempt, frozen_branch) = witness.startup_failure_snapshot();
+
+        witness.active_jobs.store(1, Ordering::SeqCst);
+        witness.record_startup_branch(TestStartupBranchWitness {
+            branch: "offload_network_created",
+            eligibility: "eligible",
+            credit_available: false,
+            attempt_serial: Some(8),
+            plan_items: 1,
+            non_incremental_items: 0,
+        });
+        let later_sql: Result<u64, ()> = Err(());
+        assert!(later_sql.is_err());
+        assert_eq!((jobs, requests, attempt), (0, 1, 7));
+        let frozen_branch = frozen_branch.unwrap();
+        assert_eq!(frozen_branch.branch, "inline");
+        assert_eq!(frozen_branch.eligibility, "excluded");
+        assert!(frozen_branch.credit_available);
+        assert_eq!(frozen_branch.attempt_serial, Some(7));
+        assert_eq!(
+            (
+                frozen_branch.plan_items,
+                frozen_branch.non_incremental_items
+            ),
+            (2, 1)
+        );
+    }
 
     fn candidate_for_route(route: [u8; 32]) -> transport_nostr_adapter::NostrRelayEvent {
         let signed = EventBuilder::new(Kind::MlsGroupMessage, "queue boundary")
