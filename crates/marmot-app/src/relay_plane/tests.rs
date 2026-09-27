@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{
-    GroupId, MessageId, TransportDeliveryPlane, TransportEndpoint, TransportEndpointFailure,
-    TransportEndpointReceipt, TransportGroupSubscription,
+    GroupId, MessageId, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
+    TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSubscription,
 };
 use tokio::sync::Notify;
 use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
@@ -2256,6 +2256,63 @@ async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
     .await
     .expect("the replacement hears the earlier writer");
     assert!(matches!(woke, AccountDeliveryWait::SpillReady));
+}
+
+#[tokio::test]
+async fn spill_hand_off_bounds_deliveries_with_empty_payloads() {
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        while !gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(vec![
+            storage_sqlite::DeliverySpillDisposition::Stored;
+            deliveries.len()
+        ])
+    });
+    let spill = delivery_spill::AccountDeliverySpill::new(
+        store,
+        MemberId::new(vec![0xA1; 32]),
+        std::sync::Weak::new(),
+        Arc::new(AccountDeliveryOverflowState::default()),
+    );
+    let empty = |index: u32| TransportDelivery {
+        account_id: MemberId::new(vec![0xA1; 32]),
+        group_id_hint: None,
+        message: TransportMessage {
+            id: MessageId::new(index.to_be_bytes().to_vec()),
+            payload: Vec::new(),
+            timestamp: Timestamp(1),
+            causal_deps: Vec::new(),
+            source: TransportSource(NOSTR_SOURCE.to_owned()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![0xD3; 32],
+            },
+        },
+        received_at: Timestamp(1),
+        source: TransportDeliverySource {
+            transport: TransportSource(NOSTR_SOURCE.to_owned()),
+            plane: TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    };
+    // The writer takes its first batch and blocks; the hand-off then fills.
+    let mut accepted = 0_u32;
+    while spill.offer(empty(accepted)) {
+        accepted += 1;
+        assert!(
+            accepted < 10_000,
+            "the hand-off must refuse at a finite count"
+        );
+    }
+    assert!(
+        accepted <= 4_096 + 128,
+        "accepted {accepted} empty deliveries"
+    );
+    release.store(true, Ordering::SeqCst);
 }
 
 #[tokio::test]

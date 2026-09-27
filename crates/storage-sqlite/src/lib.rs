@@ -31,7 +31,7 @@ mod connection;
 mod delivery_spill;
 pub use delivery_spill::{
     DeliverySpillDisposition, DeliverySpillLimits, SpilledDelivery, SpilledDeliveryBatch,
-    SpilledDeliveryRetry,
+    SpilledDeliveryDeferral,
 };
 mod encrypted_media_secrets;
 mod local_submissions;

@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 
 use cgka_traits::TransportDelivery;
-use storage_sqlite::{SpilledDelivery, SpilledDeliveryRetry};
+use storage_sqlite::SpilledDelivery;
 
 use super::AppClient;
 use crate::AppError;
@@ -17,8 +17,11 @@ use crate::relay_plane::AccountDeliveryReceive;
 use crate::unix_now_seconds;
 
 const SPILL_READ_BATCH: usize = 32;
-/// About three hours of doubling retries before an unadmittable row goes.
+/// About three hours of doubling retries. A row still unadmitted after that
+/// is removed and recorded as queue loss, so recovery keeps an obligation.
 const SPILL_MAX_ATTEMPTS: u32 = 8;
+/// Retry delay after a storage failure while settling a row.
+const SPILL_SETTLE_RETRY_SECS: u64 = 60;
 
 pub(crate) struct DeliverySpillReader {
     buffered: VecDeque<SpilledDelivery>,
@@ -81,24 +84,15 @@ impl AppClient {
         if self.delivery_spill.buffered.is_empty() && self.delivery_spill.maybe_rows {
             let storage = self.app.account_storage(&self.state.label)?;
             let batch = storage.spilled_account_deliveries(SPILL_READ_BATCH, unix_now_seconds())?;
-            if batch.discarded > 0 {
-                // Undecodable rows are gone and their content is unknown.
-                // Record them as queue loss so recovery keeps an obligation.
-                let token = rand::RngCore::next_u64(&mut rand::rngs::OsRng) & i64::MAX as u64;
-                storage.record_account_recovery_loss(
-                    &self.state.label,
-                    storage_sqlite::RecoveryLossCause::Queue,
-                    token,
-                    batch.discarded,
-                    unix_now_seconds(),
-                )?;
-                storage.synchronize_account_delivery_loss(&self.state.label)?;
+            if !batch.undecodable.is_empty() {
+                // Their content is unknown, so they become queue loss.
+                self.discard_spilled_deliveries(&batch.undecodable)?;
                 tracing::warn!(
                     target: "marmot_app::client::delivery_spill",
                     method = "next_spilled_delivery",
                     error_kind = "undecodable_spill_rows",
-                    discarded = batch.discarded,
-                    "removed undecodable spilled deliveries and recorded them as queue loss",
+                    discarded = batch.undecodable.len(),
+                    "discarded undecodable spilled deliveries as queue loss",
                 );
             }
             self.delivery_spill.maybe_rows = batch.more;
@@ -117,8 +111,8 @@ impl AppClient {
     }
 
     /// Settle the row handed to ingest or dedup. It is removed once its event
-    /// is in the seen index; otherwise it stays for a later retry. A failed
-    /// removal leaves a duplicate that the next read deduplicates.
+    /// is in the seen index; otherwise it stays for a later retry, and after
+    /// its last retry it becomes queue loss. A failed settlement is retried.
     pub(super) fn settle_spilled_delivery(&mut self) {
         let Some((seq, event_id)) = self.delivery_spill.in_flight.take() else {
             return;
@@ -126,30 +120,31 @@ impl AppClient {
         let admitted = self
             .transport_receipts()
             .is_ok_and(|receipts| receipts.contains(&event_id));
-        let settled = self
-            .app
-            .account_storage(&self.state.label)
-            .and_then(|storage| {
-                if admitted {
-                    storage.remove_spilled_account_delivery(seq)?;
-                    return Ok(());
-                }
-                let now = unix_now_seconds();
-                match storage.defer_spilled_account_delivery(seq, now, SPILL_MAX_ATTEMPTS)? {
-                    SpilledDeliveryRetry::Deferred { not_before } => {
-                        let next = self.delivery_spill.next_retry_at.get_or_insert(not_before);
-                        *next = (*next).min(not_before);
-                    }
-                    SpilledDeliveryRetry::Abandoned => tracing::warn!(
-                        target: "marmot_app::client::delivery_spill",
-                        method = "settle_spilled_delivery",
-                        error_kind = "spill_row_abandoned",
-                        "spilled delivery was never admitted; removed after its last retry",
-                    ),
-                }
-                Ok(())
-            });
+        let now = unix_now_seconds();
+        let settled = (|| -> Result<(), AppError> {
+            let storage = self.app.account_storage(&self.state.label)?;
+            if admitted {
+                storage.remove_spilled_account_delivery(seq)?;
+                return Ok(());
+            }
+            let Some(deferral) = storage.defer_spilled_account_delivery(seq, now)? else {
+                return Ok(());
+            };
+            if deferral.attempts < SPILL_MAX_ATTEMPTS {
+                self.schedule_spill_retry(deferral.not_before);
+                return Ok(());
+            }
+            self.discard_spilled_deliveries(&[seq])?;
+            tracing::warn!(
+                target: "marmot_app::client::delivery_spill",
+                method = "settle_spilled_delivery",
+                error_kind = "spill_row_unadmitted",
+                "spilled delivery was never admitted; recorded as queue loss after its last retry",
+            );
+            Ok(())
+        })();
         if settled.is_err() {
+            self.schedule_spill_retry(now.saturating_add(SPILL_SETTLE_RETRY_SECS));
             tracing::warn!(
                 target: "marmot_app::client::delivery_spill",
                 method = "settle_spilled_delivery",
@@ -157,6 +152,33 @@ impl AppClient {
                 "spilled delivery row kept after ingest; it will be read again",
             );
         }
+    }
+
+    fn schedule_spill_retry(&mut self, at: u64) {
+        let next = self.delivery_spill.next_retry_at.get_or_insert(at);
+        *next = (*next).min(at);
+    }
+
+    /// Remove rows and record them as queue loss in one transaction.
+    fn discard_spilled_deliveries(&self, seqs: &[i64]) -> Result<(), AppError> {
+        use rand::RngCore;
+        let storage = self.app.account_storage(&self.state.label)?;
+        let token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
+        storage.discard_spilled_account_deliveries(
+            seqs,
+            &self.state.label,
+            token,
+            unix_now_seconds(),
+        )?;
+        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        Ok(())
+    }
+
+    /// How long a receive wait may block before a deferred row is due.
+    pub(super) fn spill_retry_wait(&self) -> Option<std::time::Duration> {
+        self.delivery_spill
+            .next_retry_at
+            .map(|at| std::time::Duration::from_secs(at.saturating_sub(unix_now_seconds())))
     }
 }
 
@@ -171,6 +193,7 @@ mod tests {
     };
     use marmot_account::AccountHome;
 
+    use super::SPILL_MAX_ATTEMPTS;
     use crate::relay_plane::{ACCOUNT_DELIVERY_SPILL_LIMITS, MarmotRelayPlane};
     use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
     use crate::{MarmotApp, unix_now_seconds};
@@ -237,6 +260,11 @@ mod tests {
             .deliveries;
         assert_eq!(kept.len(), 1, "an unadmitted row is kept");
 
+        assert!(
+            client.spill_retry_wait().is_some(),
+            "a receive wait wakes when the deferred row is due"
+        );
+
         // Once the event is seen, settling removes the row.
         client.delivery_spill.in_flight = Some((kept[0].seq, hex::encode([7_u8; 32])));
         client.remember_seen_event(hex::encode([7_u8; 32]));
@@ -247,6 +275,56 @@ mod tests {
                 .unwrap()
                 .deliveries
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unadmitted_row_becomes_queue_loss_after_its_last_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .spill_account_deliveries(
+                &[delivery(9)],
+                ACCOUNT_DELIVERY_SPILL_LIMITS,
+                unix_now_seconds(),
+            )
+            .unwrap();
+        let seq = storage
+            .spilled_account_deliveries(10, unix_now_seconds())
+            .unwrap()
+            .deliveries[0]
+            .seq;
+        let queue_loss = |storage: &storage_sqlite::SqliteAccountStorage| {
+            storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+        };
+        assert!(!queue_loss(&storage));
+
+        for attempt in 1..=SPILL_MAX_ATTEMPTS {
+            client.delivery_spill.in_flight = Some((seq, hex::encode([9_u8; 32])));
+            client.settle_spilled_delivery();
+            let kept = !storage
+                .spilled_account_deliveries(10, u64::MAX >> 2)
+                .unwrap()
+                .deliveries
+                .is_empty();
+            assert_eq!(kept, attempt < SPILL_MAX_ATTEMPTS, "attempt {attempt}");
+        }
+        assert!(
+            queue_loss(&storage),
+            "the discarded row leaves a recovery obligation"
         );
     }
 }

@@ -2135,7 +2135,20 @@ impl AppClient {
             }
             let received = match self.take_ready_delivery()? {
                 Some(received) => received,
-                None => match self.adapter.receive_account_delivery_or_spill().await {
+                None => match match self.spill_retry_wait() {
+                    // Wake for a deferred spilled row even when nothing else
+                    // arrives; a directly owned client has no other timer.
+                    Some(delay) => match tokio::time::timeout(
+                        delay,
+                        self.adapter.receive_account_delivery_or_spill(),
+                    )
+                    .await
+                    {
+                        Ok(woke) => woke,
+                        Err(_) => continue,
+                    },
+                    None => self.adapter.receive_account_delivery_or_spill().await,
+                } {
                     AccountDeliveryWait::Received(received) => received,
                     AccountDeliveryWait::SpillReady => {
                         self.note_spill_ready();

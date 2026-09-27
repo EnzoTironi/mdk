@@ -34,8 +34,12 @@ pub(crate) const ACCOUNT_DELIVERY_SPILL_LIMITS: DeliverySpillLimits = DeliverySp
     max_rows: 8_192,
     max_bytes: 16 * 1024 * 1024,
 };
-/// Payload bytes the router may hand off before the writer catches up.
+/// Bytes and deliveries the router may hand off before the writer catches
+/// up. Each delivery is charged its payload plus a fixed allowance for the ID,
+/// route and source metadata it retains, so empty payloads are still bounded.
 const SPILL_HANDOFF_MAX_BYTES: usize = 4 * 1024 * 1024;
+const SPILL_HANDOFF_MAX_DELIVERIES: usize = 4_096;
+const SPILL_DELIVERY_OVERHEAD_BYTES: usize = 512;
 const SPILL_WRITE_BATCH: usize = 128;
 /// Retryable store failures are retried for about two seconds before the
 /// batch falls back to loss; the cursor stays fenced meanwhile.
@@ -82,9 +86,11 @@ impl AccountDeliverySpill {
     /// writer settles it, an accepted delivery fences the account's transport
     /// cursor.
     pub(super) fn offer(self: &Arc<Self>, delivery: TransportDelivery) -> bool {
-        let size = delivery.message.payload.len();
+        let size = retained_size(&delivery);
         let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
-        if handoff.bytes.saturating_add(size) > SPILL_HANDOFF_MAX_BYTES {
+        if handoff.items.len() >= SPILL_HANDOFF_MAX_DELIVERIES
+            || handoff.bytes.saturating_add(size) > SPILL_HANDOFF_MAX_BYTES
+        {
             return false;
         }
         self.overflow.begin_spill();
@@ -107,7 +113,7 @@ impl AccountDeliverySpill {
                 }
                 let take = handoff.items.len().min(SPILL_WRITE_BATCH);
                 let batch: Vec<_> = handoff.items.drain(..take).collect();
-                let bytes: usize = batch.iter().map(|d| d.message.payload.len()).sum();
+                let bytes: usize = batch.iter().map(retained_size).sum();
                 handoff.bytes = handoff.bytes.saturating_sub(bytes);
                 batch
             };
@@ -170,6 +176,10 @@ impl AccountDeliverySpill {
             }
         }
     }
+}
+
+fn retained_size(delivery: &TransportDelivery) -> usize {
+    delivery.message.payload.len() + SPILL_DELIVERY_OVERHEAD_BYTES
 }
 
 fn count_of(dispositions: &[DeliverySpillDisposition], wanted: DeliverySpillDisposition) -> u64 {

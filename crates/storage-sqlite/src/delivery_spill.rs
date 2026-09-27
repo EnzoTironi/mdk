@@ -40,22 +40,19 @@ pub struct SpilledDelivery {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpilledDeliveryBatch {
     pub deliveries: Vec<SpilledDelivery>,
+    /// Rows whose metadata no longer decodes. Their content is unknown; the
+    /// caller discards them as delivery loss.
+    pub undecodable: Vec<i64>,
     /// The read filled its limit, so more due rows may remain.
     pub more: bool,
-    /// Rows removed because their metadata no longer decodes. Their content is
-    /// unknown, so the caller must record them as delivery loss.
-    pub discarded: u64,
     /// Earliest retry time of a deferred row that is not yet due.
     pub next_retry_at: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpilledDeliveryRetry {
-    Deferred {
-        not_before: u64,
-    },
-    /// The row reached its attempt limit and was removed.
-    Abandoned,
+pub struct SpilledDeliveryDeferral {
+    pub attempts: u32,
+    pub not_before: u64,
 }
 
 /// Artifact-local version of the `metadata` encoding.
@@ -168,7 +165,7 @@ impl SqliteAccountStorage {
     }
 
     /// Oldest due rows first. A row whose metadata no longer decodes is
-    /// removed, counted in `discarded`, and does not end the read early.
+    /// reported in `undecodable` and does not end the read early.
     pub fn spilled_account_deliveries(
         &self,
         limit: usize,
@@ -202,11 +199,7 @@ impl SqliteAccountStorage {
                     delivery.message.payload = payload;
                     batch.deliveries.push(SpilledDelivery { seq, delivery });
                 }
-                Err(_) => {
-                    conn.execute_cached("DELETE FROM account_delivery_spill WHERE seq=?1", [seq])
-                        .storage()?;
-                    batch.discarded += 1;
-                }
+                Err(_) => batch.undecodable.push(seq),
             }
         }
         let next: Option<i64> = conn
@@ -228,14 +221,13 @@ impl SqliteAccountStorage {
     }
 
     /// Keep a spilled row whose ingest left no durable trace and retry it
-    /// after a doubling delay (one minute up to an hour). The row is removed
-    /// once it has been attempted `max_attempts` times.
+    /// after a doubling delay (one minute up to an hour). Returns None when
+    /// the row is already gone.
     pub fn defer_spilled_account_delivery(
         &self,
         seq: i64,
         now_secs: u64,
-        max_attempts: u32,
-    ) -> StorageResult<SpilledDeliveryRetry> {
+    ) -> StorageResult<Option<SpilledDeliveryDeferral>> {
         let conn = self.lock()?;
         let Some(attempts) = conn
             .query_row_cached(
@@ -247,16 +239,11 @@ impl SqliteAccountStorage {
             .optional()
             .storage()?
         else {
-            return Ok(SpilledDeliveryRetry::Abandoned);
+            return Ok(None);
         };
-        let attempts = i64_to_u64(attempts)?;
-        if attempts >= u64::from(max_attempts) {
-            conn.execute_cached("DELETE FROM account_delivery_spill WHERE seq=?1", [seq])
-                .storage()?;
-            return Ok(SpilledDeliveryRetry::Abandoned);
-        }
+        let attempts = u32::try_from(attempts).unwrap_or(u32::MAX);
         let delay = SPILL_RETRY_BASE_SECS
-            .saturating_mul(1_u64 << (attempts - 1).min(16))
+            .saturating_mul(1_u64 << attempts.saturating_sub(1).min(16))
             .min(SPILL_RETRY_CAP_SECS);
         let not_before = now_secs.saturating_add(delay);
         conn.execute_cached(
@@ -264,13 +251,55 @@ impl SqliteAccountStorage {
             params![seq, u64_to_i64(not_before)?],
         )
         .storage()?;
-        Ok(SpilledDeliveryRetry::Deferred { not_before })
+        Ok(Some(SpilledDeliveryDeferral {
+            attempts,
+            not_before,
+        }))
+    }
+
+    /// Remove rows the account cannot admit and record them as queue loss in
+    /// the same transaction, so recovery keeps an obligation for them.
+    pub fn discard_spilled_account_deliveries(
+        &self,
+        seqs: &[i64],
+        account_label: &str,
+        loss_token: u64,
+        now_secs: u64,
+    ) -> StorageResult<()> {
+        retry_on_busy(|| {
+            self.connection.with_transaction(|| {
+                let removed = {
+                    let conn = self.lock()?;
+                    let mut removed = 0_u64;
+                    for seq in seqs {
+                        removed += conn
+                            .execute_cached(
+                                "DELETE FROM account_delivery_spill WHERE seq=?1",
+                                [seq],
+                            )
+                            .storage()? as u64;
+                    }
+                    removed
+                };
+                if removed > 0 {
+                    self.record_account_recovery_loss(
+                        account_label,
+                        crate::RecoveryLossCause::Queue,
+                        loss_token,
+                        removed,
+                        now_secs,
+                    )?;
+                }
+                Ok(())
+            })
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RecoveryLossCause;
     use crate::storage::test_support::{gid, sample_group};
     use cgka_traits::storage::GroupStorage;
     use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
@@ -402,9 +431,22 @@ mod tests {
         );
     }
 
+    fn loss_evidence(store: &SqliteAccountStorage) -> Vec<(i64, i64)> {
+        store
+            .lock()
+            .unwrap()
+            .prepare("SELECT cause, dropped_count FROM account_delivery_loss_evidence")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
     #[test]
-    fn undecodable_rows_are_counted_and_do_not_end_the_read_early() {
+    fn undecodable_rows_are_reported_and_discarded_as_loss() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("alice").unwrap();
         store
             .spill_account_deliveries(&[delivery(1), delivery(2), delivery(3)], LIMITS, 9)
             .unwrap();
@@ -417,52 +459,85 @@ mod tests {
             )
             .unwrap();
         let first = store.spilled_account_deliveries(2, 9).unwrap();
-        assert_eq!(first.discarded, 1);
-        assert!(first.more, "a full read continues past the removed row");
+        assert_eq!(first.undecodable.len(), 1);
+        assert!(first.more, "a full read continues past the bad row");
         assert_eq!(first.deliveries.len(), 1);
         assert_eq!(first.deliveries[0].delivery, delivery(2));
-        let second = store.spilled_account_deliveries(2, 9).unwrap();
-        let rest: Vec<_> = second
+
+        store
+            .discard_spilled_account_deliveries(&first.undecodable, "alice", 77, 9)
+            .unwrap();
+        assert_eq!(
+            loss_evidence(&store),
+            vec![(RecoveryLossCause::Queue as i64, 1)]
+        );
+        let rest: Vec<_> = due(&store, 9)
             .deliveries
             .iter()
             .map(|row| row.delivery.clone())
             .collect();
         assert_eq!(rest, vec![delivery(2), delivery(3)]);
-        assert_eq!(second.discarded, 0);
     }
 
     #[test]
-    fn deferred_rows_wait_with_doubling_delay_and_are_abandoned_at_the_limit() {
+    fn deferred_rows_wait_with_doubling_delay_and_are_never_deleted_by_deferral() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("alice").unwrap();
         store
             .spill_account_deliveries(&[delivery(1)], LIMITS, 100)
             .unwrap();
         let seq = due(&store, 100).deliveries[0].seq;
 
         assert_eq!(
-            store.defer_spilled_account_delivery(seq, 100, 3).unwrap(),
-            SpilledDeliveryRetry::Deferred { not_before: 160 }
+            store.defer_spilled_account_delivery(seq, 100).unwrap(),
+            Some(SpilledDeliveryDeferral {
+                attempts: 1,
+                not_before: 160
+            })
         );
         let waiting = due(&store, 159);
         assert!(waiting.deliveries.is_empty());
         assert_eq!(waiting.next_retry_at, Some(160));
         assert_eq!(due(&store, 160).deliveries.len(), 1);
+        assert_eq!(
+            store.defer_spilled_account_delivery(seq, 160).unwrap(),
+            Some(SpilledDeliveryDeferral {
+                attempts: 2,
+                not_before: 280
+            })
+        );
+        for _ in 0..10 {
+            store.defer_spilled_account_delivery(seq, 1_000).unwrap();
+        }
+        let capped = due(&store, u64::MAX >> 2);
+        assert_eq!(capped.deliveries.len(), 1, "deferral never deletes a row");
+        assert_eq!(
+            store.defer_spilled_account_delivery(seq, 5_000).unwrap(),
+            Some(SpilledDeliveryDeferral {
+                attempts: 13,
+                not_before: 5_000 + 3_600
+            })
+        );
 
+        store
+            .discard_spilled_account_deliveries(&[seq], "alice", 5, 5_000)
+            .unwrap();
+        assert!(due(&store, u64::MAX >> 2).deliveries.is_empty());
         assert_eq!(
-            store.defer_spilled_account_delivery(seq, 160, 3).unwrap(),
-            SpilledDeliveryRetry::Deferred { not_before: 280 }
+            loss_evidence(&store),
+            vec![(RecoveryLossCause::Queue as i64, 1)]
         );
         assert_eq!(
-            store.defer_spilled_account_delivery(seq, 280, 3).unwrap(),
-            SpilledDeliveryRetry::Abandoned
+            store.defer_spilled_account_delivery(seq, 6_000).unwrap(),
+            None
         );
-        let gone = due(&store, u64::from(u32::MAX));
-        assert!(gone.deliveries.is_empty());
-        assert_eq!(gone.next_retry_at, None);
+        store
+            .discard_spilled_account_deliveries(&[seq], "alice", 6, 6_000)
+            .unwrap();
         assert_eq!(
-            store.defer_spilled_account_delivery(seq, 300, 3).unwrap(),
-            SpilledDeliveryRetry::Abandoned,
-            "deferring a removed row is a no-op"
+            loss_evidence(&store).len(),
+            1,
+            "discarding an absent row records no loss"
         );
     }
 }
