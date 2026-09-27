@@ -12524,6 +12524,10 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
         let cursor = crate::unix_now_seconds();
         client.state.last_transport_timestamp = Some(cursor);
         app.save_state(&client.state).unwrap();
+        assert!(
+            app.relay_plane
+                .disable_account_delivery_spill_for_test(client.adapter.account_id())
+        );
         const HISTORY: usize = crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + 16;
         for index in 0..HISTORY {
             let event = epoch_gap_probe(
@@ -12796,6 +12800,119 @@ fn reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment
 }
 
 #[test]
+fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
+    run_composed_app_runtime_test("delivery-overflow-spill", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = client.create_group("overflow spill", &[]).await.unwrap();
+        let nostr_group_id_hex = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection")
+            .nostr_routing
+            .nostr_group_id_hex;
+        let now = crate::unix_now_seconds();
+        let probe = |index: usize| {
+            epoch_gap_probe(
+                &nostr_group_id_hex,
+                now.saturating_sub(10_000 + index as u64),
+                &format!("spill-{index}"),
+            )
+        };
+
+        // A replay of history the account already holds overflows for free.
+        const KNOWN: usize = 8;
+        const NEW: usize = 24;
+        let known: Vec<_> = (0..KNOWN).map(|index| probe(100_000 + index)).collect();
+        for event in &known {
+            client.remember_seen_event(event.id.clone());
+        }
+        app.save_state(&client.state).unwrap();
+        let mut expected = Vec::new();
+        for index in 0..crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + NEW {
+            let event = probe(index);
+            expected.push(event.id.clone());
+            inject_epoch_gap_probe(&app, event).await;
+        }
+        for event in known {
+            inject_epoch_gap_probe(&app, event).await;
+        }
+        let health = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let health = app.relay_plane.relay_health().await;
+                if health.account_delivery_spilled + health.account_delivery_spill_already_seen
+                    >= (NEW + KNOWN) as u64
+                {
+                    break health;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the spill writer settles every overflowed delivery");
+        assert_eq!(health.account_delivery_spilled, NEW as u64);
+        assert_eq!(health.account_delivery_spill_already_seen, KNOWN as u64);
+        assert_eq!(health.account_delivery_dropped, 0);
+        assert!(!client.adapter.delivery_loss_blocks_cursor());
+        let storage = app.account_storage("alice").unwrap();
+        assert!(
+            storage
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage.spilled_account_deliveries(1_000).unwrap().len(),
+            NEW
+        );
+
+        // Keep only a few live deliveries, then reopen as a restarted process
+        // would. The in-memory queue is gone; the durable spill is not.
+        for _ in 0..4 {
+            let received = client.receive_next_delivery().await.unwrap();
+            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+                panic!("a spill never creates a loss generation");
+            };
+            client.ingest_received_delivery(*delivery).await.unwrap();
+        }
+        let spilled_before_reopen = storage.spilled_account_deliveries(1_000).unwrap().len();
+        drop(client);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        for _ in 0..spilled_before_reopen {
+            let received =
+                tokio::time::timeout(Duration::from_secs(5), client.receive_next_delivery())
+                    .await
+                    .expect("spilled rows are admitted after reopen")
+                    .unwrap();
+            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+                panic!("a spill never creates a loss generation");
+            };
+            client.ingest_received_delivery(*delivery).await.unwrap();
+        }
+        assert!(
+            storage
+                .spilled_account_deliveries(1_000)
+                .unwrap()
+                .is_empty()
+        );
+        // The queue kept the oldest injections; every later one was spilled.
+        let receipts = client.transport_receipts().unwrap();
+        for id in &expected[crate::relay_plane::ACCOUNT_DELIVERY_BUFFER..] {
+            assert!(receipts.contains(id), "a spilled delivery was admitted");
+        }
+        assert!(!client.delivery_overflow_recovery_pending);
+    });
+}
+
+#[test]
 fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
     run_composed_app_runtime_test("delivery-overflow-cursor-fence", || async {
         let dir = tempfile::tempdir().unwrap();
@@ -12851,12 +12968,14 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
                         }
                     })
             });
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
         assert!(
             app.relay_plane
-                .set_account_delivery_recovery_marker_for_test(
-                    &MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
-                    marker,
-                )
+                .set_account_delivery_recovery_marker_for_test(&account_id, marker)
+        );
+        assert!(
+            app.relay_plane
+                .disable_account_delivery_spill_for_test(&account_id)
         );
 
         // Model the dangerous lead-in: several newest events are processed by

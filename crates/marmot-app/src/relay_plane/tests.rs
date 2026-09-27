@@ -183,6 +183,7 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
             sender: delivery_tx,
             overflow: Arc::new(AccountDeliveryOverflowState::default()),
             recovery_marker: None,
+            spill: None,
         },
     );
 
@@ -2045,6 +2046,95 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
 }
 
 #[tokio::test]
+async fn full_account_queue_spills_before_it_omits() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let transport_group_id = vec![0xD3; 32];
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    // The durable spill keeps two deliveries and reports every later one full.
+    let kept = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spill = kept.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        let mut spill = spill.lock().unwrap();
+        Ok(deliveries
+            .into_iter()
+            .map(|delivery| {
+                if spill.len() < 2 {
+                    spill.push(delivery);
+                    storage_sqlite::DeliverySpillDisposition::Stored
+                } else {
+                    storage_sqlite::DeliverySpillDisposition::Full
+                }
+            })
+            .collect())
+    });
+    let adapter = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        None,
+        Some(store),
+    );
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: alice.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_699_999_900)),
+        })
+        .await
+        .unwrap();
+
+    for index in 0..ACCOUNT_DELIVERY_BUFFER + 3 {
+        let mut event = group_event(&format!("alice-{index}"), &transport_group_id);
+        event.created_at = 1_700_100_000_u64.saturating_sub(index as u64);
+        event.id = event.computed_id();
+        relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("alice-group".into()),
+                event,
+            })
+            .await
+            .unwrap();
+    }
+
+    let settled = timeout(Duration::from_secs(5), async {
+        loop {
+            let health = relay_plane.relay_health().await;
+            if health.account_delivery_spilled == 2 && health.account_delivery_dropped == 1 {
+                break health;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let health = match settled {
+        Ok(health) => health,
+        Err(_) => {
+            let health = relay_plane.relay_health().await;
+            panic!(
+                "spill did not settle: spilled={} dropped={} depth={} max_depth={}",
+                health.account_delivery_spilled,
+                health.account_delivery_dropped,
+                health.account_delivery_queue_depth,
+                health.account_delivery_max_queue_depth
+            );
+        }
+    };
+    assert_eq!(health.account_delivery_spill_already_seen, 0);
+    assert_eq!(kept.lock().unwrap().len(), 2);
+    assert!(
+        adapter.delivery_loss_blocks_cursor(),
+        "only the delivery the full spill could not keep becomes loss"
+    );
+}
+
+#[tokio::test]
 async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2070,6 +2160,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
         alice.clone(),
         relay.clone(),
         Some(recovery_marker),
+        None,
     );
     let bob_adapter = relay_plane.account_adapter(bob.clone(), relay.clone());
 
@@ -3310,8 +3401,12 @@ async fn loss_authority_persists_count_growth_after_the_first_queue_write() {
 async fn loss_authority_normal_close_does_not_invent_notification_loss() {
     let relay = Arc::new(RecordingRelayClient::default());
     let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
-    let adapter =
-        plane.account_adapter_with_recovery_marker(MemberId::new(vec![0xA2; 32]), relay, None);
+    let adapter = plane.account_adapter_with_recovery_marker(
+        MemberId::new(vec![0xA2; 32]),
+        relay,
+        None,
+        None,
+    );
     recover_relay_notification_forwarder(
         &plane.inner.transport,
         RelayNotificationConsumerExit::Closed,

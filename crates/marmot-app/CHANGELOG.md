@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- A full account delivery queue now spills deliveries into the account database instead of
+  dropping them. The worker admits spilled deliveries through the ordinary ingest path,
+  alternating them with live ones, and removes each row once ingest has seen it. Deliveries
+  the account had already seen are not stored. Only a delivery that would exceed the spill
+  limits (8,192 rows or 16 MiB per account) still becomes queue loss. `RelayPlaneHealth`
+  reports `account_delivery_spilled` and `account_delivery_spill_already_seen`. (#1947)
+
 ### Fixed
 
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing

@@ -202,6 +202,14 @@ When adding a map, task set, counter, or temp artifact to a long-lived process:
 No new long-lived runtime collection or database schema is introduced. These are
 local-access bounds, not convergence or recovery policy.
 
+### Account delivery spill (`marmot-app/src/relay_plane/delivery_spill.rs`, `storage-sqlite/src/delivery_spill.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Router-to-writer hand-off | At most 4 MiB of payload per account (`SPILL_HANDOFF_MAX_BYTES`); a delivery that does not fit is omitted into the existing loss generation | The one writer task per account drains it in batches of 128 and exits when it is empty |
+| `account_delivery_spill` rows | At most 8,192 rows and 16 MiB per account database (`ACCOUNT_DELIVERY_SPILL_LIMITS`); already-seen deliveries are not stored; a delivery over either limit is omitted into the existing loss generation | Each row is removed after live ingest has seen its delivery, or after dedup skips it. Undecodable rows are removed on read |
+| Worker read buffer | At most 32 spilled deliveries (`SPILL_READ_BATCH`) | Refilled only after the previous batch is consumed |
+
 ### Account recovery durable loss evidence (`storage-sqlite/src/account_recovery/`)
 
 | Structure | Bound | Reclamation |
