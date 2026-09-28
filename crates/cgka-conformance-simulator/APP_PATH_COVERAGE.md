@@ -73,10 +73,12 @@ history groups each, so bob is the only account that holds all of about 11,000 k
 live delivery.
 Every participant uses two endpoints of the relay process, and both serve one retained store, so each relay holds all
 history. One older profile commit in the `gap` group is hidden from both relays while bob retains the 40 later
-messages that need it. The commit is then restored, and bob cold-restarts while alice sends one message per second in
-a healthy group.
+messages that need it. The commit is then restored, while both relays keep withholding those 40 messages for the
+rest of the run, so recovery can only use bob's retained copies. Bob cold-restarts while alice sends one message per
+second in a healthy group.
 
-The hard assertions: the commit is applied, and the gap group's timeline is exact within 600 seconds. `scorecard.json`
+The hard assertions: within 600 seconds the commit is applied and the later messages decrypt, and every gap chat
+message is present exactly once (presence, not order). `scorecard.json`
 under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
 
 - status command (`group_recovery_status`) and send latency p50/p95/max;

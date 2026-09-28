@@ -591,15 +591,20 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         let ((bytes, events), (bytes_after, events_after)) = (totals(before), totals(after));
         json!({"bytes": bytes_after - bytes, "event_frames": events_after - events})
     });
+    // Both observations must land within the deadline; a read after it does
+    // not count.
+    let in_time = |at: Option<f64>| at.is_some_and(|at| at <= RECOVERY_DEADLINE.as_secs_f64());
+    let completed = in_time(applied) && in_time(decrypted);
     Ok(json!({
         "cold_reopen_ms": cold_reopen_ms,
         "measured_seconds": measured_seconds,
         "recovery": {
-            "completed": decrypted.is_some(),
+            "completed": completed,
             "commit_applied_seconds": applied,
             "later_messages_decrypted_seconds": decrypted,
             "deadline_seconds": RECOVERY_DEADLINE.as_secs(),
-            "gap_timeline_exact": observed == expected,
+            // Presence, not order: replay order need not match send order.
+            "gap_messages_each_once": observed == expected,
         },
         "final_state": final_state,
         "status_command_ms": latencies(&status),
@@ -815,15 +820,16 @@ pub(super) async fn run() {
         close_errors.is_empty(),
         "runtime close failed: {close_errors:?}"
     );
-    // The only hard assertions: the missing commit is applied and every later
-    // message decrypts exactly once. Performance targets are only recorded.
+    // The only hard assertions: within the deadline the missing commit is
+    // applied and the later messages decrypt, and every gap chat message is
+    // present exactly once. Performance targets are only recorded.
     assert_eq!(
         report["recovery"]["completed"], true,
         "gap not recovered in {RECOVERY_DEADLINE:?}"
     );
     assert_eq!(
-        report["recovery"]["gap_timeline_exact"], true,
-        "gap timeline differs"
+        report["recovery"]["gap_messages_each_once"], true,
+        "gap messages missing or duplicated"
     );
 }
 
