@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use cgka_conformance_simulator::app_runtime::RelayTrafficV1;
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, ScenarioMessageSelectorV2,
-    SubjectCreateGroup, SubjectError, SubjectUpdateGroupData,
+    SubjectCreateGroup, SubjectError, SubjectSendApplication, SubjectUpdateGroupData,
 };
 use cgka_traits::GroupId;
 use serde_json::{Value, json};
@@ -122,6 +122,38 @@ async fn send_once(
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 if chat_count(sender, group, payload).await > 0 {
                     return Ok(());
+                }
+            }
+            Err(error) => return Err(format!("sending {payload}: {error}").into()),
+        }
+    }
+    Err(format!("sending {payload}: transport_closed for 40 seconds").into())
+}
+
+/// Like [`send_once`], through a named scenario action in the active group.
+async fn send_action_once(
+    subject: &mut AppRuntimeHarness,
+    sender: &AppRuntimeProbe,
+    group: &GroupId,
+    payload: &str,
+    retries: &mut u64,
+) -> TestResult {
+    for _ in 0..20 {
+        let action = SubjectSendApplication {
+            action_id: payload,
+            sender: "alice",
+            payload,
+        };
+        match subject.send_application(action).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.message.ends_with("transport_closed") => {
+                *retries += 1;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if chat_count(sender, group, payload).await > 0 {
+                    return Err(format!(
+                        "sending {payload}: published without its action id after a refusal"
+                    )
+                    .into());
                 }
             }
             Err(error) => return Err(format!("sending {payload}: {error}").into()),
@@ -241,10 +273,11 @@ async fn setup(subject: &mut AppRuntimeHarness, clients: &[String]) -> TestResul
     subject.set_online("alice", false).await?;
     subject.set_relay_event_visibility("relay:shared", &selector, &[], false)?;
     subject.set_online("alice", true).await?;
+    // Named actions, so the relay can withhold them from the measured phase.
     let alice = subject.probe("alice")?;
     for index in 0..LATER_MESSAGES {
         let payload = format!("gap-later-{index:02}");
-        send_once(&alice, &gap, &payload, &mut send_retries).await?;
+        send_action_once(subject, &alice, &gap, &payload, &mut send_retries).await?;
     }
     let published = subject.relay_publication_ids().await?;
     let group_events = |range: std::ops::Range<usize>| {
@@ -276,8 +309,20 @@ async fn setup(subject: &mut AppRuntimeHarness, clients: &[String]) -> TestResul
     .await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
     subject.set_online("bob", false).await?;
+    // The relays keep withholding the later messages for the rest of the run,
+    // so the final timeline can only come from what bob retained.
+    for index in 0..LATER_MESSAGES {
+        let later = ScenarioMessageSelectorV2 {
+            action_id: Some(format!("gap-later-{index:02}")),
+            ..Default::default()
+        };
+        subject.set_relay_event_visibility("relay:shared", &later, &[], false)?;
+    }
     subject.set_relay_event_visibility("relay:shared", &selector, &[], true)?;
-    note(started, "gap commit restored; bob stopped");
+    note(
+        started,
+        "gap commit restored; later messages withheld; bob stopped",
+    );
     // Held history: every group event bob retained before the measured restart.
     let published = subject.relay_publication_ids().await?;
     let held = published
@@ -355,10 +400,11 @@ fn summarize(relay: &RelayTrafficV1, workload: &Workload) -> Value {
 fn percentiles(samples: impl IntoIterator<Item = f64>) -> Value {
     let mut sorted = samples.into_iter().collect::<Vec<_>>();
     sorted.sort_by(f64::total_cmp);
+    // Nearest rank: the smallest sample with at least p% of samples at or
+    // below it.
     let rank = |p: usize| {
-        sorted
-            .get(sorted.len().saturating_sub(1) * p / 100)
-            .copied()
+        let index = (sorted.len() * p).div_ceil(100).checked_sub(1)?;
+        sorted.get(index).copied()
     };
     json!({"n": sorted.len(), "p50": rank(50), "p95": rank(95), "max": sorted.last()})
 }
@@ -776,4 +822,24 @@ pub(super) async fn run() {
         report["recovery"]["gap_timeline_exact"], true,
         "gap timeline differs"
     );
+}
+
+#[test]
+fn percentiles_use_the_nearest_rank() {
+    let six = percentiles([10.0, 20.0, 30.0, 40.0, 50.0, 342.0]);
+    assert_eq!(six["p50"], json!(30.0));
+    assert_eq!(
+        six["p95"],
+        json!(342.0),
+        "p95 of six samples is the maximum"
+    );
+    let one = percentiles([7.0]);
+    assert_eq!(
+        (one["p50"].clone(), one["p95"].clone()),
+        (json!(7.0), json!(7.0))
+    );
+    let none = percentiles(std::iter::empty());
+    assert!(none["p50"].is_null() && none["p95"].is_null());
+    let hundred = percentiles((1..=100).map(f64::from));
+    assert_eq!(hundred["p95"], json!(95.0));
 }
