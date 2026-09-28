@@ -37,6 +37,8 @@ pub(crate) struct DeliverySpillReader {
     loss_recorded: bool,
     #[cfg(test)]
     pub(super) fail_next_read: bool,
+    #[cfg(test)]
+    pub(super) fail_next_discard: bool,
 }
 
 impl Default for DeliverySpillReader {
@@ -50,6 +52,8 @@ impl Default for DeliverySpillReader {
             loss_recorded: false,
             #[cfg(test)]
             fail_next_read: false,
+            #[cfg(test)]
+            fail_next_discard: false,
         }
     }
 }
@@ -119,38 +123,44 @@ impl AppClient {
             } else {
                 read
             };
-            let batch = match read {
-                Ok(batch) => batch,
+            match read {
+                Ok(batch) => self.absorb_spill_batch(batch),
                 Err(_) => {
                     self.delivery_spill.maybe_rows = false;
                     self.defer_spill_read("spill_read_failed");
-                    return Ok(None);
-                }
-            };
-            if !batch.undecodable.is_empty() {
-                // Their content is unknown, so they become queue loss. If that
-                // fails the rows stay and are read again later.
-                if self.discard_spilled_deliveries(&batch.undecodable).is_ok() {
-                    tracing::warn!(
-                        target: "marmot_app::client::delivery_spill",
-                        method = "next_spilled_delivery",
-                        error_kind = "undecodable_spill_rows",
-                        discarded = batch.undecodable.len(),
-                        "discarded undecodable spilled deliveries as queue loss",
-                    );
-                } else {
-                    self.defer_spill_read("undecodable_spill_discard_failed");
                 }
             }
-            self.delivery_spill.maybe_rows = batch.more;
-            self.delivery_spill.next_retry_at = batch.next_retry_at;
-            self.delivery_spill.buffered.extend(batch.deliveries);
         }
         Ok(self.delivery_spill.buffered.pop_front().map(|row| {
             let event_id = hex::encode(row.delivery.message.id.as_slice());
             self.delivery_spill.in_flight = Some((row.seq, event_id));
             row.delivery
         }))
+    }
+
+    /// Buffer one read. Undecodable rows become queue loss first. If that
+    /// fails, the whole batch stays durable and is read again after a paced
+    /// retry, so a quiet receive neither spins nor waits forever.
+    fn absorb_spill_batch(&mut self, batch: storage_sqlite::SpilledDeliveryBatch) {
+        if !batch.undecodable.is_empty() {
+            if self.discard_spilled_deliveries(&batch.undecodable).is_err() {
+                self.delivery_spill.maybe_rows = false;
+                self.defer_spill_read("undecodable_spill_discard_failed");
+                return;
+            }
+            tracing::warn!(
+                target: "marmot_app::client::delivery_spill",
+                method = "next_spilled_delivery",
+                error_kind = "undecodable_spill_rows",
+                discarded = batch.undecodable.len(),
+                "discarded undecodable spilled deliveries as queue loss",
+            );
+        }
+        self.delivery_spill.maybe_rows = batch.more;
+        if let Some(at) = batch.next_retry_at {
+            self.schedule_spill_retry(at);
+        }
+        self.delivery_spill.buffered.extend(batch.deliveries);
     }
 
     fn defer_spill_read(&mut self, error_kind: &'static str) {
@@ -223,6 +233,12 @@ impl AppClient {
     /// transaction, then fence the cursor until recovery settles that loss.
     fn discard_spilled_deliveries(&mut self, seqs: &[i64]) -> Result<(), AppError> {
         use rand::RngCore;
+        #[cfg(test)]
+        if std::mem::take(&mut self.delivery_spill.fail_next_discard) {
+            return Err(AppError::BlockingTask(
+                "injected spill discard failure".into(),
+            ));
+        }
         let storage = self.app.account_storage(&self.state.label)?;
         let token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
         storage.discard_spilled_account_deliveries(
@@ -423,6 +439,54 @@ mod tests {
         client.delivery_spill.next_retry_at = Some(0);
         assert!(client.delivery_spill.pending());
         assert_eq!(client.next_spilled_delivery().unwrap(), Some(delivery(4)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_undecodable_discard_keeps_a_paced_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap();
+        let now = unix_now_seconds();
+        storage
+            .spill_account_deliveries(&[delivery(6)], ACCOUNT_DELIVERY_SPILL_LIMITS, now)
+            .unwrap();
+        let seq = storage
+            .spilled_account_deliveries(10, now)
+            .unwrap()
+            .deliveries[0]
+            .seq;
+
+        // The only row is undecodable and recording its loss fails.
+        client.delivery_spill.fail_next_discard = true;
+        client.absorb_spill_batch(storage_sqlite::SpilledDeliveryBatch {
+            undecodable: vec![seq],
+            ..Default::default()
+        });
+        assert!(
+            !client.delivery_spill.pending(),
+            "a failed discard does not re-read on every turn"
+        );
+        assert!(
+            client.spill_retry_wait().is_some(),
+            "a quiet receive still wakes for the retry"
+        );
+        assert_eq!(
+            storage
+                .spilled_account_deliveries(10, now)
+                .unwrap()
+                .deliveries
+                .len(),
+            1,
+            "the row stays durable"
+        );
     }
 
     #[tokio::test]
