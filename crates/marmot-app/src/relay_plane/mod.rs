@@ -1009,25 +1009,26 @@ impl MarmotRelayPlane {
     /// reopened session registers a new signer, which the SDK refuses while
     /// the previous context is live. Keep the delivery route so the
     /// replacement adapter inherits unresolved loss evidence.
+    ///
+    /// This runs on the reopening worker and never outlives it. If the worker
+    /// is cancelled first, the reaper's `deactivate_account_context` retires
+    /// the same context before a replacement may register; detached work here
+    /// could instead remove that replacement's context.
     pub(crate) async fn retire_account_session_transport(&self, account_id: &MemberId) {
-        let transport = self.inner.transport.clone();
-        let account_id = account_id.clone();
-        // Finish retirement even if the reopening worker is cancelled.
-        let retirement = tokio::spawn(async move {
-            let forwarder = transport
-                .account_notification_forwarders
-                .lock()
-                .await
-                .remove(&account_id);
-            if let Some(mut forwarder) = forwarder {
-                forwarder.abort();
-                let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut forwarder).await;
-            }
-            if let Some(sdk) = &transport.sdk_relay_client {
-                let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, sdk.remove_account(&account_id)).await;
-            }
-        });
-        let _ = retirement.await;
+        let forwarder = self
+            .inner
+            .transport
+            .account_notification_forwarders
+            .lock()
+            .await
+            .remove(account_id);
+        if let Some(mut forwarder) = forwarder {
+            forwarder.abort();
+            let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut forwarder).await;
+        }
+        if let Some(sdk) = &self.inner.transport.sdk_relay_client {
+            let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, sdk.remove_account(account_id)).await;
+        }
     }
 
     /// Retire a stopped account worker's subscriptions and immutable SDK

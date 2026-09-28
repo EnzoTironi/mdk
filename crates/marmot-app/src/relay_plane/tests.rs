@@ -3316,3 +3316,46 @@ async fn sdk_account_worker_reopens_after_notification_loss() {
         .unwrap();
     runtime.shutdown().await;
 }
+
+/// A reopen cancelled mid-retirement leaves nothing running. The reaper
+/// retires the context, and a replacement registered afterwards keeps its
+/// SDK context.
+#[tokio::test]
+async fn cancelled_reopen_retirement_cannot_remove_a_replacement_context() {
+    use futures::FutureExt;
+    use nostr_sdk::prelude::Keys;
+
+    let plane = MarmotRelayPlane::from_sdk(None, true);
+    let sdk = plane.inner.transport.sdk_relay_client.clone().unwrap();
+    let keys = Keys::generate();
+    let alice = MemberId::new(keys.public_key().to_bytes().to_vec());
+    sdk.register_account(alice.clone(), Arc::new(keys.clone()))
+        .await
+        .unwrap();
+    plane
+        .inner
+        .transport
+        .account_notification_forwarders
+        .lock()
+        .await
+        .insert(alice.clone(), tokio::spawn(std::future::pending::<()>()));
+
+    // The reopening worker is cancelled after its first poll.
+    assert!(
+        plane
+            .retire_account_session_transport(&alice)
+            .now_or_never()
+            .is_none()
+    );
+    plane.deactivate_account_context(&alice).await.unwrap();
+    // The reopened session brings a new signer handle for the same identity.
+    sdk.register_account(alice.clone(), Arc::new(keys))
+        .await
+        .expect("the reaper retired the old context");
+    tokio::time::sleep(RELAY_PLANE_TASK_ABORT_WAIT * 2).await;
+    assert!(
+        sdk.notification_loss_for_account(&alice).await.is_ok(),
+        "no retirement outlives the cancelled worker"
+    );
+    sdk.shutdown_accounts().await;
+}
