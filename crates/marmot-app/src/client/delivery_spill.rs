@@ -33,6 +33,8 @@ pub(crate) struct DeliverySpillReader {
     live_turn: bool,
     /// Row whose delivery is with ingest, and that delivery's event ID.
     in_flight: Option<(i64, String)>,
+    /// Rows just became queue loss; the next receive starts its recovery.
+    loss_recorded: bool,
 }
 
 impl Default for DeliverySpillReader {
@@ -43,6 +45,7 @@ impl Default for DeliverySpillReader {
             next_retry_at: None,
             live_turn: false,
             in_flight: None,
+            loss_recorded: false,
         }
     }
 }
@@ -62,6 +65,17 @@ impl DeliverySpillReader {
             self.maybe_rows = true;
         }
         !self.buffered.is_empty() || self.maybe_rows
+    }
+
+    /// Whether spilled rows became queue loss since the last receive. Like a
+    /// router overflow, that loss must start recovery even on a directly
+    /// owned client with no worker to select it.
+    pub(super) fn take_recorded_loss(&mut self) -> bool {
+        std::mem::take(&mut self.loss_recorded)
+    }
+
+    pub(super) fn loss_recorded(&self) -> bool {
+        self.loss_recorded
     }
 }
 
@@ -179,6 +193,7 @@ impl AppClient {
         self.delivery_overflow_recovery_pending = true;
         self.delivery_overflow_recovery_marker_token
             .get_or_insert(token);
+        self.delivery_spill.loss_recorded = true;
         Ok(())
     }
 
@@ -381,16 +396,13 @@ mod tests {
             client.delivery_overflow_recovery_pending,
             "the cursor stays fenced until recovery settles the loss"
         );
+        // A directly owned client has no worker to select that loss. Its next
+        // receive must start recovery without further relay traffic.
+        let attempts = storage.recovery_retry_state().unwrap().attempt_serial;
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.next_event()).await;
         assert!(
-            matches!(
-                client
-                    .select_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::Receive
-                    )
-                    .unwrap(),
-                crate::client::PendingRecoverySelection::Grant(_)
-            ),
-            "the owner selects the loss for recovery"
+            storage.recovery_retry_state().unwrap().attempt_serial > attempts,
+            "next_event starts recovery for the new queue loss"
         );
     }
 }

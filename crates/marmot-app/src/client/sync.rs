@@ -2127,6 +2127,19 @@ impl AppClient {
     ) -> Result<crate::relay_plane::AccountDeliveryReceive, AppError> {
         use crate::relay_plane::AccountDeliveryWait;
         loop {
+            // Spilled rows that became queue loss are already durable and
+            // fence the cursor. Report them as an overflow, so every caller
+            // starts the same recovery it runs for a router omission.
+            if self.delivery_spill.take_recorded_loss() {
+                return Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(
+                    crate::relay_plane::AccountDeliveryOverflow {
+                        marker_token: self
+                            .delivery_overflow_recovery_marker_token
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                ));
+            }
             // A spilled backlog is always ready. Yield before taking a row, so
             // the worker's lower-priority arms still run between deliveries,
             // and cancellation here loses nothing.
@@ -2135,6 +2148,7 @@ impl AppClient {
             }
             let received = match self.take_ready_delivery()? {
                 Some(received) => received,
+                None if self.delivery_spill.loss_recorded() => continue,
                 None => match match self.spill_retry_wait() {
                     // Wake for a deferred spilled row even when nothing else
                     // arrives; a directly owned client has no other timer.
