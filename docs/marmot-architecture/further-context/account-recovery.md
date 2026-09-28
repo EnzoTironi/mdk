@@ -48,14 +48,22 @@ The simulator comes first; Jeff validates on a phone.
      minimum per loss generation over every delivery charged to it, written in the same
      durable update as the count. That covers the router's marker write and the
      transaction that deletes a spill row and records its loss. A later drop can carry an
-     earlier `created_at`, for example an inbox wrap tweaked by NIP-59. Neither the
-     checkpoint nor the live subscription floor is a bound: each subscription keeps the
-     `since` it was built with, which can be far older than the current checkpoint. A
-     charge with no known `created_at` clears the generation's bound in that same update,
-     so a goal is bounded only when every delivery charged to it contributed a timestamp.
-   - Loss with no known bound has an unbounded goal. That covers SDK notification lag, an
-     undecodable spill row, count-only rows written before step 2, and an epoch gap whose
-     commit time is unknown. So does a goal that reaches below the retained-inventory floor. None of these can be certified by
+     earlier `created_at`, for example an inbox wrap tweaked by NIP-59. The checkpoint is
+     not a bound: each subscription keeps the `since` it was built with, which can be far
+     older than the current checkpoint. A charge with no known `created_at` clears the
+     generation's bound in that same update, so a goal is bounded only when every delivery
+     charged to it contributed a timestamp.
+   - SDK notification lag loses notifications, not deliveries with known times. It charges
+     the lowest `since` among every REQ the account's SDK context issued, live or closed.
+     Routing is by content, so a closed REQ's buffered or in-flight notifications still
+     arrive, and nothing bounds when: a stalled consumer keeps them buffered, and a relay
+     with a deep outbound backlog keeps sending them. An unfloored REQ, such as post-join
+     maintenance, makes every later charge on that context unknown. A lag keeps the account route open
+     and forces no reconnect. The SDK client has already marked the lost events seen, so
+     only comparison and exact-ID acquisition recover them.
+   - Loss with no known bound has an unbounded goal. That covers SDK notification lag while
+     an unfloored REQ is in scope, an undecodable spill row, count-only rows written before
+     step 2, and an epoch gap whose commit time is unknown. So does a goal that reaches below the retained-inventory floor. None of these can be certified by
      comparison, although the comparison still fetches every difference inside the window.
      Such an obligation completes only on its own evidence, for example the missing epoch
      arriving, or it parks for explicit deep repair.
@@ -275,7 +283,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   kept as a running minimum with the count. A charge with no known `created_at`, such as an
   undecodable row, sets the generation's bound to unknown for good, so it cannot keep an
   earlier minimum. Count-only rows written before step 2 are unknown too, so their goals
-  stay unbounded.
+  stay unbounded. A notification-lag row charges its lag's REQ floor the same way, under a
+  fresh token per lag.
 - Existing pending QueueLoss, notification-loss, epoch-gap, incremental and explicit rows
   run on the new path as unknown-scope comparisons.
 - Tables that no code reads any more are dropped in a later migration, once their rows have
@@ -320,6 +329,15 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   certify the route. A set of at most 16,384 is complete, including a busy route that sits
   exactly on the cap, and can certify it. A per-relay truncation flag from the fork would
   replace this inference.
+- Notification-lag bounds (#2070). Two kinds of REQ still carry no `since`: post-join
+  maintenance, and a group's retained prior routes. Once either has been issued, every
+  later lag on that account's SDK context has unbounded loss and its goal parks, until the
+  context is replaced. A closed REQ's floor keeps counting for the context's life, so the
+  floor only falls: every lag compares from the lowest `since` the context ever issued.
+  The inbox's two-day NIP-59 widening sets that floor at least two days back on every
+  route; per-route floors would need per-scope storage. An EOSE lost in a lag is not
+  recovered, so the next activation re-subscribes instead of reusing the live one. Relays
+  that ignore `since` are not detected.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.

@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,8 +32,8 @@ use crate::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
     NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
-    NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome, NostrRelayClient,
-    NostrRelayEvent, NostrSubscription, NostrTransportAdapter,
+    NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
+    NostrRelayClient, NostrRelayEvent, NostrSubscription, NostrTransportAdapter,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -312,6 +312,93 @@ pub struct RelayRegistrationOutcome {
     pub accepted: bool,
 }
 
+/// The `since` floors of the REQs one account context issued, which bound the
+/// events a lag on its notification receiver can lose.
+///
+/// Deliveries are routed by message content, not by subscription id
+/// (`AdapterState::routes_for`), and the SDK does not verify subscription ids
+/// by default. So a REQ's notifications can still reach the account after it
+/// is closed or replaced: those already buffered in the SDK broadcast or the
+/// app's consumer queue, and frames the relay sent before it processed the
+/// CLOSE. Neither has a deadline. A stalled consumer keeps them buffered, and
+/// a relay with a deep outbound backlog keeps sending them for as long as the
+/// backlog takes to drain. So a closed REQ's floor bounds the receiver's loss
+/// for the rest of the context's life. Only the lowest closed floor matters.
+#[derive(Debug, Default)]
+struct SubscriptionFloors {
+    /// Filter `since` of each live REQ, in Unix seconds; `None` is unfloored.
+    live: HashMap<SubscriptionId, Option<u64>>,
+    /// The lowest floor among the REQs this context closed, replaced, or
+    /// abandoned.
+    retired: Option<NostrNotificationLossFloor>,
+}
+
+impl SubscriptionFloors {
+    /// Record a REQ before it goes out, returning the floor it replaces under
+    /// the same id. A replaced filter's frames can still arrive, so its floor
+    /// is retired rather than forgotten.
+    fn open(&mut self, id: &SubscriptionId, since: Option<u64>) -> Option<Option<u64>> {
+        let replaced = self.live.insert(id.clone(), since);
+        if let Some(previous) = replaced
+            && previous != since
+        {
+            self.retire(NostrNotificationLossFloor::from_since(previous));
+        }
+        replaced
+    }
+
+    /// A REQ that failed may still have reached a relay: retire its floor, and
+    /// restore the floor of the REQ it would have replaced.
+    fn abandon(&mut self, id: &SubscriptionId, replaced: Option<Option<u64>>) {
+        let since = match replaced {
+            Some(previous) => self.live.insert(id.clone(), previous),
+            None => self.live.remove(id),
+        };
+        if let Some(since) = since {
+            self.retire(NostrNotificationLossFloor::from_since(since));
+        }
+    }
+
+    /// The REQ's CLOSE went out.
+    fn close(&mut self, id: &SubscriptionId) {
+        if let Some(since) = self.live.remove(id) {
+            self.retire(NostrNotificationLossFloor::from_since(since));
+        }
+    }
+
+    /// Account-wide teardown: every REQ except those whose CLOSE failed. This
+    /// includes a REQ whose subscribe failed or was cancelled after it was
+    /// recorded, which the context never learned the relays accepted.
+    fn close_all_except(&mut self, still_live: &[SubscriptionId]) {
+        let closed = self
+            .live
+            .extract_if(|id, _| !still_live.contains(id))
+            .map(|(_, since)| NostrNotificationLossFloor::from_since(since))
+            .collect::<Vec<_>>();
+        for floor in closed {
+            self.retire(floor);
+        }
+    }
+
+    fn retire(&mut self, floor: NostrNotificationLossFloor) {
+        self.retired = Some(self.retired.map_or(floor, |kept| kept.lowest(floor)));
+    }
+
+    /// The lowest floor among live REQs and every REQ this context closed.
+    /// With neither, there is no REQ evidence at all. That reads as
+    /// unbounded, not as no loss: the lost notifications then came from a
+    /// REQ this record never saw.
+    fn loss_floor(&self) -> NostrNotificationLossFloor {
+        self.live
+            .values()
+            .copied()
+            .map(NostrNotificationLossFloor::from_since)
+            .chain(self.retired)
+            .reduce(NostrNotificationLossFloor::lowest)
+            .unwrap_or(NostrNotificationLossFloor::Unbounded)
+    }
+}
+
 /// `nostr-sdk` backed implementation of [`NostrRelayClient`].
 #[derive(Clone)]
 pub struct NostrSdkRelayClient {
@@ -322,6 +409,9 @@ pub struct NostrSdkRelayClient {
     notification_loss_tx: watch::Sender<Option<NostrNotificationLoss>>,
     require_account_context: bool,
     account_subscriptions: Arc<RwLock<HashMap<MemberId, Vec<SubscriptionId>>>>,
+    /// Floors of the REQs this client issued, read at a receiver lag. A
+    /// std lock, never held across an await.
+    subscription_floors: Arc<StdMutex<SubscriptionFloors>>,
     publish_relay_refs: Arc<Mutex<HashMap<RelayUrl, usize>>>,
     #[cfg(test)]
     publish_connect_attempts: Arc<Mutex<HashMap<RelayUrl, usize>>>,
@@ -434,6 +524,7 @@ impl NostrSdkRelayClient {
             notification_loss_tx: watch::channel(None).0,
             require_account_context: false,
             account_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            subscription_floors: Arc::default(),
             publish_relay_refs: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             publish_connect_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -602,6 +693,55 @@ impl NostrSdkRelayClient {
                 loss.receiver_generation = loss.receiver_generation.saturating_add(1);
             }
         });
+    }
+
+    /// Lower bound on the wire `created_at` of any event whose notification
+    /// this client's receiver loses if it lags now: the lowest `since` among
+    /// the REQs it issued, live or closed. It only falls over the context's
+    /// life, so reading it at the lag gives the tightest bound.
+    ///
+    /// Only an account context records floors. A shared or multi-account root
+    /// reports [`NostrNotificationLossFloor::Unbounded`]: its receiver's loss
+    /// cannot be attributed to one account's REQs.
+    pub fn notification_loss_floor(&self) -> NostrNotificationLossFloor {
+        self.account_subscription_floors()
+            .map_or(NostrNotificationLossFloor::Unbounded, |floors| {
+                floors.loss_floor()
+            })
+    }
+
+    /// [`Self::notification_loss_floor`] of the account context a
+    /// multi-account root holds for `account_id`, or of this client when it is
+    /// that account's context. Unbounded for an unknown account.
+    pub async fn notification_loss_floor_for_account(
+        &self,
+        account_id: &MemberId,
+    ) -> NostrNotificationLossFloor {
+        if self.require_account_context {
+            return self
+                .account_clients
+                .read()
+                .await
+                .get(account_id)
+                .map_or(NostrNotificationLossFloor::Unbounded, |account| {
+                    account.notification_loss_floor()
+                });
+        }
+        if self.account_id.as_ref() == Some(account_id) {
+            self.notification_loss_floor()
+        } else {
+            NostrNotificationLossFloor::Unbounded
+        }
+    }
+
+    /// The REQ floor record, which only an account context keeps.
+    fn account_subscription_floors(&self) -> Option<MutexGuard<'_, SubscriptionFloors>> {
+        self.account_id.as_ref()?;
+        Some(
+            self.subscription_floors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     /// Remove only one account's sockets and authentication context.
@@ -1260,6 +1400,91 @@ impl NostrSdkRelayClient {
                 })
             }
         }
+    }
+
+    /// Issue one planned REQ on this client and record where it registered.
+    async fn subscribe_planned(
+        &self,
+        plan: NostrSdkSubscriptionPlan,
+    ) -> Result<(), TransportAdapterError> {
+        tracing::debug!(
+            target: "transport_nostr_adapter::sdk_client",
+            method = "subscribe",
+            endpoint_count = plan.endpoints.len(),
+            "subscribing SDK relay plan"
+        );
+        for endpoint in &plan.endpoints {
+            self.add_subscription_relay(endpoint.clone()).await?;
+        }
+
+        // Let nostr-sdk own connection lifecycle for subscriptions. `connect()`
+        // starts background connection tasks for any newly added relays and those
+        // tasks keep retrying; the subscription below is queued/resubscribed as
+        // relays become available instead of blocking activation on a per-relay
+        // connection attempt.
+        self.client.connect().await;
+
+        let output = self
+            .client
+            .subscribe(ReqTarget::manual(
+                plan.endpoints
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| (endpoint, vec![plan.filter.clone()])),
+            ))
+            .with_id(plan.subscription_id.clone())
+            .await
+            .map_err(|_| TransportAdapterError::Subscription("subscribe failed".to_owned()))?;
+
+        if output.success.is_empty() {
+            return Err(TransportAdapterError::Subscription(format!(
+                "subscribe registered on 0 of {} relays",
+                plan.endpoints.len()
+            )));
+        }
+
+        if !output.failed.is_empty() {
+            tracing::warn!(
+                target: "transport_nostr_adapter::sdk_client",
+                method = "subscribe",
+                registered_count = output.success.len(),
+                failed_count = output.failed.len(),
+                "SDK relay subscription partially registered"
+            );
+        }
+
+        tracing::debug!(
+            target: "transport_nostr_adapter::sdk_client",
+            method = "subscribe",
+            endpoint_count = plan.endpoints.len(),
+            registered_count = output.success.len(),
+            "SDK relay subscription registered"
+        );
+
+        // Record which of the requested endpoints acknowledged the registration
+        // so the app can surface it in the `subscription_rebuild` audit row.
+        // Only reached on the success path (>=1 relay registered): a total
+        // failure returned above, aborting activation before any audit row.
+        let outcomes = plan
+            .endpoints
+            .iter()
+            .map(|endpoint| (endpoint.clone(), output.success.contains_key(endpoint)));
+        merge_registration_log(
+            self.registration_log
+                .lock()
+                .await
+                .entry(plan.account_id.clone())
+                .or_default(),
+            outcomes,
+        );
+
+        self.account_subscriptions
+            .write()
+            .await
+            .entry(plan.account_id)
+            .or_default()
+            .push_unique(plan.subscription_id);
+        Ok(())
     }
 
     async fn event_for_publish(
@@ -2146,84 +2371,22 @@ impl NostrRelayClient for NostrSdkRelayClient {
         }
         let mut plan = Self::plan_subscription(&subscription)?;
         plan.subscription_id = SubscriptionId::new(subscription_id);
-        tracing::debug!(
-            target: "transport_nostr_adapter::sdk_client",
-            method = "subscribe",
-            endpoint_count = plan.endpoints.len(),
-            "subscribing SDK relay plan"
-        );
-        for endpoint in &plan.endpoints {
-            self.add_subscription_relay(endpoint.clone()).await?;
+        // Record the floor before any relay can answer, as the adapter records
+        // routes before the REQ: a lag can lose the very first reply.
+        let id = plan.subscription_id.clone();
+        let since = plan.filter.since.map(|since| since.as_secs());
+        let replaced = self
+            .account_subscription_floors()
+            .map(|mut floors| floors.open(&id, since));
+        let result = self.subscribe_planned(plan).await;
+        if result.is_err()
+            && let Some(replaced) = replaced
+            && let Some(mut floors) = self.account_subscription_floors()
+        {
+            // The REQ may have reached a relay before the failure.
+            floors.abandon(&id, replaced);
         }
-
-        // Let nostr-sdk own connection lifecycle for subscriptions. `connect()`
-        // starts background connection tasks for any newly added relays and those
-        // tasks keep retrying; the subscription below is queued/resubscribed as
-        // relays become available instead of blocking activation on a per-relay
-        // connection attempt.
-        self.client.connect().await;
-
-        let output = self
-            .client
-            .subscribe(ReqTarget::manual(
-                plan.endpoints
-                    .iter()
-                    .cloned()
-                    .map(|endpoint| (endpoint, vec![plan.filter.clone()])),
-            ))
-            .with_id(plan.subscription_id.clone())
-            .await
-            .map_err(|_| TransportAdapterError::Subscription("subscribe failed".to_owned()))?;
-
-        if output.success.is_empty() {
-            return Err(TransportAdapterError::Subscription(format!(
-                "subscribe registered on 0 of {} relays",
-                plan.endpoints.len()
-            )));
-        }
-
-        if !output.failed.is_empty() {
-            tracing::warn!(
-                target: "transport_nostr_adapter::sdk_client",
-                method = "subscribe",
-                registered_count = output.success.len(),
-                failed_count = output.failed.len(),
-                "SDK relay subscription partially registered"
-            );
-        }
-
-        tracing::debug!(
-            target: "transport_nostr_adapter::sdk_client",
-            method = "subscribe",
-            endpoint_count = plan.endpoints.len(),
-            registered_count = output.success.len(),
-            "SDK relay subscription registered"
-        );
-
-        // Record which of the requested endpoints acknowledged the registration
-        // so the app can surface it in the `subscription_rebuild` audit row.
-        // Only reached on the success path (>=1 relay registered): a total
-        // failure returned above, aborting activation before any audit row.
-        let outcomes = plan
-            .endpoints
-            .iter()
-            .map(|endpoint| (endpoint.clone(), output.success.contains_key(endpoint)));
-        merge_registration_log(
-            self.registration_log
-                .lock()
-                .await
-                .entry(plan.account_id.clone())
-                .or_default(),
-            outcomes,
-        );
-
-        self.account_subscriptions
-            .write()
-            .await
-            .entry(plan.account_id)
-            .or_default()
-            .push_unique(plan.subscription_id);
-        Ok(())
+        result
     }
 
     async fn unsubscribe(
@@ -2254,6 +2417,11 @@ impl NostrRelayClient for NostrSdkRelayClient {
             .unsubscribe(&plan.subscription_id)
             .await
             .map_err(|_| TransportAdapterError::Subscription("unsubscribe failed".to_owned()))?;
+        // Look the floor up by id: callers may rebuild the subscription
+        // without the `since` it was issued with.
+        if let Some(mut floors) = self.account_subscription_floors() {
+            floors.close(&plan.subscription_id);
+        }
         if let Some(ids) = self
             .account_subscriptions
             .write()
@@ -2308,6 +2476,9 @@ impl NostrRelayClient for NostrSdkRelayClient {
             if self.client.unsubscribe(&id).await.is_err() {
                 failed.push(id);
             }
+        }
+        if let Some(mut floors) = self.account_subscription_floors() {
+            floors.close_all_except(&failed);
         }
         if !failed.is_empty() {
             self.account_subscriptions
@@ -3061,6 +3232,157 @@ mod tests {
         root.remove_account(&bob_id).await;
         assert!(root.notification_loss_for_account(&bob_id).await.is_err());
         assert_eq!(alice_watch.borrow().as_ref().unwrap().cumulative_skipped, 6);
+        root.shutdown_accounts().await;
+    }
+
+    #[test]
+    fn notification_loss_floor_is_the_lowest_live_or_closed_since() {
+        use NostrNotificationLossFloor::{Since, Unbounded};
+        let id = |name: &str| SubscriptionId::new(name);
+        let mut floors = SubscriptionFloors::default();
+        assert_eq!(
+            floors.loss_floor(),
+            Unbounded,
+            "no REQ evidence is not a bound"
+        );
+
+        assert_eq!(floors.open(&id("inbox"), Some(500)), None);
+        floors.open(&id("group"), Some(300));
+        assert_eq!(floors.loss_floor(), Since(300));
+
+        // A closed REQ's frames can still arrive however long ago it closed,
+        // so its floor stays after later REQs open above it.
+        floors.close(&id("group"));
+        floors.open(&id("group"), Some(800));
+        floors.open(&id("other"), Some(900));
+        assert_eq!(floors.loss_floor(), Since(300), "a lower closed REQ");
+
+        // A REQ replaced under its id keeps its earlier filter's floor too.
+        let mut replaced = SubscriptionFloors::default();
+        replaced.open(&id("inbox"), Some(500));
+        assert_eq!(replaced.open(&id("inbox"), Some(900)), Some(Some(500)));
+        assert_eq!(replaced.loss_floor(), Since(500));
+
+        // A failed REQ may have reached a relay; the one it would have
+        // replaced is still live.
+        let mut failed = SubscriptionFloors::default();
+        failed.open(&id("inbox"), Some(900));
+        let previous = failed.open(&id("inbox"), Some(700));
+        failed.abandon(&id("inbox"), previous);
+        assert_eq!(failed.live.get(&id("inbox")), Some(&Some(900)));
+        assert_eq!(failed.loss_floor(), Since(700));
+
+        // Account teardown retires everything but a REQ whose CLOSE failed.
+        let mut teardown = SubscriptionFloors::default();
+        teardown.open(&id("kept"), Some(950));
+        teardown.open(&id("orphan"), Some(100));
+        teardown.close_all_except(&[id("kept")]);
+        assert_eq!(teardown.live.keys().collect::<Vec<_>>(), [&id("kept")]);
+        teardown.close(&id("kept"));
+        assert_eq!(teardown.loss_floor(), Since(100));
+
+        // An old unfloored REQ that closed while a floored one stays live
+        // leaves every later lag on its context unbounded: however long ago
+        // it closed, its frames may still be buffered or on their way.
+        let mut unfloored = SubscriptionFloors::default();
+        unfloored.open(&id("maintenance"), None);
+        unfloored.open(&id("group"), Some(900));
+        unfloored.close(&id("maintenance"));
+        unfloored.open(&id("inbox"), Some(950));
+        assert_eq!(unfloored.loss_floor(), Unbounded);
+        let fresh = unfloored.open(&id("fresh"), Some(50));
+        unfloored.abandon(&id("fresh"), fresh);
+        assert!(!unfloored.live.contains_key(&id("fresh")));
+        assert_eq!(unfloored.retired, Some(Unbounded), "no floor raises it");
+    }
+
+    #[tokio::test]
+    async fn account_context_records_req_floors_from_subscribe_to_teardown() {
+        use NostrNotificationLossFloor::{Since, Unbounded};
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoints = vec![TransportEndpoint(relay.url().await.to_string())];
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let attempt = SubscriptionAttempt::INITIAL.next();
+        let group_id = cgka_traits::GroupId::new(vec![0xC3; 16]);
+        let group = |since| NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: group_id.clone(),
+            transport_group_id: vec![0xD4; 32],
+            endpoints: endpoints.clone(),
+            since,
+            attempt,
+        };
+        assert_eq!(account.notification_loss_floor(), Unbounded);
+
+        root.subscribe(NostrSubscription::AccountInbox {
+            account_id: account_id.clone(),
+            endpoints: endpoints.clone(),
+            since: Some(Timestamp(2_000)),
+            attempt,
+        })
+        .await
+        .unwrap();
+        root.subscribe(group(Some(Timestamp(1_000)))).await.unwrap();
+        assert_eq!(account.notification_loss_floor(), Since(1_000));
+        assert_eq!(
+            root.notification_loss_floor_for_account(&account_id).await,
+            Since(1_000)
+        );
+        assert_eq!(
+            root.notification_loss_floor_for_account(&MemberId::new(vec![0xEE; 32]))
+                .await,
+            Unbounded
+        );
+        assert_eq!(
+            root.notification_loss_floor(),
+            Unbounded,
+            "a multi-account root cannot attribute its receiver's loss"
+        );
+
+        // Group sync rebuilds a removed REQ without its `since`; its floor is
+        // found by id, and it keeps counting once the REQ is closed.
+        root.unsubscribe(group(None)).await.unwrap();
+        assert_eq!(account.notification_loss_floor(), Since(1_000));
+        root.unsubscribe_account(&account_id).await.unwrap();
+        assert!(
+            account
+                .account_subscription_floors()
+                .unwrap()
+                .live
+                .is_empty()
+        );
+        assert_eq!(
+            account.notification_loss_floor(),
+            Since(1_000),
+            "closed REQs keep counting for the context's life"
+        );
+
+        // A subscribe that fails after its floor was recorded keeps it: the
+        // REQ may have reached a relay.
+        account.client().shutdown().await;
+        let failed = root
+            .subscribe(NostrSubscription::AccountInbox {
+                account_id: account_id.clone(),
+                endpoints: vec![TransportEndpoint("wss://unreachable.example".into())],
+                since: Some(Timestamp(50)),
+                attempt: attempt.next(),
+            })
+            .await;
+        assert!(failed.is_err());
+        assert!(
+            account
+                .account_subscription_floors()
+                .unwrap()
+                .live
+                .is_empty()
+        );
+        assert_eq!(account.notification_loss_floor(), Since(50));
         root.shutdown_accounts().await;
     }
 

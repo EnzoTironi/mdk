@@ -60,6 +60,28 @@
   and report a stale window when an older visible-anchor quote names a row
   dropped by a background replacement. (#2052)
 
+- Keep an account's delivery route open when its relay notification consumer lags. A lag
+  used to close the route and send the account worker through reconnect. The reopened
+  session replayed the backlog from the loss-fenced cursor, which overflowed again, so large
+  accounts looped in reconnect backoff and commands failed with `transport_closed`. The
+  consumer now resumes on the same receiver and the worker keeps serving commands. It
+  records the loss durably, bounded below by the lowest `since` among every REQ the
+  account's SDK context issued, live or closed, or unbounded when any of them had no
+  `since`, and recovers it by comparison. `RelayPlaneHealth` still counts each lag in
+  `notification_forwarder_lag_incidents`, `notification_forwarder_lagged_notifications`
+  and `notification_forwarder_restarts`. Only an unexpected consumer exit
+  (`notification_forwarder_unexpected_exits`) still closes delivery and reconnects. (#2070)
+
+- Hand a pending loss signal to an account's next delivery route when the worker drops its
+  queue with the control record still in it. The record died with the queue, but the plane
+  still counted it as queued, so the loss generation could never clear and the transport
+  cursor stayed fenced for the rest of the process. (#2070)
+
+- Publish and rotate KeyPackages without a full-history resubscription. Both used to
+  activate transport with no `since`, which replayed every held event on every inbox and
+  group route and left a notification lag during that replay unbounded. They now reuse the
+  live activation or rebuild it from the transport cursor, like reconnect. (#2070)
+
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay
   until a newer event replaces them. (#1973)

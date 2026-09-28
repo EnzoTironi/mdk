@@ -47,6 +47,11 @@ for reconnect/backoff and relay status mechanics.
 - Keep `activate_account`'s opening `unsubscribe_account` unconditional. Attempt-scoped ids removed the relay-side
   REQ-replace backstop, and a rolled-back activation can leave `accounts` empty while the relay client still holds this
   account's subscriptions; an orphaned REQ double-delivers because routing is content-keyed.
+- Record each REQ's filter `since` in its SDK account context before the REQ goes out, find it by subscription id
+  when the REQ closes, and keep a closed REQ's floor for the rest of the context's life: routing is content-keyed,
+  and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be lost in a lag. Do
+  not add a time-based expiry. Read `notification_loss_floor` at the lag; an unfloored REQ or missing evidence is
+  `Unbounded`, never "no loss".
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`
