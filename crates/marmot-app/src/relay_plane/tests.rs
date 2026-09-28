@@ -2258,16 +2258,27 @@ async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
     assert!(matches!(woke, AccountDeliveryWait::SpillReady));
 }
 
-/// Retirement waits for an in-flight spill write while the route still
-/// exists: a committed write is durable before any replacement reads the
-/// table, and a failed one records durable loss through that route.
+/// A spill write can outlive its route: retirement removes the route while
+/// the writer still holds a batch, however long the store takes. A replacement
+/// adapter shares that writer's coordination, so it stays fenced until the
+/// batch settles, wakes when it commits, and inherits durable loss when it
+/// fails.
 #[tokio::test]
-async fn retirement_settles_an_in_flight_spill_write_before_removing_the_route() {
+async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
     for commit in [true, false] {
         let relay = Arc::new(RecordingRelayClient::default());
         let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
         let alice = MemberId::new(vec![0xA1; 32]);
         let release = Arc::new(AtomicBool::new(false));
+        // A failed assertion must still free the blocked store thread, or the
+        // runtime cannot shut down.
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release_on_exit = ReleaseOnDrop(release.clone());
         let gate = release.clone();
         let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
             while !gate.load(Ordering::SeqCst) {
@@ -2291,8 +2302,8 @@ async fn retirement_settles_an_in_flight_spill_write_before_removing_the_route()
         let adapter = relay_plane.account_adapter_with_recovery_marker(
             alice.clone(),
             relay.clone(),
-            Some(marker),
-            Some(store),
+            Some(marker.clone()),
+            Some(store.clone()),
         );
         fill_account_queue(&relay_plane, &adapter, &alice, 1).await;
         timeout(Duration::from_secs(5), async {
@@ -2303,27 +2314,35 @@ async fn retirement_settles_an_in_flight_spill_write_before_removing_the_route()
         .await
         .expect("the overflowed delivery is handed to the spill writer");
 
-        let retiring = relay_plane.clone();
-        let account = alice.clone();
-        let deactivate =
-            tokio::spawn(async move { retiring.deactivate_account_context(&account).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Retirement does not wait for the held write.
+        timeout(
+            Duration::from_secs(5),
+            relay_plane.deactivate_account_context(&alice),
+        )
+        .await
+        .expect("retirement does not wait for the writer")
+        .unwrap();
+        drop(adapter);
+        let replacement = relay_plane.account_adapter_with_recovery_marker(
+            alice.clone(),
+            relay.clone(),
+            Some(marker),
+            Some(store),
+        );
         assert!(
-            !deactivate.is_finished(),
-            "retirement waits for the in-flight write"
+            replacement.delivery_loss_blocks_cursor(),
+            "the replacement is fenced by the retired writer's batch"
         );
         release.store(true, Ordering::SeqCst);
-        timeout(Duration::from_secs(5), deactivate)
-            .await
-            .expect("retirement completes once the write settles")
-            .unwrap()
-            .unwrap();
-        assert_eq!(adapter.delivery_overflow.spill_in_flight(), 0);
         if commit {
-            assert!(
-                !adapter.delivery_loss_blocks_cursor(),
-                "a committed spill leaves no loss"
-            );
+            let woke = timeout(
+                Duration::from_secs(5),
+                replacement.receive_account_delivery_or_spill(),
+            )
+            .await
+            .expect("the replacement hears the retired writer commit");
+            assert!(matches!(woke, AccountDeliveryWait::SpillReady));
+            assert!(!replacement.delivery_loss_blocks_cursor());
             assert!(marked.lock().unwrap().is_empty());
         } else {
             timeout(Duration::from_secs(5), async {
@@ -2337,7 +2356,11 @@ async fn retirement_settles_an_in_flight_spill_write_before_removing_the_route()
                 }
             })
             .await
-            .expect("a failed write records durable loss through the still-registered route");
+            .expect("the lost batch is durable although its route was retired");
+            assert!(
+                replacement.delivery_loss_blocks_cursor(),
+                "the lost batch keeps the replacement fenced"
+            );
         }
     }
 }
@@ -2390,6 +2413,7 @@ async fn spill_hand_off_bounds_deliveries_with_empty_payloads() {
         MemberId::new(vec![0xA1; 32]),
         std::sync::Weak::new(),
         Arc::new(AccountDeliveryOverflowState::default()),
+        None,
     );
     let empty = |index: u32| TransportDelivery {
         account_id: MemberId::new(vec![0xA1; 32]),

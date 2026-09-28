@@ -16,8 +16,9 @@ use cgka_traits::{MemberId, TransportDelivery};
 use storage_sqlite::{DeliverySpillDisposition, DeliverySpillLimits};
 
 use super::{
-    AccountDeliveryOverflowState, AccountDeliveryRecoveryMarkerError, RelayPlaneTransport,
-    account_deliveries_read, omit_account_delivery,
+    AccountDeliveryOverflowState, AccountDeliveryRecoveryMarker,
+    AccountDeliveryRecoveryMarkerError, RelayPlaneTransport, account_deliveries_read,
+    omit_account_delivery, persist_retired_queue_loss,
 };
 
 pub(crate) type AccountDeliverySpillStore = Arc<
@@ -45,9 +46,6 @@ const SPILL_WRITE_BATCH: usize = 128;
 /// batch falls back to loss; the cursor stays fenced meanwhile.
 const SPILL_WRITE_RETRIES: u32 = 20;
 const SPILL_WRITE_RETRY_DELAY: Duration = Duration::from_millis(100);
-/// How long retirement waits for in-flight spill writes. The writer's own
-/// retries end sooner; this bound only guards a wedged store.
-const SPILL_RETIRE_WAIT: Duration = Duration::from_secs(5);
 
 pub(super) struct AccountDeliverySpill {
     store: AccountDeliverySpillStore,
@@ -56,11 +54,13 @@ pub(super) struct AccountDeliverySpill {
     /// Loss recorded after an adapter replacement must reach the account's
     /// current route, not the one this writer started under.
     transport: Weak<RelayPlaneTransport>,
-    /// Shared by every adapter of this account, so fences and wakeups survive
+    /// Shared by every adapter of this account, including one registered
+    /// after this writer's route was retired, so fences and wakeups survive
     /// replacement.
     overflow: Arc<AccountDeliveryOverflowState>,
-    /// Signalled when the writer has nothing left to write.
-    idle: tokio::sync::Notify,
+    /// The route's durable loss marker, kept so loss recorded after the route
+    /// is retired is still durable for the next session.
+    marker: Option<AccountDeliveryRecoveryMarker>,
 }
 
 #[derive(Default)]
@@ -68,8 +68,6 @@ struct Handoff {
     items: VecDeque<TransportDelivery>,
     bytes: usize,
     writing: bool,
-    /// Set at retirement: later hand-offs are refused and become loss.
-    sealed: bool,
 }
 
 impl AccountDeliverySpill {
@@ -78,6 +76,7 @@ impl AccountDeliverySpill {
         account_id: MemberId,
         transport: Weak<RelayPlaneTransport>,
         overflow: Arc<AccountDeliveryOverflowState>,
+        marker: Option<AccountDeliveryRecoveryMarker>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -85,7 +84,7 @@ impl AccountDeliverySpill {
             account_id,
             transport,
             overflow,
-            idle: tokio::sync::Notify::new(),
+            marker,
         })
     }
 
@@ -96,8 +95,7 @@ impl AccountDeliverySpill {
     pub(super) fn offer(self: &Arc<Self>, delivery: TransportDelivery) -> bool {
         let size = retained_size(&delivery);
         let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
-        if handoff.sealed
-            || handoff.items.len() >= SPILL_HANDOFF_MAX_DELIVERIES
+        if handoff.items.len() >= SPILL_HANDOFF_MAX_DELIVERIES
             || handoff.bytes.saturating_add(size) > SPILL_HANDOFF_MAX_BYTES
         {
             return false;
@@ -118,8 +116,6 @@ impl AccountDeliverySpill {
                 let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
                 if handoff.items.is_empty() {
                     handoff.writing = false;
-                    drop(handoff);
-                    self.idle.notify_waiters();
                     return;
                 }
                 let take = handoff.items.len().min(SPILL_WRITE_BATCH);
@@ -141,40 +137,6 @@ impl AccountDeliverySpill {
             if stored > 0 {
                 self.overflow.spill_ready.notify_one();
             }
-        }
-    }
-
-    /// Refuse further hand-offs and wait, bounded, for the writer to settle
-    /// what it holds. Retirement calls this while the account's route still
-    /// exists, so a failed write records durable loss and a committed one is in
-    /// the table before any replacement adapter, with fresh coordination, can
-    /// read it.
-    pub(super) async fn retire(&self) {
-        let settled = async {
-            loop {
-                let idle = self.idle.notified();
-                tokio::pin!(idle);
-                idle.as_mut().enable();
-                {
-                    let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
-                    handoff.sealed = true;
-                    if !handoff.writing {
-                        return;
-                    }
-                }
-                idle.await;
-            }
-        };
-        if tokio::time::timeout(SPILL_RETIRE_WAIT, settled)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                target: "marmot_app::relay_plane",
-                method = "retire",
-                error_kind = "spill_write_unsettled",
-                "account delivery spill writer did not settle before retirement",
-            );
         }
     }
 
@@ -215,9 +177,18 @@ impl AccountDeliverySpill {
         });
         match route {
             Some(route) => omit_account_delivery(&route),
-            // The account is gone; its loss fence has no consumer left.
+            // The route was retired while this batch was in flight. The loss
+            // still fences any replacement, which shares this overflow state,
+            // and becomes durable through the retired route's marker. There
+            // is no queue for the signal; the next session recovers from the
+            // durable marker.
             None => {
-                self.overflow.record_drop(0);
+                if let Some(generation) = self.overflow.record_drop(0) {
+                    self.overflow.cancel_signal(generation);
+                }
+                if let Some(marker) = self.marker.clone() {
+                    persist_retired_queue_loss(&self.overflow, marker);
+                }
             }
         }
     }

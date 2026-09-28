@@ -209,6 +209,7 @@ local-access bounds, not convergence or recovery policy.
 | Router-to-writer hand-off | At most 4,096 deliveries and 4 MiB per account (`SPILL_HANDOFF_MAX_DELIVERIES`, `SPILL_HANDOFF_MAX_BYTES`), each delivery charged its payload plus 512 bytes (`SPILL_DELIVERY_OVERHEAD_BYTES`) so empty payloads stay bounded; a delivery that does not fit is omitted into the existing loss generation | The one writer task per account drains it in batches of 128 and exits when it is empty |
 | `account_delivery_spill` rows | At most 8,192 rows and 16 MiB per account database (`ACCOUNT_DELIVERY_SPILL_LIMITS`); already-seen deliveries are not stored; a delivery over either limit is omitted into the existing loss generation | Each row is removed after live ingest has seen its delivery, or after dedup skips it. A row whose ingest left no trace is retried with backoff and, after 8 attempts, removed and recorded as queue loss in one transaction; undecodable rows are removed on read the same way |
 | Worker read buffer | At most 32 spilled deliveries (`SPILL_READ_BATCH`) | Refilled only after the previous batch is consumed |
+| Retired-route overflow coordination | One weak entry per account (`account_overflow_states`), shared by a spill writer that outlives its route and any replacement adapter | Entries whose state nothing holds are pruned at the next adapter registration |
 
 ### Account recovery durable loss evidence (`storage-sqlite/src/account_recovery/`)
 

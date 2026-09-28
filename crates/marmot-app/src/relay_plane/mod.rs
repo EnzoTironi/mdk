@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{
-    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -117,6 +117,11 @@ struct RelayPlaneTransport {
     directory_client: Option<NostrSdkClient>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     account_deliveries: RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
+    /// Each account's overflow coordination while anything still holds it,
+    /// such as a spill writer whose route was retired mid-batch. A later
+    /// adapter for the account shares it instead of starting fresh.
+    account_overflow_states:
+        std::sync::Mutex<HashMap<MemberId, Weak<AccountDeliveryOverflowState>>>,
     account_delivery_metrics: Arc<AccountDeliveryMetrics>,
     router: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder: Mutex<Option<JoinHandle<()>>>,
@@ -311,14 +316,6 @@ impl AccountDeliveryOverflowState {
         self.metrics
             .max_queue_depth
             .fetch_max(depth, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    fn spill_in_flight(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .spill_in_flight
     }
 
     fn begin_spill(&self) {
@@ -823,6 +820,7 @@ impl MarmotRelayPlane {
             directory_client,
             directory_events: broadcast::channel(DIRECTORY_EVENT_BUFFER).0,
             account_deliveries: RwLock::new(HashMap::new()),
+            account_overflow_states: std::sync::Mutex::new(HashMap::new()),
             account_delivery_metrics: Arc::new(AccountDeliveryMetrics::default()),
             router: Mutex::new(None),
             notification_forwarder: Mutex::new(None),
@@ -871,9 +869,17 @@ impl MarmotRelayPlane {
         // slow consumer or blocking the shared router.
         let (delivery_tx, delivery_rx) = mpsc::channel(ACCOUNT_DELIVERY_BUFFER + 1);
         let mut routes = account_deliveries_write(&self.inner.transport.account_deliveries);
+        let mut overflow_states = self
+            .inner
+            .transport
+            .account_overflow_states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        overflow_states.retain(|_, state| state.strong_count() > 0);
         let delivery_overflow = routes
             .get(&account_id)
             .map(|route| route.overflow.clone())
+            .or_else(|| overflow_states.get(&account_id).and_then(Weak::upgrade))
             .unwrap_or_else(|| {
                 Arc::new(AccountDeliveryOverflowState {
                     inner: std::sync::Mutex::new(AccountDeliveryOverflowInner::default()),
@@ -881,20 +887,23 @@ impl MarmotRelayPlane {
                     spill_ready: Arc::default(),
                 })
             });
+        overflow_states.insert(account_id.clone(), Arc::downgrade(&delivery_overflow));
+        drop(overflow_states);
         routes.insert(
             account_id.clone(),
             AccountDeliveryRoute {
                 sender: delivery_tx,
                 overflow: delivery_overflow.clone(),
-                recovery_marker,
                 spill: spill_store.map(|store| {
                     delivery_spill::AccountDeliverySpill::new(
                         store,
                         account_id.clone(),
                         Arc::downgrade(&self.inner.transport),
                         delivery_overflow.clone(),
+                        recovery_marker.clone(),
                     )
                 }),
+                recovery_marker,
             },
         );
         MarmotRelayPlaneAccountAdapter {
@@ -1107,14 +1116,6 @@ impl MarmotRelayPlane {
         &self,
         account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
-        // Settle in-flight spill writes while this route can still record
-        // their loss, and before a replacement adapter reads the table.
-        let spill = account_deliveries_read(&self.inner.transport.account_deliveries)
-            .get(account_id)
-            .and_then(|route| route.spill.clone());
-        if let Some(spill) = spill {
-            spill.retire().await;
-        }
         account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
         self.inner
             .transport
@@ -3009,6 +3010,18 @@ fn persist_queue_loss(
         });
     } else if overflow.take_durable_marker_signal(generation) {
         enqueue_account_delivery_overflow_signal(sender, overflow, generation);
+    }
+}
+
+/// Persist loss recorded after its route was retired. There is no queue for
+/// a signal; whichever session comes next recovers from the durable marker.
+fn persist_retired_queue_loss(
+    overflow: &Arc<AccountDeliveryOverflowState>,
+    marker: AccountDeliveryRecoveryMarker,
+) {
+    if overflow.start_marker_persistence() {
+        let overflow = overflow.clone();
+        tokio::spawn(async move { overflow.persist_marker_before_drop(marker).await });
     }
 }
 
