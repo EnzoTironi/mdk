@@ -18,7 +18,7 @@ use storage_sqlite::{DeliverySpillDisposition, DeliverySpillLimits};
 use super::{
     AccountDeliveryOverflowState, AccountDeliveryRecoveryMarker,
     AccountDeliveryRecoveryMarkerError, RelayPlaneTransport, account_deliveries_read,
-    omit_account_delivery, persist_retired_queue_loss,
+    enqueue_account_delivery_overflow_signal, omit_account_delivery, persist_retired_queue_loss,
 };
 
 pub(crate) type AccountDeliverySpillStore = Arc<
@@ -169,25 +169,35 @@ impl AccountDeliverySpill {
         Vec::new()
     }
 
-    fn omit(&self) {
-        let route = self.transport.upgrade().and_then(|transport| {
+    fn current_route(&self) -> Option<super::AccountDeliveryRoute> {
+        self.transport.upgrade().and_then(|transport| {
             account_deliveries_read(&transport.account_deliveries)
                 .get(&self.account_id)
                 .cloned()
-        });
-        match route {
+        })
+    }
+
+    fn omit(&self) {
+        match self.current_route() {
             Some(route) => omit_account_delivery(&route),
             // The route was retired while this batch was in flight. The loss
             // still fences any replacement, which shares this overflow state,
-            // and becomes durable through the retired route's marker. There
-            // is no queue for the signal; the next session recovers from the
-            // durable marker.
+            // and becomes durable through the retired route's marker. A
+            // replacement that registers later is signalled when it reuses
+            // the state; one that registered meanwhile is signalled here.
             None => {
-                if let Some(generation) = self.overflow.record_drop(0) {
-                    self.overflow.cancel_signal(generation);
-                }
+                self.overflow.record_retired_drop();
                 if let Some(marker) = self.marker.clone() {
                     persist_retired_queue_loss(&self.overflow, marker);
+                }
+                if let Some(route) = self.current_route()
+                    && let Some(generation) = self.overflow.claim_retired_loss_signal()
+                {
+                    enqueue_account_delivery_overflow_signal(
+                        &route.sender,
+                        &self.overflow,
+                        generation,
+                    );
                 }
             }
         }

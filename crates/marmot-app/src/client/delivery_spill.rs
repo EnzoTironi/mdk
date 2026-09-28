@@ -20,7 +20,7 @@ const SPILL_READ_BATCH: usize = 32;
 /// About three hours of doubling retries. A row still unadmitted after that
 /// is removed and recorded as queue loss, so recovery keeps an obligation.
 const SPILL_MAX_ATTEMPTS: u32 = 8;
-/// Retry delay after a storage failure while settling a row.
+/// Retry delay after a storage failure while reading or settling rows.
 const SPILL_SETTLE_RETRY_SECS: u64 = 60;
 
 pub(crate) struct DeliverySpillReader {
@@ -35,6 +35,8 @@ pub(crate) struct DeliverySpillReader {
     in_flight: Option<(i64, String)>,
     /// Rows just became queue loss; the next receive starts its recovery.
     loss_recorded: bool,
+    #[cfg(test)]
+    pub(super) fail_next_read: bool,
 }
 
 impl Default for DeliverySpillReader {
@@ -46,6 +48,8 @@ impl Default for DeliverySpillReader {
             live_turn: false,
             in_flight: None,
             loss_recorded: false,
+            #[cfg(test)]
+            fail_next_read: false,
         }
     }
 }
@@ -101,18 +105,42 @@ impl AppClient {
 
     fn next_spilled_delivery(&mut self) -> Result<Option<TransportDelivery>, AppError> {
         if self.delivery_spill.buffered.is_empty() && self.delivery_spill.maybe_rows {
-            let storage = self.app.account_storage(&self.state.label)?;
-            let batch = storage.spilled_account_deliveries(SPILL_READ_BATCH, unix_now_seconds())?;
+            // Spilled rows are durable, so a failed read waits for a retry
+            // instead of blocking live delivery.
+            let read = self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    Ok(storage.spilled_account_deliveries(SPILL_READ_BATCH, unix_now_seconds())?)
+                });
+            #[cfg(test)]
+            let read = if std::mem::take(&mut self.delivery_spill.fail_next_read) {
+                Err(AppError::BlockingTask("injected spill read failure".into()))
+            } else {
+                read
+            };
+            let batch = match read {
+                Ok(batch) => batch,
+                Err(_) => {
+                    self.delivery_spill.maybe_rows = false;
+                    self.defer_spill_read("spill_read_failed");
+                    return Ok(None);
+                }
+            };
             if !batch.undecodable.is_empty() {
-                // Their content is unknown, so they become queue loss.
-                self.discard_spilled_deliveries(&batch.undecodable)?;
-                tracing::warn!(
-                    target: "marmot_app::client::delivery_spill",
-                    method = "next_spilled_delivery",
-                    error_kind = "undecodable_spill_rows",
-                    discarded = batch.undecodable.len(),
-                    "discarded undecodable spilled deliveries as queue loss",
-                );
+                // Their content is unknown, so they become queue loss. If that
+                // fails the rows stay and are read again later.
+                if self.discard_spilled_deliveries(&batch.undecodable).is_ok() {
+                    tracing::warn!(
+                        target: "marmot_app::client::delivery_spill",
+                        method = "next_spilled_delivery",
+                        error_kind = "undecodable_spill_rows",
+                        discarded = batch.undecodable.len(),
+                        "discarded undecodable spilled deliveries as queue loss",
+                    );
+                } else {
+                    self.defer_spill_read("undecodable_spill_discard_failed");
+                }
             }
             self.delivery_spill.maybe_rows = batch.more;
             self.delivery_spill.next_retry_at = batch.next_retry_at;
@@ -123,6 +151,16 @@ impl AppClient {
             self.delivery_spill.in_flight = Some((row.seq, event_id));
             row.delivery
         }))
+    }
+
+    fn defer_spill_read(&mut self, error_kind: &'static str) {
+        self.schedule_spill_retry(unix_now_seconds().saturating_add(SPILL_SETTLE_RETRY_SECS));
+        tracing::warn!(
+            target: "marmot_app::client::delivery_spill",
+            method = "next_spilled_delivery",
+            error_kind,
+            "spilled deliveries kept for a later read",
+        );
     }
 
     pub(super) fn note_spill_ready(&mut self) {
@@ -344,6 +382,47 @@ mod tests {
             client.spill_retry_wait().is_some(),
             "the row is read again later"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_spill_read_waits_instead_of_blocking_live_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .spill_account_deliveries(
+                &[delivery(4)],
+                ACCOUNT_DELIVERY_SPILL_LIMITS,
+                unix_now_seconds(),
+            )
+            .unwrap();
+        client.delivery_spill.maybe_rows = true;
+        client.delivery_spill.fail_next_read = true;
+        assert!(
+            client.next_spilled_delivery().unwrap().is_none(),
+            "a failed read is not a receive error"
+        );
+        assert!(
+            !client.delivery_spill.pending(),
+            "the live queue is served meanwhile"
+        );
+        assert!(
+            client.spill_retry_wait().is_some(),
+            "the read is retried later"
+        );
+
+        // Once the retry is due the row is read normally.
+        client.delivery_spill.next_retry_at = Some(0);
+        assert!(client.delivery_spill.pending());
+        assert_eq!(client.next_spilled_delivery().unwrap(), Some(delivery(4)));
     }
 
     #[tokio::test]

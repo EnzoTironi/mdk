@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{
-    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -117,11 +117,10 @@ struct RelayPlaneTransport {
     directory_client: Option<NostrSdkClient>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     account_deliveries: RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
-    /// Each account's overflow coordination while anything still holds it,
-    /// such as a spill writer whose route was retired mid-batch. A later
-    /// adapter for the account shares it instead of starting fresh.
-    account_overflow_states:
-        std::sync::Mutex<HashMap<MemberId, Weak<AccountDeliveryOverflowState>>>,
+    /// Each account's overflow coordination, kept for the process lifetime. A
+    /// spill writer can outlive its route; every later adapter for the account
+    /// shares its fence, wakeup and pending loss instead of starting fresh.
+    account_overflow_states: std::sync::Mutex<HashMap<MemberId, Arc<AccountDeliveryOverflowState>>>,
     account_delivery_metrics: Arc<AccountDeliveryMetrics>,
     router: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder: Mutex<Option<JoinHandle<()>>>,
@@ -255,6 +254,9 @@ struct AccountDeliveryOverflowInner {
     marker_closed: bool,
     /// Deliveries handed to the spill writer but not yet durable or lost.
     spill_in_flight: u64,
+    /// A spill writer recorded loss after its route was retired, so no queue
+    /// has carried its signal yet.
+    retired_loss_unsignalled: bool,
 }
 
 #[derive(Default)]
@@ -374,6 +376,29 @@ impl AccountDeliveryOverflowState {
             state.signal_queued = true;
             Some(state.generation)
         }
+    }
+
+    fn record_retired_drop(&self) {
+        self.record_drop(0);
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retired_loss_unsignalled = true;
+    }
+
+    /// Claim the signal for loss a retired writer recorded while no route
+    /// existed. Any other pending loss already had its route.
+    fn claim_retired_loss_signal(&self) -> Option<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !std::mem::take(&mut state.retired_loss_unsignalled) || !state.pending {
+            return None;
+        }
+        state.signal_queued = true;
+        state.marker_signal_pending = false;
+        Some(state.generation)
     }
 
     fn cancel_signal(&self, generation: u64) {
@@ -868,27 +893,23 @@ impl MarmotRelayPlane {
         // can always carry the explicit recovery signal without awaiting the
         // slow consumer or blocking the shared router.
         let (delivery_tx, delivery_rx) = mpsc::channel(ACCOUNT_DELIVERY_BUFFER + 1);
+        let signal_tx = delivery_tx.clone();
         let mut routes = account_deliveries_write(&self.inner.transport.account_deliveries);
-        let mut overflow_states = self
+        let delivery_overflow = self
             .inner
             .transport
             .account_overflow_states
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        overflow_states.retain(|_, state| state.strong_count() > 0);
-        let delivery_overflow = routes
-            .get(&account_id)
-            .map(|route| route.overflow.clone())
-            .or_else(|| overflow_states.get(&account_id).and_then(Weak::upgrade))
-            .unwrap_or_else(|| {
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(account_id.clone())
+            .or_insert_with(|| {
                 Arc::new(AccountDeliveryOverflowState {
                     inner: std::sync::Mutex::new(AccountDeliveryOverflowInner::default()),
                     metrics: self.inner.transport.account_delivery_metrics.clone(),
                     spill_ready: Arc::default(),
                 })
-            });
-        overflow_states.insert(account_id.clone(), Arc::downgrade(&delivery_overflow));
-        drop(overflow_states);
+            })
+            .clone();
         routes.insert(
             account_id.clone(),
             AccountDeliveryRoute {
@@ -906,6 +927,13 @@ impl MarmotRelayPlane {
                 recovery_marker,
             },
         );
+        // Loss a retired writer recorded while no route existed has not been
+        // signalled to any consumer. The route lock orders this against that
+        // writer's own check for a route.
+        if let Some(generation) = delivery_overflow.claim_retired_loss_signal() {
+            enqueue_account_delivery_overflow_signal(&signal_tx, &delivery_overflow, generation);
+        }
+        drop(routes);
         MarmotRelayPlaneAccountAdapter {
             account_id,
             relay_plane: self.clone(),

@@ -2261,11 +2261,21 @@ async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
 /// A spill write can outlive its route: retirement removes the route while
 /// the writer still holds a batch, however long the store takes. A replacement
 /// adapter shares that writer's coordination, so it stays fenced until the
-/// batch settles, wakes when it commits, and inherits durable loss when it
-/// fails.
+/// batch settles, wakes when it commits, and is told to recover when it fails,
+/// whether the replacement registered before or after the failure.
 #[tokio::test]
 async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
-    for commit in [true, false] {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Outcome {
+        Commit,
+        FailAfterReplacement,
+        FailBeforeReplacement,
+    }
+    for outcome in [
+        Outcome::Commit,
+        Outcome::FailAfterReplacement,
+        Outcome::FailBeforeReplacement,
+    ] {
         let relay = Arc::new(RecordingRelayClient::default());
         let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
         let alice = MemberId::new(vec![0xA1; 32]);
@@ -2284,7 +2294,7 @@ async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
             while !gate.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            if commit {
+            if outcome == Outcome::Commit {
                 Ok(vec![
                     storage_sqlite::DeliverySpillDisposition::Stored;
                     deliveries.len()
@@ -2323,28 +2333,7 @@ async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
         .expect("retirement does not wait for the writer")
         .unwrap();
         drop(adapter);
-        let replacement = relay_plane.account_adapter_with_recovery_marker(
-            alice.clone(),
-            relay.clone(),
-            Some(marker),
-            Some(store),
-        );
-        assert!(
-            replacement.delivery_loss_blocks_cursor(),
-            "the replacement is fenced by the retired writer's batch"
-        );
-        release.store(true, Ordering::SeqCst);
-        if commit {
-            let woke = timeout(
-                Duration::from_secs(5),
-                replacement.receive_account_delivery_or_spill(),
-            )
-            .await
-            .expect("the replacement hears the retired writer commit");
-            assert!(matches!(woke, AccountDeliveryWait::SpillReady));
-            assert!(!replacement.delivery_loss_blocks_cursor());
-            assert!(marked.lock().unwrap().is_empty());
-        } else {
+        let durable = || async {
             timeout(Duration::from_secs(5), async {
                 while marked
                     .lock()
@@ -2357,10 +2346,45 @@ async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
             })
             .await
             .expect("the lost batch is durable although its route was retired");
+        };
+        if outcome == Outcome::FailBeforeReplacement {
+            // The write fails while no route exists.
+            release.store(true, Ordering::SeqCst);
+            durable().await;
+        }
+        let replacement = relay_plane.account_adapter_with_recovery_marker(
+            alice.clone(),
+            relay.clone(),
+            Some(marker),
+            Some(store),
+        );
+        assert!(
+            replacement.delivery_loss_blocks_cursor(),
+            "{outcome:?}: the replacement is fenced by the retired writer's batch"
+        );
+        release.store(true, Ordering::SeqCst);
+        let woke = timeout(
+            Duration::from_secs(5),
+            replacement.receive_account_delivery_or_spill(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{outcome:?}: the replacement hears the retired writer"));
+        if outcome == Outcome::Commit {
+            assert!(matches!(woke, AccountDeliveryWait::SpillReady));
+            assert!(!replacement.delivery_loss_blocks_cursor());
+            assert!(marked.lock().unwrap().is_empty());
+        } else {
+            // Recovery starts on the replacement with no further relay
+            // traffic, and the loss keeps its cursor fenced until then.
             assert!(
-                replacement.delivery_loss_blocks_cursor(),
-                "the lost batch keeps the replacement fenced"
+                matches!(
+                    woke,
+                    AccountDeliveryWait::Received(AccountDeliveryReceive::Overflow(_))
+                ),
+                "{outcome:?}: the replacement is told to recover"
             );
+            durable().await;
+            assert!(replacement.delivery_loss_blocks_cursor());
         }
     }
 }
