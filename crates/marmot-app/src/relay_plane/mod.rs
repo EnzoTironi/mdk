@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{
     Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -9,9 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use cgka_traits::transport::Timestamp;
 use cgka_traits::{
-    MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportEndpoint, TransportGroupSubscription, TransportGroupSync,
-    TransportPublishReport, TransportPublishRequest,
+    MemberId, MessageId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
+    TransportDelivery, TransportDeliveryPlane, TransportEndpoint, TransportGroupSubscription,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
 use futures::{Stream, StreamExt};
 use nostr_sdk::NotificationUpdate;
@@ -158,6 +158,8 @@ pub struct MarmotRelayPlaneAccountAdapter {
     publish_client: Arc<dyn NostrRelayClient>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<AccountDeliveryEvent>>>,
     delivery_overflow: Arc<AccountDeliveryOverflowState>,
+    /// The queue generation `delivery_rx` belongs to.
+    delivery_epoch: u64,
     incremental_activation: Arc<Mutex<Option<IncrementalActivation>>>,
 }
 
@@ -165,6 +167,8 @@ pub struct MarmotRelayPlaneAccountAdapter {
 struct AccountDeliveryRoute {
     sender: mpsc::Sender<AccountDeliveryEvent>,
     overflow: Arc<AccountDeliveryOverflowState>,
+    /// The queue generation `sender` feeds.
+    epoch: u64,
     recovery_marker: Option<AccountDeliveryRecoveryMarker>,
     spill: Option<Arc<delivery_spill::AccountDeliverySpill>>,
 }
@@ -267,6 +271,81 @@ struct AccountDeliveryOverflowInner {
     /// lag's floor was unknown.
     notification_floor: Option<u64>,
     notification_floor_unknown: bool,
+    /// What the account queue holds, and the restart floors a cursor commit
+    /// must keep over it.
+    admission: AccountDeliveryAdmission,
+}
+
+/// The account queue as a restart would see it, and the restart floors a
+/// transport-cursor commit guards. It sits under the overflow lock, which the
+/// router holds while it places each delivery, so every commit's decision is
+/// ordered against every placement: a delivery queued first caps the commit,
+/// and one placed later sees the floor the commit raised.
+///
+/// Every value is a restart `since`: the group-route `since` a restart builds
+/// from a cursor, which is the cursor minus the rebuild lookback. A delivery's
+/// key is the lowest such `since` that still fetches it again: its
+/// `created_at`, or for the inbox its `created_at` plus the NIP-59 widening
+/// the inbox REQ adds.
+#[derive(Debug, Default)]
+struct AccountDeliveryAdmission {
+    /// The queue generation `queued` describes. A replaced route's queue
+    /// dies with its receiver.
+    epoch: u64,
+    /// Keys of the deliveries in the account queue, and of those its
+    /// consumer took but has not yet ingested durably, with their counts.
+    queued: BTreeMap<u64, u32>,
+    /// The key in `queued` each taken delivery holds until its consumer
+    /// releases it, by event. A delivery whose ingest failed is never
+    /// released, so its key keeps capping commits for the rest of the queue
+    /// generation, unless a redelivery of the same event is released.
+    taken: HashMap<MessageId, u64>,
+    /// The persisted cursor's restart `since`. Every seal raises it before
+    /// its commit saves, so it covers a cursor still being written too.
+    durable_since: Option<u64>,
+    /// The part of `durable_since` that drain checkpoints, settled loss and
+    /// the cursor the account opened with made durable, which is where a
+    /// design without live promotion would have it. A delivery keyed between
+    /// the two is one that only a live promotion, or a commit still saving,
+    /// stopped a restart from fetching, so the router spills it instead of
+    /// queueing it. `None` until the account's first settled cursor: before
+    /// any cursor a restart relied on its comparison, not the cursor, for
+    /// everything, so while this is `None` every delivery below
+    /// `durable_since` is spilled.
+    settled_since: Option<u64>,
+}
+
+impl AccountDeliveryAdmission {
+    /// One delivery keyed `key` no longer caps a commit.
+    fn remove_queued(&mut self, key: u64) {
+        if let std::collections::btree_map::Entry::Occupied(mut count) = self.queued.entry(key) {
+            if *count.get() > 1 {
+                *count.get_mut() -= 1;
+            } else {
+                count.remove();
+            }
+        }
+    }
+}
+
+/// Where the router puts one delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountDeliveryPlacement {
+    Queue,
+    /// The durable spill. The cursor fence already counts it.
+    Spill,
+    /// Queue loss, because no spill can take it.
+    Omit,
+}
+
+/// The lowest restart `since` that fetches `delivery` again.
+fn account_delivery_restart_key(delivery: &TransportDelivery) -> u64 {
+    let created_at = delivery.message.timestamp.0;
+    if delivery.source.plane == TransportDeliveryPlane::AccountInbox {
+        created_at.saturating_add(transport_nostr_adapter::NIP59_TIMESTAMP_TWEAK_SECS)
+    } else {
+        created_at
+    }
 }
 
 /// What one omission charges to the current loss generation.
@@ -340,9 +419,173 @@ impl AccountDeliveryOverflowState {
             .fetch_max(depth, Ordering::Relaxed);
     }
 
-    fn begin_spill(&self) {
+    /// Decide where one delivery goes, under the lock every cursor commit
+    /// decides under. A full queue, or a key below the durable floor and not
+    /// below the settled one, sends it to the spill, or to loss when there is
+    /// none. Before the first settled cursor every key below the durable
+    /// floor goes there. A spilled delivery is counted in the cursor fence
+    /// here, before the hand-off holds it, so no commit can pass it while it
+    /// is in neither place.
+    fn place(
+        &self,
+        epoch: u64,
+        key: u64,
+        queue_full: bool,
+        spill: bool,
+    ) -> AccountDeliveryPlacement {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        state.spill_in_flight = state.spill_in_flight.saturating_add(1);
+        let admission = &mut state.admission;
+        let below_durable_floor = admission.durable_since.is_some_and(|durable| {
+            key < durable && admission.settled_since.is_none_or(|settled| settled <= key)
+        });
+        if !queue_full && !below_durable_floor {
+            if admission.epoch == epoch {
+                *admission.queued.entry(key).or_default() += 1;
+            }
+            return AccountDeliveryPlacement::Queue;
+        }
+        if spill {
+            state.spill_in_flight = state.spill_in_flight.saturating_add(1);
+            AccountDeliveryPlacement::Spill
+        } else {
+            AccountDeliveryPlacement::Omit
+        }
+    }
+
+    /// A delivery `place` queued never reached the queue: its send failed.
+    fn unqueue(&self, epoch: u64, key: u64) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        if admission.epoch == epoch {
+            admission.remove_queued(key);
+        }
+    }
+
+    /// The consumer took a queued delivery. It keeps its key, so it caps
+    /// every commit until the consumer releases it: until then its ingest may
+    /// still fail, and a restart must fetch it again. An event holds one key
+    /// at a time, so a redelivery of one whose ingest failed takes over the
+    /// pin that failure left.
+    fn take(&self, epoch: u64, key: u64, id: &MessageId) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        if admission.epoch != epoch {
+            return;
+        }
+        let spare = match admission.taken.get_mut(id) {
+            Some(held) => {
+                let spare = (*held).max(key);
+                *held = (*held).min(key);
+                spare
+            }
+            None => {
+                admission.taken.insert(id.clone(), key);
+                return;
+            }
+        };
+        admission.remove_queued(spare);
+    }
+
+    /// A taken delivery's ingest is durable, or its consumer dropped it on
+    /// purpose, so it no longer caps a commit.
+    fn release(&self, epoch: u64, id: &MessageId) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        if admission.epoch != epoch {
+            return;
+        }
+        if let Some(key) = admission.taken.remove(id) {
+            admission.remove_queued(key);
+        }
+    }
+
+    /// Start the generation of a new route's queue. The previous queue died
+    /// with its receiver, and nothing in it can be taken any more. Its
+    /// deliveries, and those its consumer took and never released, went with
+    /// it: the new route's subscriptions start from a cursor no commit moved
+    /// past them, so they fetch them again.
+    fn open_queue(&self) -> u64 {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        admission.epoch = admission.epoch.wrapping_add(1);
+        admission.queued.clear();
+        admission.taken.clear();
+        admission.epoch
+    }
+
+    /// How far a commit may promote the cursor, decided under the placement
+    /// lock: `candidate`, capped at the lowest key the persisted cursor still
+    /// covers of a delivery queued or taken and not yet released, plus the
+    /// lookback. `None` while loss or a spill hand-off is pending, and for a
+    /// replaced adapter, whose queue is not the one tracked here. The restart
+    /// floor rises here, before the commit's save starts, so any delivery
+    /// placed while that save runs and falls below it goes to the spill. A
+    /// settled commit moves the settled floor up once its save succeeds; a
+    /// live one leaves it, so its spilling continues.
+    fn seal_cursor(
+        &self,
+        epoch: u64,
+        lookback: Option<u64>,
+        candidate: Option<u64>,
+    ) -> Option<u64> {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if state.pending || state.spill_in_flight > 0 || state.admission.epoch != epoch {
+            return None;
+        }
+        let candidate = candidate?;
+        let Some(lookback) = lookback else {
+            // A full-history plane rebuilds unfloored, so no cursor can hide
+            // a delivery from a restart.
+            return Some(candidate);
+        };
+        let admission = &mut state.admission;
+        let covered = admission.durable_since.unwrap_or(0);
+        let cap = admission
+            .queued
+            .range(covered..)
+            .next()
+            .map(|(key, _)| key.saturating_add(lookback));
+        let reached = cap.map_or(candidate, |cap| candidate.min(cap));
+        let since = reached.saturating_sub(lookback);
+        admission.durable_since = Some(admission.durable_since.map_or(since, |d| d.max(since)));
+        Some(reached)
+    }
+
+    /// A commit's save failed, so `restored` is still the persisted cursor:
+    /// lower the restart floor its seal raised back to it. The router queues
+    /// what that floor covers again, and the next seal is capped by it.
+    /// Deliveries spilled meanwhile stay in the spill.
+    fn unseal_cursor(&self, lookback: Option<u64>, restored: Option<u64>) {
+        let Some(lookback) = lookback else {
+            return;
+        };
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        admission.durable_since = restored
+            .map(|restored| restored.saturating_sub(lookback))
+            .max(admission.settled_since);
+    }
+
+    /// Record a cursor that is durable without live promotion: one a settled
+    /// commit reached on its own, never one an earlier live promotion left
+    /// persisted, so the settled floor stays at or below where a design
+    /// without live promotion would have it. `opened` is the cursor the
+    /// account opened with: it seeds the settled floor only when this process
+    /// has none, because a reopened client inherits whatever live promotion an
+    /// earlier one made.
+    fn settle_cursor(&self, lookback: Option<u64>, reached: Option<u64>, opened: bool) {
+        let (Some(lookback), Some(reached)) = (lookback, reached) else {
+            return;
+        };
+        let since = reached.saturating_sub(lookback);
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        admission.durable_since = Some(admission.durable_since.map_or(since, |d| d.max(since)));
+        admission.settled_since = match admission.settled_since {
+            Some(settled) if opened => Some(settled),
+            Some(settled) => Some(settled.max(since)),
+            None => Some(since),
+        };
     }
 
     fn finish_spill(&self, settled: u64, stored: u64, already_seen: u64) {
@@ -849,12 +1092,14 @@ pub struct RelayPlaneHealth {
     /// High-water queue depth for any account since this plane started.
     #[serde(default)]
     pub account_delivery_max_queue_depth: u64,
-    /// Deliveries omitted from full per-account queues and covered by an
-    /// explicit recovery generation.
+    /// Deliveries neither queued nor spilled, and covered by an explicit
+    /// recovery generation instead.
     #[serde(default)]
     pub account_delivery_dropped: u64,
-    /// Deliveries a full queue stored in the durable account spill instead of
-    /// omitting.
+    /// Deliveries stored in the durable account spill instead of the queue:
+    /// because it was full, or because a transport-cursor checkpoint still
+    /// saving, or a live promotion alone, had put them below the floor a
+    /// restart fetches from.
     #[serde(default)]
     pub account_delivery_spilled: u64,
     /// Spill candidates discarded because the account had already seen them.
@@ -1044,11 +1289,15 @@ impl MarmotRelayPlane {
                 })
             })
             .clone();
+        // The route lock orders the new generation against the router, which
+        // reads a route's generation with the route itself.
+        let delivery_epoch = delivery_overflow.open_queue();
         let replaced = routes.insert(
             account_id.clone(),
             AccountDeliveryRoute {
                 sender: delivery_tx,
                 overflow: delivery_overflow.clone(),
+                epoch: delivery_epoch,
                 spill: spill_store.map(|store| {
                     delivery_spill::AccountDeliverySpill::new(
                         store,
@@ -1078,23 +1327,50 @@ impl MarmotRelayPlane {
             publish_client,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             delivery_overflow,
+            delivery_epoch,
             incremental_activation: Arc::new(Mutex::new(None)),
         }
     }
 
+    /// Queue a delivery past the router's placement, as an adapter/engine
+    /// disagreement would. It still counts in the queue's restart floor.
     #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) async fn inject_delivery_for_test(&self, delivery: TransportDelivery) -> bool {
         let sender = account_deliveries_read(&self.inner.transport.account_deliveries)
             .get(&delivery.account_id)
             .cloned();
         match sender {
-            Some(route) => route
-                .sender
-                .send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
-                .await
-                .is_ok(),
+            Some(route) => {
+                let key = account_delivery_restart_key(&delivery);
+                {
+                    let mut state = route
+                        .overflow
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if state.admission.epoch == route.epoch {
+                        *state.admission.queued.entry(key).or_default() += 1;
+                    }
+                }
+                let sent = route
+                    .sender
+                    .send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
+                    .await
+                    .is_ok();
+                if !sent {
+                    route.overflow.unqueue(route.epoch, key);
+                }
+                sent
+            }
             None => false,
         }
+    }
+
+    /// Place one delivery exactly as the router does, synchronously, so a
+    /// test can land it at a chosen point inside a cursor commit.
+    #[cfg(test)]
+    pub(crate) fn route_account_delivery_for_test(&self, delivery: TransportDelivery) {
+        route_account_delivery(&self.inner.transport, delivery);
     }
 
     pub(crate) fn sanitize_relay_endpoints(
@@ -1784,60 +2060,7 @@ impl MarmotRelayPlane {
         let adapter = transport.adapter.clone();
         let handle = handle.spawn(async move {
             while let Ok(Some(delivery)) = adapter.receive().await {
-                let sender = account_deliveries_read(&transport.account_deliveries)
-                    .get(&delivery.account_id)
-                    .cloned();
-                if let Some(route) = sender {
-                    // Fan out without awaiting the per-account queue: a single
-                    // account whose receiver has stalled (full buffer) must not
-                    // block this shared router and back-pressure delivery for
-                    // every other account (and, upstream, the relay notification
-                    // pipeline). A full queue hands the delivery to the account's
-                    // durable spill. Only when that is full too does the delivery
-                    // join an explicit loss generation, using the one channel slot
-                    // reserved for its control record.
-                    let queue_depth = route
-                        .sender
-                        .max_capacity()
-                        .saturating_sub(route.sender.capacity());
-                    route.overflow.observe_queue_depth(queue_depth);
-                    if route.sender.capacity() <= 1 {
-                        let created_at = delivery.message.timestamp.0;
-                        let spilled = route
-                            .spill
-                            .as_ref()
-                            .is_some_and(|spill| spill.offer(delivery));
-                        if !spilled {
-                            omit_account_delivery(&route, Some(created_at));
-                        }
-                        continue;
-                    }
-                    match route
-                        .sender
-                        .try_send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
-                    {
-                        Ok(()) => {
-                            let queue_depth = route
-                                .sender
-                                .max_capacity()
-                                .saturating_sub(route.sender.capacity());
-                            route.overflow.observe_queue_depth(queue_depth);
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // Only this router writes the route, and it reserves
-                            // one control slot above, so reaching Full here
-                            // indicates a violated queue invariant rather than
-                            // ordinary backpressure.
-                            tracing::warn!(
-                                target: "marmot_app::relay_plane",
-                                method = "spawn_router",
-                                error_kind = "reserved_overflow_slot_unavailable",
-                                "account delivery queue invariant failed",
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {}
-                    }
-                }
+                route_account_delivery(&transport, delivery);
             }
         });
         *router = Some(handle);
@@ -3003,11 +3226,90 @@ impl MarmotRelayPlaneAccountAdapter {
 
     fn account_delivery_receive(&self, event: AccountDeliveryEvent) -> AccountDeliveryReceive {
         match event {
-            AccountDeliveryEvent::Delivery(delivery) => AccountDeliveryReceive::Delivery(delivery),
+            AccountDeliveryEvent::Delivery(delivery) => {
+                // Taken, it still caps every commit until its consumer
+                // releases it: a failed ingest's checkpoint must not pass it.
+                self.delivery_overflow.take(
+                    self.delivery_epoch,
+                    account_delivery_restart_key(&delivery),
+                    &delivery.message.id,
+                );
+                AccountDeliveryReceive::Delivery(delivery)
+            }
             AccountDeliveryEvent::Overflow { generation } => {
                 AccountDeliveryReceive::Overflow(self.delivery_overflow.consume_signal(generation))
             }
         }
+    }
+
+    fn cursor_lookback_secs(&self) -> Option<u64> {
+        self.relay_plane.subscription_rebuild_lookback_secs()
+    }
+
+    /// How far a commit may promote the transport cursor, decided under the
+    /// router's placement lock: at most `candidate`, and never past a
+    /// delivery still queued, or taken and not yet released, that the
+    /// persisted cursor still lets a restart fetch. `None` while loss or a
+    /// spill hand-off is pending. The caller persists the larger of this and
+    /// its current cursor. The restart floor rises here, before the commit's
+    /// save runs, so a delivery that arrives during that save and falls below
+    /// it is spilled rather than queued.
+    pub(crate) fn seal_transport_cursor(&self, candidate: Option<u64>) -> Option<u64> {
+        self.delivery_overflow.seal_cursor(
+            self.delivery_epoch,
+            self.cursor_lookback_secs(),
+            candidate,
+        )
+    }
+
+    /// The delivery of event `id` no longer needs a restart to fetch it: its
+    /// ingest is durable, or its consumer dropped it on purpose, as a
+    /// duplicate or as input the account keeps no trace of by design. Its
+    /// consumer calls this before the save that follows, so a committed
+    /// delivery never holds the cursor back. A delivery whose ingest failed
+    /// is never released: it caps every commit until a redelivery of the
+    /// same event is released or its queue generation ends. An event this
+    /// queue holds no pin for, such as one read back from the spill, has
+    /// nothing to release.
+    pub(crate) fn release_account_delivery(&self, id: &MessageId) {
+        self.delivery_overflow.release(self.delivery_epoch, id);
+    }
+
+    /// A sealed commit's save failed and `restored` is still the persisted
+    /// cursor. Undo the floor its seal raised.
+    pub(crate) fn unseal_transport_cursor(&self, restored: Option<u64>) {
+        self.delivery_overflow
+            .unseal_cursor(self.cursor_lookback_secs(), restored);
+    }
+
+    /// A settled commit (a drain checkpoint, settled loss or a retired
+    /// notice) saved what its seal reached, so the settled floor rises to it
+    /// and the router stops spilling below. `reached` is what the seal
+    /// returned, not the cursor the commit persisted, which may be an earlier
+    /// live promotion's. A live commit never settles.
+    pub(crate) fn settle_transport_cursor(&self, reached: Option<u64>) {
+        self.delivery_overflow
+            .settle_cursor(self.cursor_lookback_secs(), reached, false);
+    }
+
+    /// Record the cursor the account opened with.
+    pub(crate) fn open_transport_cursor(&self, persisted: Option<u64>) {
+        self.delivery_overflow
+            .settle_cursor(self.cursor_lookback_secs(), persisted, true);
+    }
+
+    /// Whether the account has a settled cursor floor: the one it opened
+    /// with, or one a drain checkpoint, settled loss or retired notice made
+    /// durable. Only the account worker settles, so this cannot change
+    /// between the worker's read and its next seal.
+    pub(crate) fn transport_cursor_settled(&self) -> bool {
+        self.delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admission
+            .settled_since
+            .is_some()
     }
 
     /// Process-local overflow evidence becomes visible at the exact omission,
@@ -3251,6 +3553,83 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             )),
             None => Ok(None),
         }
+    }
+}
+
+/// Hand one delivery to its account without awaiting the account queue: a
+/// single account whose receiver has stalled (full buffer) must not block the
+/// shared router and back-pressure delivery for every other account (and,
+/// upstream, the relay notification pipeline).
+///
+/// A full queue hands the delivery to the account's durable spill, and so
+/// does a delivery that a transport-cursor checkpoint still saving, or a live
+/// promotion alone, stopped a restart from fetching again: the queue never
+/// holds one of those. Only when the spill cannot take it does the delivery
+/// join an explicit loss generation, using the one channel slot reserved for
+/// its control record.
+fn route_account_delivery(transport: &RelayPlaneTransport, delivery: TransportDelivery) {
+    let Some(route) = account_deliveries_read(&transport.account_deliveries)
+        .get(&delivery.account_id)
+        .cloned()
+    else {
+        return;
+    };
+    let queue_depth = route
+        .sender
+        .max_capacity()
+        .saturating_sub(route.sender.capacity());
+    route.overflow.observe_queue_depth(queue_depth);
+    let created_at = delivery.message.timestamp.0;
+    let key = account_delivery_restart_key(&delivery);
+    match route.overflow.place(
+        route.epoch,
+        key,
+        route.sender.capacity() <= 1,
+        route.spill.is_some(),
+    ) {
+        AccountDeliveryPlacement::Queue => {
+            match route
+                .sender
+                .try_send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
+            {
+                Ok(()) => {
+                    let queue_depth = route
+                        .sender
+                        .max_capacity()
+                        .saturating_sub(route.sender.capacity());
+                    route.overflow.observe_queue_depth(queue_depth);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    route.overflow.unqueue(route.epoch, key);
+                    // Only this router writes the route, and it reserves one
+                    // control slot above, so reaching Full here indicates a
+                    // violated queue invariant rather than ordinary
+                    // backpressure.
+                    tracing::warn!(
+                        target: "marmot_app::relay_plane",
+                        method = "route_account_delivery",
+                        error_kind = "reserved_overflow_slot_unavailable",
+                        "account delivery queue invariant failed",
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    route.overflow.unqueue(route.epoch, key);
+                }
+            }
+        }
+        AccountDeliveryPlacement::Spill => {
+            let spilled = route
+                .spill
+                .as_ref()
+                .is_some_and(|spill| spill.offer(delivery));
+            if !spilled {
+                // Record the loss before releasing the placement's fence, so
+                // the cursor stays fenced throughout.
+                omit_account_delivery(&route, Some(created_at));
+                route.overflow.finish_spill(1, 0, 0);
+            }
+        }
+        AccountDeliveryPlacement::Omit => omit_account_delivery(&route, Some(created_at)),
     }
 }
 

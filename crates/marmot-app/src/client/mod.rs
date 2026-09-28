@@ -336,6 +336,17 @@ pub(crate) struct GroupRouteRefresh {
     pub(crate) state_pruned: bool,
 }
 
+/// Where [`AppClient::cursor_seal_probe`] runs relative to a seal.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorSeal {
+    Before,
+    After,
+}
+
+#[cfg(test)]
+pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
+
 pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
@@ -441,11 +452,24 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
-    /// Last transport cursor promoted by a completed drain checkpoint. Live
-    /// one-at-a-time worker ingests may advance `state` for diagnostics, but
-    /// they persist this older safe floor until a drain has observed any
-    /// process-local overflow fence/control record.
+    /// The transport cursor every save persists. `state` holds the ingested
+    /// maximum; this moves only through a seal under the router's placement
+    /// lock: at a drain checkpoint or settled loss, or with a live ingest's
+    /// own save once every subscription finished replaying stored history
+    /// and the account has a settled cursor floor.
+    /// The seal never passes a delivery that is queued, or taken and not yet
+    /// durably ingested, when a restart would then no longer fetch it, and
+    /// the router spills an arrival that falls below the floor it raised:
+    /// during the commit's save, and after a live one.
     pub(crate) checkpointed_transport_timestamp: Option<u64>,
+    /// Runs at every transport-cursor seal, before and after, so a test can
+    /// land a delivery on either side of the decision.
+    #[cfg(test)]
+    pub(crate) cursor_seal_probe: std::sync::Mutex<Option<CursorSealProbe>>,
+    /// Fail the next ingest of this event before the engine sees it, as a
+    /// storage or engine error would.
+    #[cfg(test)]
+    pub(crate) fail_ingest_of: Option<cgka_traits::MessageId>,
     /// Durable account-wide marker set when the bounded relay-plane queue
     /// omits a delivery. While true, every subscription rebuild is unfloored
     /// and EOSE-gated recovery must complete before the cursor is trusted.
