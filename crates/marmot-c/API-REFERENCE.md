@@ -4962,4 +4962,3 @@ Configure or disable the dedicated v5 OTLP sender in memory. To enable, supply a
 
 </details>
 
-
