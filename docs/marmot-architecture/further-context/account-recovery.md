@@ -44,13 +44,16 @@ The simulator comes first; Jeff validates on a phone.
      disposed.
    - That window must cover the obligation's whole goal. A queue-loss goal starts at the
      earliest `created_at` among the deliveries it lost. The router and the spill know each
-     delivery when they drop or discard it, so they record that bound with the loss
-     evidence. Step 2 adds it to the evidence row. Neither the checkpoint nor the live
-     subscription floor is a bound: each subscription keeps the `since` it was built with,
-     which can be far older than the current checkpoint.
+     delivery's wire `created_at` when they drop or discard it. Step 2 keeps a running
+     minimum per loss generation over every delivery charged to it, written in the same
+     durable update as the count. That covers the router's marker write and the
+     transaction that deletes a spill row and records its loss. A later drop can carry an
+     earlier `created_at`, for example an inbox wrap tweaked by NIP-59. Neither the
+     checkpoint nor the live subscription floor is a bound: each subscription keeps the
+     `since` it was built with, which can be far older than the current checkpoint.
    - Loss with no known bound has an unbounded goal. That covers SDK notification lag, an
-     undecodable spill row, and an epoch gap whose commit time is unknown. So does a goal
-     that reaches below the retained-inventory floor. None of these can be certified by
+     undecodable spill row, count-only rows written before step 2, and an epoch gap whose
+     commit time is unknown. So does a goal that reaches below the retained-inventory floor. None of these can be certified by
      comparison, although the comparison still fetches every difference inside the window.
      Such an obligation completes only on its own evidence, for example the missing epoch
      arriving, or it parks for explicit deep repair.
@@ -64,7 +67,9 @@ The simulator comes first; Jeff validates on a phone.
    are the whitenoise.chat relays we operate, and NIP-77 is a hard requirement for group
    relays from now on. The account inbox route requires the account's inbox relays. An
    empty required set never certifies a scope. A required relay that does not support NIP-77
-   leaves its scope waiting for that capability; the scope does not complete vacuously.
+   cannot certify its scope. That attempt counts toward the no-progress budget, so the
+   obligation parks for explicit deep repair instead of waiting indefinitely or completing
+   vacuously.
    Treating relays we do not operate as best-effort needs a configured set of operated
    relays. Until one exists, every relay on a route is required.
 4. Both implementation steps land before the next MarmotKit release.
@@ -197,8 +202,10 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 - Forward-only migration 0096 adds the spill table: event ID unique, payload, metadata
   blob with a format version, size, retry attempts and retry time.
-- Step 2 adds a nullable earliest-`created_at` bound to `account_delivery_loss_evidence`.
-  Existing rows have no bound, so their goals stay unbounded.
+- Step 2 adds a nullable earliest-`created_at` bound to `account_delivery_loss_evidence`,
+  kept as a running minimum with the count. Count-only rows written before step 2 have no
+  bound, so their goals stay unbounded; new loss always records one when the delivery is
+  known.
 - Existing pending QueueLoss, notification-loss, epoch-gap, incremental and explicit rows
   run on the new path as unknown-scope comparisons.
 - Tables that no code reads any more are dropped in a later migration, once their rows have
