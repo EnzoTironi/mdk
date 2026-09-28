@@ -56,6 +56,10 @@
   zeros. Only local signing-key files are still zeroed, and their reader now re-reads
   instead of parsing a replaced key file.
 
+- Keep conversation-window commands usable across content-only replacements
+  and report a stale window when an older visible-anchor quote names a row
+  dropped by a background replacement. (#2052)
+
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay
   until a newer event replaces them. (#1973)
