@@ -2125,16 +2125,60 @@ impl AppClient {
     pub(crate) async fn receive_next_delivery(
         &mut self,
     ) -> Result<crate::relay_plane::AccountDeliveryReceive, AppError> {
+        use crate::relay_plane::AccountDeliveryWait;
         loop {
-            let Some(received) = self.adapter.receive_account_delivery().await? else {
-                if let Some(loss) = self
-                    .adapter
-                    .unpersisted_notification_loss()
-                    .or_else(|| self.adapter.pending_delivery_overflow())
-                {
-                    self.observe_delivery_overflow(loss)?;
-                }
-                return Err(AppError::TransportClosed);
+            // Spilled rows that became queue loss are already durable and
+            // fence the cursor. Report them as an overflow, so every caller
+            // starts the same recovery it runs for a router omission.
+            if self.delivery_spill.take_recorded_loss() {
+                return Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(
+                    crate::relay_plane::AccountDeliveryOverflow {
+                        marker_token: self
+                            .delivery_overflow_recovery_marker_token
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                ));
+            }
+            // A spilled backlog is always ready. Yield before taking a row, so
+            // the worker's lower-priority arms still run between deliveries,
+            // and cancellation here loses nothing.
+            if self.delivery_spill.pending() {
+                tokio::task::yield_now().await;
+            }
+            let received = match self.take_ready_delivery()? {
+                Some(received) => received,
+                None if self.delivery_spill.loss_recorded() => continue,
+                None => match match self.spill_retry_wait() {
+                    // Wake for a deferred spilled row even when nothing else
+                    // arrives; a directly owned client has no other timer.
+                    Some(delay) => match tokio::time::timeout(
+                        delay,
+                        self.adapter.receive_account_delivery_or_spill(),
+                    )
+                    .await
+                    {
+                        Ok(woke) => woke,
+                        Err(_) => continue,
+                    },
+                    None => self.adapter.receive_account_delivery_or_spill().await,
+                } {
+                    AccountDeliveryWait::Received(received) => received,
+                    AccountDeliveryWait::SpillReady => {
+                        self.note_spill_ready();
+                        continue;
+                    }
+                    AccountDeliveryWait::Closed => {
+                        if let Some(loss) = self
+                            .adapter
+                            .unpersisted_notification_loss()
+                            .or_else(|| self.adapter.pending_delivery_overflow())
+                        {
+                            self.observe_delivery_overflow(loss)?;
+                        }
+                        return Err(AppError::TransportClosed);
+                    }
+                },
             };
             let delivery = match received {
                 crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) => delivery,
@@ -2148,6 +2192,7 @@ impl AppClient {
             let event_id = hex::encode(delivery.message.id.as_slice());
             if self.transport_receipts()?.contains(&event_id) {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
+                self.settle_spilled_delivery();
                 continue;
             }
             return Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(
@@ -2196,6 +2241,16 @@ impl AppClient {
     }
 
     async fn ingest_received_delivery_inner(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {
+        // A spilled delivery gets exactly the live path's one ingest attempt.
+        let result = self.ingest_received_delivery_once(delivery).await;
+        self.settle_spilled_delivery();
+        result
+    }
+
+    async fn ingest_received_delivery_once(
         &mut self,
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {

@@ -69,6 +69,7 @@ use crate::{
 mod audit;
 mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
+mod delivery_spill;
 pub(crate) mod epoch_stall;
 mod invite_recovery;
 mod projection;
@@ -452,6 +453,8 @@ pub struct AppClient {
     /// and EOSE-gated recovery must complete before the cursor is trusted.
     pub(crate) delivery_overflow_recovery_pending: bool,
     pub(crate) delivery_overflow_recovery_marker_token: Option<u64>,
+    /// Durable overflow rows awaiting admission through the live ingest path.
+    pub(crate) delivery_spill: delivery_spill::DeliverySpillReader,
     /// Unit-test fault injection for the account-open replay path. This keeps
     /// the live protocol group intact while exercising a missing best-effort
     /// app projection.

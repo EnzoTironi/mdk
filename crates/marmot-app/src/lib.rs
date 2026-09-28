@@ -1808,6 +1808,7 @@ impl MarmotApp {
             checkpointed_transport_timestamp,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
+            delivery_spill: Default::default(),
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
@@ -3847,10 +3848,27 @@ impl MarmotApp {
                         }
                     })
             });
+        let spill_storage = self.account_storage(label)?;
+        let spill_store: relay_plane::AccountDeliverySpillStore = Arc::new(move |deliveries| {
+            spill_storage
+                .spill_account_deliveries(
+                    deliveries,
+                    relay_plane::ACCOUNT_DELIVERY_SPILL_LIMITS,
+                    unix_now_seconds(),
+                )
+                .map_err(|error| {
+                    if error.is_closed() {
+                        relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                    } else {
+                        relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                    }
+                })
+        });
         let adapter = relay_plane.account_adapter_with_recovery_marker(
             account_id.clone(),
             publish_client,
             Some(recovery_marker),
+            Some(spill_store),
         );
 
         let key_packages = AppKeyPackagePublisher {
