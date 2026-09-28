@@ -310,7 +310,9 @@ async fn setup(subject: &mut AppRuntimeHarness, clients: &[String]) -> TestResul
     tokio::time::sleep(Duration::from_secs(5)).await;
     subject.set_online("bob", false).await?;
     // The relays keep withholding the later messages for the rest of the run,
-    // so the final timeline can only come from what bob retained.
+    // so the final timeline can only come from what bob retained. The relay
+    // changes presence only while every participant is offline.
+    subject.set_online("alice", false).await?;
     for index in 0..LATER_MESSAGES {
         let later = ScenarioMessageSelectorV2 {
             action_id: Some(format!("gap-later-{index:02}")),
@@ -319,6 +321,7 @@ async fn setup(subject: &mut AppRuntimeHarness, clients: &[String]) -> TestResul
         subject.set_relay_event_visibility("relay:shared", &later, &[], false)?;
     }
     subject.set_relay_event_visibility("relay:shared", &selector, &[], true)?;
+    subject.set_online("alice", true).await?;
     note(
         started,
         "gap commit restored; later messages withheld; bob stopped",
