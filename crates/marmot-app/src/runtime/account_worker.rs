@@ -2544,6 +2544,7 @@ async fn run_app_runtime_account_worker(
                         // backoff as well as before hydrating its replacement;
                         // this leaves room for a one-shot client during a
                         // prolonged transport outage.
+                        let transport_account = client.adapter.account_id().clone();
                         drop(client);
                         client = loop {
                             let reconnect_wait = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReconnectWait);
@@ -2623,7 +2624,12 @@ async fn run_app_runtime_account_worker(
                             let reopened_result = tokio::select! {
                                 _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
                                 _ = &mut shutdown => break 'worker,
-                                result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
+                                result = async {
+                                    // The reopened session registers a new signer,
+                                    // so retire the previous session's SDK context.
+                                    relay_plane.retire_account_session_transport(&transport_account).await;
+                                    app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()).await
+                                } => result,
                             };
                             reopen.finish_app(&reopened_result);
                             match reopened_result {

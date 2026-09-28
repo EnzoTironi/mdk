@@ -14,6 +14,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `relay_repair` pointer; regenerate and recompile with the matching header
   and library. The preview is non-publishing, and `ManualReview` has no
   approvable action.
+- `marmot_edit_local_message_with_client_token` durably queues a revision of a
+  token-aware local text or reply. It returns local acceptance before delivery;
+  use `marmot_local_send_status` and the matching generated header/library.
+
 - Stateless `marmot_verify_public_nostr_event_json` C API backed by the same
   Nostr/libsecp256k1 verifier as the UniFFI bindings. It checks canonical event
   IDs and signatures without client state, and requires the matching regenerated
