@@ -72,9 +72,10 @@ The simulator comes first; Jeff validates on a phone.
    relays from now on. The account inbox route requires the account's inbox relays. An
    empty required set never certifies a scope. A required relay that does not support NIP-77
    cannot certify its scope, so the scope never completes on the relays that do.
-   Acquisition keeps admitting what the supporting relays still hold. An attempt counts
-   toward the no-progress budget only when it admits nothing new, so three quiet attempts
-   park the obligation instead of it waiting indefinitely or completing vacuously. Nothing
+   Acquisition keeps admitting what the supporting relays still hold. The decision 1
+   budget applies unchanged: the obligation parks after three completed attempts in a row
+   that admit nothing new and certify nothing, and an attempt that admits a batch resets
+   that streak. It neither waits indefinitely nor completes vacuously. Nothing
    closes a parked scope without qualified coverage and durable admission. EOSE from an
    unfloored replay is not enough, because the SDK can suppress an event it saw but the
    account never admitted, and an unreachable required relay proves nothing. The only
@@ -117,10 +118,10 @@ NIP-77 comparison covers what remains.
   already holds therefore fills neither the spill nor the network.
 - A delivery that misses the hand-off or spill limits becomes queue loss, as today: the
   cursor stays fenced until recovery settles that loss, and live input keeps flowing.
-- A spilled event counts as retained for cursor safety once its write is durable. The live
-  cursor passes an event only after it is admitted or durably spilled. Pending queue loss
-  holds the cursor fence until recovery settles the obligation. Deliveries already in hand
-  keep flowing, because the fence is on the subscription cursor.
+- The cursor fence stays up while a hand-off is in flight or queue loss is pending. It
+  releases when that hand-off settles as already seen, when its spill write is durable, or
+  when recovery settles the pending loss. Deliveries already in hand keep flowing, because
+  the fence is on the subscription cursor.
 - While spilled rows remain, the worker alternates them with live deliveries, and yields
   between them, so neither a busy live queue nor a large spill starves the other. Order is
   not guaranteed; the engine already handles reordered input (deferral and retained input).
@@ -168,7 +169,8 @@ The worker never awaits the network. There is one recovery job per account.
 Rules kept from the current design: complete coverage with a still-stuck engine means no
 replay; the blocked reason is recorded; the existing one-shot wedge report still escalates
 after three distinct local observations and starts no acquisition. That report is separate
-from decision 1's budget, which parks an obligation after three passes without progress.
+from decision 1's budget, which parks an obligation after three completed attempts in a
+row that admit nothing new and certify nothing.
 
 NIP-77 cost scales with the difference, not the set size, so comparing the whole retained
 window is cheap once we are caught up.
@@ -203,19 +205,23 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Post-join maintenance subscriptions. These are unchanged here and revisited later: they
   are also a full-history request.
 - The #1946 rule that recovery debt is never evicted. Spill rows are capped; unresolved loss
-  is not. Every unresolved loss generation and every parked obligation stays until qualified
-  completion or an explicit deep repair, with no fixed row cap, as
-  [runtime-state-bounds.md](../runtime-state-bounds.md) records. A cap on that debt would
-  need its own reviewed retirement rule.
+  is not. Every unresolved loss generation and every parked obligation stays, with no fixed
+  row cap, until qualified completion (an explicit deep repair counts only when it achieves
+  that coverage) or an explicit user-authorized retirement, which is recorded as "history
+  may be incomplete" rather than as coverage.
+  [runtime-state-bounds.md](../runtime-state-bounds.md) records the no-cap rule for
+  qualified completion; step 2 adds the retirement ending there when it implements it. A
+  cap on that debt would need its own reviewed retirement rule.
 
 ## Storage
 
 - Forward-only migration 0096 adds the spill table: event ID unique, payload, metadata
   blob with a format version, size, retry attempts and retry time.
 - Step 2 adds a nullable earliest-`created_at` bound to `account_delivery_loss_evidence`,
-  kept as a running minimum with the count. Count-only rows written before step 2 have no
-  bound, so their goals stay unbounded; new loss always records one when the delivery is
-  known.
+  kept as a running minimum with the count. A charge with no known `created_at`, such as an
+  undecodable row, sets the generation's bound to unknown for good, so it cannot keep an
+  earlier minimum. Count-only rows written before step 2 are unknown too, so their goals
+  stay unbounded.
 - Existing pending QueueLoss, notification-loss, epoch-gap, incremental and explicit rows
   run on the new path as unknown-scope comparisons.
 - Tables that no code reads any more are dropped in a later migration, once their rows have
