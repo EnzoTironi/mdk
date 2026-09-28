@@ -42,14 +42,18 @@ The simulator comes first; Jeff validates on a phone.
    - Unknown-scope loss completes when every *required* relay finished an untruncated NIP-77
      comparison over the frozen window, and every difference was admitted or terminally
      disposed.
-   - That window must cover the obligation's whole goal. A queue or notification loss goal
-     starts at the live subscription floor, minus the NIP-59 overlap on the inbox route.
-     Pending loss holds the cursor fence, so the current checkpoint floor is a safe lower
-     bound. A goal that reaches below the retained-inventory floor, or has no lower bound
-     (an epoch gap whose commit time is unknown), cannot be certified by comparison. The
-     comparison still fetches every difference inside the window. The obligation completes
-     only on its own evidence, for example the missing epoch arriving, or it parks for
-     explicit deep repair.
+   - That window must cover the obligation's whole goal. A queue-loss goal starts at the
+     earliest `created_at` among the deliveries it lost. The router and the spill know each
+     delivery when they drop or discard it, so they record that bound with the loss
+     evidence. Step 2 adds it to the evidence row. Neither the checkpoint nor the live
+     subscription floor is a bound: each subscription keeps the `since` it was built with,
+     which can be far older than the current checkpoint.
+   - Loss with no known bound has an unbounded goal. That covers SDK notification lag, an
+     undecodable spill row, and an epoch gap whose commit time is unknown. So does a goal
+     that reaches below the retained-inventory floor. None of these can be certified by
+     comparison, although the comparison still fetches every difference inside the window.
+     Such an obligation completes only on its own evidence, for example the missing epoch
+     arriving, or it parks for explicit deep repair.
    - Otherwise, after **3 completed attempts that make no progress**, the obligation parks.
      It shows "history may be incomplete" and offers an explicit deep repair. There are no
      further automatic retries.
@@ -193,6 +197,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 - Forward-only migration 0096 adds the spill table: event ID unique, payload, metadata
   blob with a format version, size, retry attempts and retry time.
+- Step 2 adds a nullable earliest-`created_at` bound to `account_delivery_loss_evidence`.
+  Existing rows have no bound, so their goals stay unbounded.
 - Existing pending QueueLoss, notification-loss, epoch-gap, incremental and explicit rows
   run on the new path as unknown-scope comparisons.
 - Tables that no code reads any more are dropped in a later migration, once their rows have
@@ -230,10 +236,13 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Truncated comparisons. The whitenoise relays' own match-set cap is 5,000,000, so the
   adapter's request limit is the binding one. `NostrReconciliationSummary` reports only
   aggregate relay success and failure, with no truncation outcome. The adapter therefore
-  asks for one item more than the inventory cap (16,385). A relay set that fills that limit
-  may be truncated, so that endpoint counts as failed and cannot certify the route. A set of
-  at most 16,384 is complete, including a busy route that sits exactly on the cap, and can
-  certify it. A per-relay truncation flag from the fork would replace this inference.
+  asks for one item more than the inventory cap (16,385). It reconstructs each endpoint's
+  relay-side set size from the SDK sync summary: local items in the window, minus the
+  local-only IDs, plus the remote-only IDs. The remote difference alone is not that set.
+  An endpoint whose set fills the limit may be truncated, so it counts as failed and cannot
+  certify the route. A set of at most 16,384 is complete, including a busy route that sits
+  exactly on the cap, and can certify it. A per-relay truncation flag from the fork would
+  replace this inference.
 - Recovery audit event meanings change. The audit-v5 agents pick this up after step 2.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.
