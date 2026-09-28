@@ -628,7 +628,12 @@ fn targets(report: &Value) -> Value {
             .sum::<u64>()
     };
     let held = total(&report["relays"], "held_history_frames");
-    let commit = total(&report["relays"], "missing_commit_frames");
+    let commit_by_relay = report["relays"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|relay| relay["missing_commit_frames"].as_u64().unwrap_or(0))
+        .collect::<Vec<_>>();
     let idle = total(&report["idle_window"]["relays"], "event_frames");
     let visible = report["live_visibility_ms"]["not_visible"] == 0;
     let recovered = report["recovery"]["completed"] == true;
@@ -654,8 +659,8 @@ fn targets(report: &Value) -> Value {
         target("no re-download of held history", held == 0, json!(held)),
         target(
             "missing commit fetched at most once per relay",
-            recovered && commit <= 2,
-            json!(commit)
+            recovered && commit_by_relay.iter().all(|frames| *frames <= 1),
+            json!(commit_by_relay)
         ),
         target("no EVENT downloads while idle", idle == 0, json!(idle)),
     ])
