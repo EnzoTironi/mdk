@@ -1004,6 +1004,32 @@ impl MarmotRelayPlane {
         Ok(())
     }
 
+    /// Retire one account session's immutable SDK authenticator and its
+    /// notification forwarder before the same worker reopens that account. The
+    /// reopened session registers a new signer, which the SDK refuses while
+    /// the previous context is live. Keep the delivery route so the
+    /// replacement adapter inherits unresolved loss evidence.
+    pub(crate) async fn retire_account_session_transport(&self, account_id: &MemberId) {
+        let transport = self.inner.transport.clone();
+        let account_id = account_id.clone();
+        // Finish retirement even if the reopening worker is cancelled.
+        let retirement = tokio::spawn(async move {
+            let forwarder = transport
+                .account_notification_forwarders
+                .lock()
+                .await
+                .remove(&account_id);
+            if let Some(mut forwarder) = forwarder {
+                forwarder.abort();
+                let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut forwarder).await;
+            }
+            if let Some(sdk) = &transport.sdk_relay_client {
+                let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, sdk.remove_account(&account_id)).await;
+            }
+        });
+        let _ = retirement.await;
+    }
+
     /// Retire a stopped account worker's subscriptions and immutable SDK
     /// authenticator before a replacement worker can register a fresh signer.
     pub(crate) async fn deactivate_account_context(

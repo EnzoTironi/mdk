@@ -3251,3 +3251,68 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
         "count updates do not enqueue duplicate controls"
     );
 }
+
+/// Notification loss closes the account delivery route and the managed
+/// worker reopens its session. The reopened session registers a new signer
+/// with the SDK, which refuses while the previous immutable account context is
+/// live, so the worker must retire that context first. Otherwise every reopen
+/// fails and the account stays in reconnect backoff, where commands fail with
+/// `transport_closed`.
+#[tokio::test]
+async fn sdk_account_worker_reopens_after_notification_loss() {
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let alice = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = crate::MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(30), runtime.catch_up_accounts())
+        .await
+        .expect("initial catch-up finishes")
+        .unwrap();
+    let group = runtime
+        .create_group_with_options(
+            &alice.label,
+            "notification loss",
+            &[],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![url]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    runtime.group_members(&alice.label, &group).await.unwrap();
+
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_recovery_for_test(1);
+    // The first reconnect waits two seconds plus jitter; later ones double.
+    timeout(Duration::from_secs(20), async {
+        let mut reconnecting = false;
+        loop {
+            match runtime.group_members(&alice.label, &group).await {
+                Ok(_) if reconnecting => break,
+                Ok(_) => {}
+                Err(crate::AppError::TransportClosed) => reconnecting = true,
+                Err(error) => panic!("unexpected group read error: {error:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the reopened worker serves reads again");
+    timeout(Duration::from_secs(30), runtime.catch_up_accounts())
+        .await
+        .expect("the reopened worker catches up")
+        .unwrap();
+    runtime.shutdown().await;
+}
