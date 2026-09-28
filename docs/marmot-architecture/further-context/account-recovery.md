@@ -61,7 +61,8 @@ The simulator comes first; Jeff validates on a phone.
      arriving, or it parks for explicit deep repair.
    - Otherwise, after **3 completed attempts in a row that admit nothing new and certify
      nothing**, the obligation parks.
-     It shows "history may be incomplete" and offers an explicit deep repair. There are no
+     It shows "history may be incomplete" and offers an explicit deep repair, which can
+     still complete it with qualified coverage, or an explicit retirement. There are no
      further automatic retries.
    - Attempts that fail only because relays were unreachable do not count toward the budget.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
@@ -73,10 +74,12 @@ The simulator comes first; Jeff validates on a phone.
    cannot certify its scope, so the scope never completes on the relays that do.
    Acquisition keeps admitting what the supporting relays still hold. An attempt counts
    toward the no-progress budget only when it admits nothing new, so three quiet attempts
-   park the obligation instead of it waiting indefinitely or completing vacuously. A
-   completed explicit deep repair, an unfloored replay with EOSE coverage from every
-   reachable required relay, closes the parked scopes it covered without a NIP-77
-   certificate.
+   park the obligation instead of it waiting indefinitely or completing vacuously. Nothing
+   closes a parked scope without qualified coverage and durable admission. EOSE from an
+   unfloored replay is not enough, because the SDK can suppress an event it saw but the
+   account never admitted, and an unreachable required relay proves nothing. The only
+   other way out is an explicit, user-authorized retirement. It is recorded as a distinct
+   outcome ("history may be incomplete"), never as coverage.
    Treating relays we do not operate as best-effort needs a configured set of operated
    relays. Until one exists, every relay on a route is required.
 4. Both implementation steps land before the next MarmotKit release.
