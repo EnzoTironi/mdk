@@ -9,6 +9,33 @@
   profile edits also schedule indexer copies after account-relay acknowledgement;
   indexer latency does not delay account readiness or edit returns. Pending
   copies are cancelled on runtime shutdown or account removal.
+- Account recovery completes loss of unknown scope on NIP-77 comparison certificates. A
+  scope certifies when every required relay finished an untruncated comparison over a
+  window that covers the scope's whole goal and every difference was admitted. A queue-loss
+  goal starts at the earliest wire `created_at` among the deliveries it lost. A goal with no
+  known lower bound never certifies. Cold-start and incremental history compare the
+  retained 30-day inventory window. An epoch gap also completes once its group's local
+  epoch passes the stalled one. A relay whose compared set fills the request limit counts
+  as truncated and cannot certify. (#2068)
+- A recovery obligation parks once every route it still cannot certify has been compared
+  three times in a row for its goal with its required relays answering, and nothing was
+  admitted or certified. It then waits for new evidence or explicit repair. A comparison whose
+  required relay failed or timed out does not count; one that answered but could not fetch a
+  claimed event, or whose events were not durably admitted, does. New evidence, or durable
+  admission on a route, starts that route's count over. (#2068)
+- Every automatic recovery cause except maintenance boundaries, explicit repair and
+  known-event demand compares off the account worker. The worker then admits what the
+  comparison fetched a few events per turn, between commands and live input, and never
+  through the live delivery queue. Automatic recovery reuses the live subscriptions
+  instead of re-subscribing, so it no longer replays history the account already holds.
+  The separate online epoch-gap job is removed. (#2068)
+- Account recovery certifies a route on its operated relays only.
+  `MarmotAppConfig::recovery_operated_relays` names them and defaults to
+  `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`. A route that lists
+  none of them still certifies on all of the relays recovery can dial; a retired, unsafe or
+  over-cap relay is never required. The route's other relays are still
+  compared and their events admitted, but their failures never withhold completion or
+  schedule a retry. Changing the operated set rebuilds pending recovery scopes. (#2068)
 
 - A full account delivery queue now spills deliveries into the account database instead of
   dropping them. The worker admits spilled deliveries through the ordinary ingest path,
@@ -50,15 +77,33 @@
 
 ### Breaking changes
 
+- Remove `RecoveryExecutorMode` and `MarmotAppConfig::recovery_executor_mode`. The
+  conservative mode ran one recovery obligation per grant as a same-schema rollback
+  switch. The bindings and CLI never exposed it, and recovery now has one execution
+  path. Rust callers that set the field should delete it. (#2068)
 - `HostPerformanceOperation` and `RuntimePerformanceOperation` gain 28 shared and
   nine Linux-specific host stages. Downstream exhaustive Rust matches must handle
   the new variants. The snapshot struct layout is unchanged; stages appear in
   `runtime_operations`.
+- `MarmotAppEvent` gains `HistoryNoticesChanged { account_id_hex, account_label }`, and
+  `GroupRecoveryStatus` gains `history_may_be_incomplete` and `history_notice_ids` (both
+  serde-defaulted). Exhaustive Rust matches and struct literals must handle them. (#2068)
 
 ### Added
 
 - Route reviewed host stages through the existing runtime telemetry registry,
   including its fixed metric names and all five outcomes in snapshots and OTLP.
+- Surface parked recovery as "history may be incomplete". `MarmotAppRuntime::history_notices`
+  lists each parked occurrence as a `HistoryNotice` (opaque `notice_id`, `HistoryNoticeCause`,
+  optional group, parking time); a group's own occurrences also appear in
+  `GroupRecoveryStatus`. `dismiss_history_notice` runs on the account worker and durably retires
+  exactly that occurrence as its own outcome, never as coverage, returning false for a stale id.
+  Retiring the last pending loss obligation releases the transport-cursor fence without recording
+  a recovery success, and a late observation of retired loss releases it too instead of
+  re-raising it. A dismissed incremental-history notice stays dismissed: later startups still
+  compare, but parking again on the same routes and required relays raises no new notice.
+  `HistoryNoticesChanged` announces parking, un-parking and dismissal; a group whose own notices
+  changed also gets `GroupStateUpdated`. (#2068)
 
 ## 0.10.4 - 2026-09-20
 

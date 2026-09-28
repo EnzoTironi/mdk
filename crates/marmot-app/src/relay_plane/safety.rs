@@ -274,6 +274,44 @@ impl super::MarmotRelayPlaneAccountAdapter {
     }
 }
 
+/// Whether two endpoint spellings name the same relay. Parsing normalizes
+/// case and default ports, which a route's signed spelling may not.
+pub(crate) fn same_relay(left: &str, right: &str) -> bool {
+    left == right
+        || matches!(
+            (RelayUrl::parse(left.trim()), RelayUrl::parse(right.trim())),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
+/// The endpoints whose comparison certifies a recovery scope, chosen from the
+/// ones recovery may contact (`admitted`): the route's operated relays. Any
+/// other relay is best effort and never blocks completion. A route with no
+/// operated relay requires all of its admitted relays, so its history can
+/// still certify. A relay the plane refuses, such as a retired or unsafe
+/// host, or one past the per-route cap, is never compared and never required.
+pub(crate) fn recovery_required_endpoints(admitted: &[String], operated: &[String]) -> Vec<String> {
+    let operated = operated
+        .iter()
+        .filter_map(|relay| RelayUrl::parse(relay.trim()).ok())
+        .collect::<std::collections::HashSet<_>>();
+    let is_operated = |endpoint: &&String| {
+        RelayUrl::parse(endpoint.trim()).is_ok_and(|url| operated.contains(&url))
+    };
+    let mut required = if admitted.iter().any(|endpoint| is_operated(&endpoint)) {
+        admitted
+            .iter()
+            .filter(is_operated)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        admitted.to_vec()
+    };
+    required.sort();
+    required.dedup();
+    required
+}
+
 /// Require TLS for every public relay. Plaintext `ws://` is admitted only for
 /// an explicitly enabled loopback host; private/link-local/CGNAT and public
 /// plaintext endpoints stay rejected even with the dev flag. Relay
@@ -368,6 +406,10 @@ fn is_retired_relay_host(host: &Host<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(urls: &[&str]) -> Vec<String> {
+        urls.iter().map(|url| (*url).to_owned()).collect()
+    }
 
     fn endpoints(urls: &[&str]) -> Vec<TransportEndpoint> {
         urls.iter()
@@ -601,6 +643,75 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn same_relay_compares_parsed_identities() {
+        assert!(same_relay("wss://relay.example", "wss://relay.example"));
+        assert!(same_relay("wss://Relay.Example:443", "wss://relay.example"));
+        assert!(same_relay("wss://relay.example/", "wss://relay.example"));
+        assert!(!same_relay("wss://relay.example", "wss://other.example"));
+    }
+
+    #[test]
+    fn operated_relays_alone_certify_a_route_that_names_them() {
+        let operated = vec![
+            "wss://relay.eu.whitenoise.chat".to_owned(),
+            "wss://relay.us.whitenoise.chat/".to_owned(),
+        ];
+        assert_eq!(
+            recovery_required_endpoints(
+                &strings(&[
+                    "wss://relay.primal.net",
+                    "wss://relay.us.whitenoise.chat",
+                    "wss://nos.lol",
+                ]),
+                &operated,
+            ),
+            vec!["wss://relay.us.whitenoise.chat".to_owned()],
+            "an operated relay certifies in the route's own spelling; the rest are best effort"
+        );
+        assert_eq!(
+            recovery_required_endpoints(
+                &strings(&[
+                    "wss://relay.us.whitenoise.chat",
+                    "wss://relay.eu.whitenoise.chat"
+                ]),
+                &operated,
+            ),
+            vec![
+                "wss://relay.eu.whitenoise.chat".to_owned(),
+                "wss://relay.us.whitenoise.chat".to_owned(),
+            ]
+        );
+        assert_eq!(
+            recovery_required_endpoints(
+                &strings(&["wss://nos.lol", "wss://relay.primal.net"]),
+                &operated,
+            ),
+            vec![
+                "wss://nos.lol".to_owned(),
+                "wss://relay.primal.net".to_owned()
+            ],
+            "a route with no operated relay still certifies on all of its relays"
+        );
+        assert!(recovery_required_endpoints(&[], &operated).is_empty());
+    }
+
+    #[test]
+    fn a_relay_the_plane_refuses_is_never_required() {
+        // Required relays are chosen from the admitted ones, so a route with
+        // no operated relay can still certify on the relays recovery dials.
+        let policy = RelaySafetyPolicy::default();
+        let admitted = policy
+            .usable_group_endpoints(endpoints(&["wss://nos.lol", "wss://10.0.0.1"]), "test")
+            .into_iter()
+            .map(|endpoint| endpoint.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovery_required_endpoints(&admitted, &[]),
+            vec!["wss://nos.lol".to_owned()]
+        );
     }
 
     #[test]

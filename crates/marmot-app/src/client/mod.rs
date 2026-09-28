@@ -71,6 +71,7 @@ mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 mod delivery_spill;
 pub(crate) mod epoch_stall;
+pub(crate) mod history_notices;
 mod invite_recovery;
 mod projection;
 mod push;
@@ -83,16 +84,11 @@ use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 #[cfg(test)]
 pub(crate) use sync::TestComparisonActivityWitness;
-#[cfg(all(test, feature = "test-policy-overrides"))]
-pub(crate) use sync::TestRecoveryPhase;
-#[cfg(test)]
-pub(crate) use sync::TestRecoveryPhaseWitness;
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
-    ComparisonNetworkJob, ComparisonNetworkResult, ConvergenceScheduleState,
-    DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome, EpochGapQueueJob,
-    OnlineEpochGapRecovery, PendingRecoverySelection, RouteSubmission,
+    ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob, ConvergenceScheduleState,
+    EpochBackfillRunOutcome, PendingRecoverySelection,
 };
 
 #[cfg(test)]
@@ -344,8 +340,6 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
         Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
-    #[cfg(test)]
-    pub(crate) test_recovery_phase_witness: Option<TestRecoveryPhaseWitness>,
     pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
     pub(crate) audit_v5_peel_slot:
         Option<std::sync::Arc<std::sync::Mutex<audit_v5_probe::PeelSlot>>>,
@@ -396,6 +390,10 @@ pub struct AppClient {
     pub(crate) pending_group_projection_updates: HashSet<String>,
     /// Recovery status has its own notification queue; saving a projection must not consume it.
     pub(crate) pending_recovery_status_updates: HashSet<GroupId>,
+    /// The parked recovery set as last announced to hosts ("history may be
+    /// incomplete"): one small entry per parked occurrence, compared at each
+    /// publication seam so a change raises `HistoryNoticesChanged`.
+    pub(crate) history_notice_baseline: Option<history_notices::HistoryNoticeBaseline>,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.

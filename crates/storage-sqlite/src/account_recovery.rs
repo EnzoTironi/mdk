@@ -7,12 +7,15 @@ pub use demand::{
     RecoveryCause, RecoveryDemand, RecoveryDemandTicket, RecoveryPredicate, RecoveryRequest,
 };
 mod loss;
+mod notice;
 mod plan;
 mod stall;
 pub use loss::{RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
+pub use notice::ParkedRecoveryObligation;
 pub use plan::{
-    RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
-    RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
+    RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility, RecoveryEndpointCheckpoint,
+    RecoveryPassProgress, RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan,
+    RecoveryScopeToken, StoredRecoveryScope,
 };
 pub use stall::QualifiedRecoveryStallSample;
 
@@ -279,7 +282,7 @@ fn join_epoch_tx(
          VALUES (?1, 1, ?2, ?3, ?4, ?4)
          ON CONFLICT(demand_key) DO UPDATE SET
              stalled_epoch = MAX(stalled_epoch, excluded.stalled_epoch),
-             revision = revision + 1, state = 0, eligibility = 0,
+             revision = revision + 1, state = 0, eligibility = 0, incomplete_reason = NULL,
              updated_at_ms = excluded.updated_at_ms
          WHERE excluded.stalled_epoch > stalled_epoch OR ?5",
         params![key, group, epoch, milliseconds(now)?, released_input],
@@ -303,17 +306,20 @@ pub(crate) fn arm_overflow_tx(
     token: i64,
     dropped: i64,
     now: i64,
+    earliest_created_at: Option<u64>,
 ) -> StorageResult<()> {
     // Import may have joined this generation before its queued control record
     // reaches the worker. Changing the represented identity must fence old
-    // grants even though it grants no permission to reset quiescence.
+    // grants even though it grants no permission to reset quiescence. A
+    // retired obligation already covers every imported generation, so a late
+    // observation of one cannot reopen it; newer loss reopens it on import.
     let adopted = conn.execute_cached(
         "UPDATE account_recovery_obligations SET marker_token = ?2, revision = revision + 1, state = 0,
              dropped_count = (SELECT imported_count FROM account_delivery_loss_evidence
                  WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2),
              pending_since = (SELECT pending_since FROM account_delivery_loss_evidence
                  WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2)
-         WHERE demand_key = ?1 AND marker_token != ?2 AND EXISTS(
+         WHERE demand_key = ?1 AND marker_token != ?2 AND state != 2 AND EXISTS(
              SELECT 1 FROM account_delivery_loss_evidence
              WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2 AND imported_count >= ?3)",
         params![format!("overflow:{label}"), token, dropped, label],
@@ -329,17 +335,39 @@ pub(crate) fn arm_overflow_tx(
     }
     // Preserve what the worker already observed, even when this token's marker
     // callback has not committed yet. A delayed duplicate cannot rearm debt.
+    let (bound_state, bound_seconds) = loss_bound_values(earliest_created_at)?;
     conn.execute_cached(
-        "INSERT INTO account_delivery_loss_evidence
-         (account_label, cause, marker_token, pending_since, dropped_count, imported_count)
-         VALUES (?1, 0, ?2, ?3, ?4, ?4)
-         ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
-             dropped_count = MAX(dropped_count, excluded.dropped_count),
-             imported_count = MAX(COALESCE(imported_count, 0), excluded.imported_count)",
-        params![label, token, now, dropped],
+        &format!(
+            "INSERT INTO account_delivery_loss_evidence
+             (account_label, cause, marker_token, pending_since, dropped_count, imported_count,
+              bound_state, bound_seconds)
+             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?5, ?6)
+             ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
+                 dropped_count = MAX(dropped_count, excluded.dropped_count),
+                 imported_count = MAX(COALESCE(imported_count, 0), excluded.imported_count),
+                 {LOSS_BOUND_MERGE}"
+        ),
+        params![label, token, now, dropped, bound_state, bound_seconds],
     )
     .storage()?;
     Ok(())
+}
+
+/// Merges one charge into a generation's `created_at` bound: a running
+/// minimum while every charge is known, and unknown for good once one is not.
+/// SQLite evaluates each assignment against the row before the update.
+pub(crate) const LOSS_BOUND_MERGE: &str = "
+    bound_state = CASE WHEN bound_state = 1 AND excluded.bound_state = 1 THEN 1 ELSE 2 END,
+    bound_seconds = CASE WHEN bound_state = 1 AND excluded.bound_state = 1
+        THEN MIN(bound_seconds, excluded.bound_seconds) END";
+
+pub(crate) fn loss_bound_values(
+    earliest_created_at: Option<u64>,
+) -> StorageResult<(i64, Option<i64>)> {
+    Ok(match earliest_created_at {
+        Some(seconds) => (1, Some(sqlite_integer(seconds)?)),
+        None => (2, None),
+    })
 }
 
 fn join_loss_tx(
@@ -361,20 +389,26 @@ fn join_loss_tx(
         }
     };
     let key = format!("{prefix}:{label}");
+    // A retired obligation reopens only for loss its retirement did not
+    // cover: a generation it never saw, or a count above that generation's
+    // retired watermark. A delayed duplicate of retired loss changes nothing.
     let changed = conn.execute_cached(
         "INSERT INTO account_recovery_obligations
          (demand_key, cause, account_label, marker_token, pending_since, dropped_count, created_at_ms, updated_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
          ON CONFLICT(demand_key) DO UPDATE SET
-             revision = revision + 1, state = 0, eligibility = 0,
+             revision = revision + 1, state = 0, eligibility = 0, incomplete_reason = NULL,
              pending_since = CASE WHEN ?8 AND marker_token != excluded.marker_token
                  THEN excluded.pending_since ELSE MIN(pending_since, excluded.pending_since) END,
              dropped_count = CASE WHEN marker_token = excluded.marker_token THEN MAX(dropped_count, excluded.dropped_count)
                  WHEN ?8 THEN excluded.dropped_count ELSE dropped_count END,
              marker_token = CASE WHEN ?8 THEN excluded.marker_token ELSE marker_token END,
              updated_at_ms = excluded.updated_at_ms
-         WHERE marker_token != excluded.marker_token OR dropped_count < excluded.dropped_count",
-        params![key, demand_cause, label, token, now, dropped, milliseconds(now)?, adopt_token],
+         WHERE (marker_token != excluded.marker_token OR dropped_count < excluded.dropped_count)
+             AND (state != 2 OR NOT EXISTS(SELECT 1 FROM account_delivery_loss_evidence AS e
+                 WHERE e.account_label = ?3 AND e.cause = ?9 AND e.marker_token = ?4
+                     AND e.retired_count >= ?6))",
+        params![key, demand_cause, label, token, now, dropped, milliseconds(now)?, adopt_token, cause],
     ).storage()?;
     conn.execute_cached(
         "INSERT OR IGNORE INTO account_recovery_scopes(obligation_id, scope_id)
@@ -392,13 +426,15 @@ fn join_loss_tx(
 
 /// Token-only legacy retirement cannot certify other generations joined into
 /// the same account demand. Reconstitute those generations in this transaction;
-/// their imported watermark remains distinct from low-level retirement.
+/// their imported watermark remains distinct from low-level retirement. Loss
+/// the user already retired carries no debt and is not reconstituted.
 pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageResult<bool> {
     let rows = conn
         .prepare_cached(
             "SELECT marker_token,pending_since,dropped_count FROM account_delivery_loss_evidence
          WHERE account_label=?1 AND cause=0
            AND (legacy_retired_count IS NULL OR dropped_count>legacy_retired_count)
+           AND (retired_count IS NULL OR dropped_count>retired_count)
          ORDER BY marker_token",
         )
         .storage()?
@@ -700,12 +736,32 @@ impl SqliteAccountStorage {
         dropped_count: u64,
         observed_at_seconds: u64,
     ) -> StorageResult<()> {
-        self.record_account_recovery_loss(
+        self.record_account_delivery_loss_bounded(
+            label,
+            marker_token,
+            dropped_count,
+            observed_at_seconds,
+            None,
+        )
+    }
+
+    /// Like [`Self::record_account_delivery_loss`], also charging the earliest
+    /// wire `created_at` among the dropped deliveries, or an unknown time.
+    pub fn record_account_delivery_loss_bounded(
+        &self,
+        label: &str,
+        marker_token: u64,
+        dropped_count: u64,
+        observed_at_seconds: u64,
+        earliest_created_at: Option<u64>,
+    ) -> StorageResult<()> {
+        self.record_account_recovery_loss_bounded(
             label,
             RecoveryLossCause::Queue,
             marker_token,
             dropped_count,
             observed_at_seconds,
+            earliest_created_at,
         )
     }
 }

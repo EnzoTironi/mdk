@@ -64,6 +64,9 @@ pub struct StoredRecoveryScope {
     pub route_revision: u64,
     pub inventory_revision: u64,
     pub loss_revision: u64,
+    /// Quiet comparisons in a row for this goal; see
+    /// [`RECOVERY_PARK_AFTER_QUIET_PASSES`].
+    pub quiet_passes: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -82,6 +85,23 @@ pub struct RecoveryScopeCheckpoint {
     pub retained_known_event: bool,
 }
 
+/// Quiet comparisons in a row that each uncertified scope of an obligation
+/// needs, for its unchanged goal, before the obligation parks.
+pub const RECOVERY_PARK_AFTER_QUIET_PASSES: u64 = 3;
+
+/// What one comparison pass did for one compared scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryPassProgress {
+    /// It certified the scope or durably admitted fetched history.
+    Progressed,
+    /// The scope's required relays answered, and it certified nothing and
+    /// admitted nothing.
+    Quiet,
+    /// A required relay failed or timed out, or admission was refused. The
+    /// pass says nothing about the scope's history.
+    Unserved,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
 pub enum RecoveryEligibility {
@@ -96,7 +116,7 @@ pub enum RecoveryEligibility {
 #[serde(deny_unknown_fields)]
 pub(super) struct ScopePayloadV1 {
     pub(super) required_endpoints: Vec<String>,
-    admitted_endpoints: Vec<String>,
+    pub(super) admitted_endpoints: Vec<String>,
     checkpoints: Vec<RecoveryEndpointCheckpoint>,
     retained_known_event: bool,
     attempt_serial: u64,
@@ -104,6 +124,14 @@ pub(super) struct ScopePayloadV1 {
     pub(super) loss_revision: u64,
     pub(super) route_revision: u64,
     pub(super) inventory_revision: u64,
+    /// Comparisons of this scope in a row, for this goal, that answered and
+    /// neither certified nor admitted anything.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    quiet_passes: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn invalid_scope() -> StorageError {
@@ -126,17 +154,16 @@ fn encode_scope(payload: &ScopePayloadV1) -> StorageResult<Vec<u8>> {
     serde_json::to_vec(payload).map_err(|_| invalid_scope())
 }
 
+/// Required endpoints certify a scope; admitted endpoints are the ones its
+/// comparison may contact. Either may hold an endpoint the other lacks: a
+/// best-effort relay is admitted without being required, and a required
+/// relay the dial policy refuses is required without being admitted.
 fn validate_endpoints(required: &[String], admitted: &[String]) -> StorageResult<()> {
     let canonical = |values: &[String]| {
         values.iter().all(|value| !value.is_empty())
             && values.windows(2).all(|pair| pair[0] < pair[1])
     };
-    if !canonical(required)
-        || !canonical(admitted)
-        || admitted
-            .iter()
-            .any(|endpoint| required.binary_search(endpoint).is_err())
-    {
+    if !canonical(required) || !canonical(admitted) {
         return Err(invalid_scope());
     }
     Ok(())
@@ -148,12 +175,15 @@ fn validate_checkpoints(
 ) -> StorageResult<()> {
     let mut seen = std::collections::BTreeSet::new();
     for checkpoint in checkpoints {
-        if payload
+        let known = payload
             .required_endpoints
             .binary_search(&checkpoint.endpoint)
-            .is_err()
-            || !seen.insert(&checkpoint.endpoint)
-        {
+            .is_ok()
+            || payload
+                .admitted_endpoints
+                .binary_search(&checkpoint.endpoint)
+                .is_ok();
+        if !known || !seen.insert(&checkpoint.endpoint) {
             return Err(invalid_scope());
         }
     }
@@ -166,9 +196,14 @@ pub(super) fn payload_is_qualified(
     known_event: bool,
 ) -> bool {
     match predicate {
+        // Only required endpoints certify. Each must also have been admitted:
+        // a relay the dial policy refused cannot vouch for anything.
         0 => {
             !payload.required_endpoints.is_empty()
-                && payload.required_endpoints == payload.admitted_endpoints
+                && payload
+                    .required_endpoints
+                    .iter()
+                    .all(|endpoint| payload.admitted_endpoints.binary_search(endpoint).is_ok())
                 && payload.required_endpoints.iter().all(|endpoint| {
                     payload.checkpoints.iter().any(|checkpoint| {
                         &checkpoint.endpoint == endpoint
@@ -288,6 +323,105 @@ fn scopes_qualify_where(
         })
 }
 
+/// One route an obligation could not certify, with the relays it requires.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UncertifiedScopeKey {
+    route_kind: u8,
+    group_id: Option<Vec<u8>>,
+    transport_group_id: Option<Vec<u8>>,
+    required_endpoints: Vec<String>,
+}
+
+/// The routes, with their required relays, the obligation still cannot
+/// certify, sorted.
+pub(super) fn uncertified_scope_keys(
+    conn: &Connection,
+    obligation_id: &[u8],
+    predicate: i64,
+) -> StorageResult<Vec<UncertifiedScopeKey>> {
+    let rows = conn
+        .prepare_cached(
+            "SELECT route_kind, group_id, transport_group_id, snapshot_state, scope_format,
+                    scope_payload, known_event_id IS NOT NULL
+                 FROM account_recovery_scopes WHERE obligation_id = ?1",
+        )
+        .storage()?
+        .query_map([obligation_id], |row| {
+            Ok((
+                row.get::<_, Option<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, bool>(6)?,
+            ))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    let mut keys = Vec::new();
+    for (kind, group_id, transport_group_id, ready, format, bytes, known_event) in rows {
+        let (Some(route_kind), Some(bytes)) = (kind, bytes.filter(|_| ready == 1)) else {
+            continue;
+        };
+        let payload = decode_scope(format, &bytes)?;
+        if !payload_is_qualified(&payload, predicate, known_event) {
+            keys.push(UncertifiedScopeKey {
+                route_kind,
+                group_id,
+                transport_group_id,
+                required_endpoints: payload.required_endpoints,
+            });
+        }
+    }
+    keys.sort();
+    Ok(keys)
+}
+
+/// Whether every scope the obligation still cannot certify has had its quiet
+/// comparisons in a row for its goal. A scope a pass never compared keeps its
+/// own count, so a slice of routes cannot park the rest.
+fn quiet_scopes_exhausted(
+    conn: &Connection,
+    obligation_id: &[u8],
+    predicate: i64,
+) -> StorageResult<bool> {
+    let rows = conn
+        .prepare_cached(
+            "SELECT snapshot_state, scope_format, scope_payload, known_event_id IS NOT NULL
+                 FROM account_recovery_scopes WHERE obligation_id = ?1",
+        )
+        .storage()?
+        .query_map([obligation_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    let mut uncertified = 0usize;
+    for (ready, format, bytes, known_event) in rows {
+        let Some(bytes) = bytes.filter(|_| ready == 1) else {
+            return Ok(false);
+        };
+        let payload = decode_scope(format, &bytes)?;
+        if payload_is_qualified(&payload, predicate, known_event) {
+            continue;
+        }
+        if payload.quiet_passes < RECOVERY_PARK_AFTER_QUIET_PASSES {
+            return Ok(false);
+        }
+        uncertified += 1;
+    }
+    Ok(uncertified > 0)
+}
+
 impl SqliteAccountStorage {
     pub fn recovery_scope_snapshots(
         &self,
@@ -359,6 +493,7 @@ impl SqliteAccountStorage {
                 route_revision: payload.route_revision,
                 inventory_revision: payload.inventory_revision,
                 loss_revision: payload.loss_revision,
+                quiet_passes: payload.quiet_passes,
             });
         }
         Ok(scopes)
@@ -464,6 +599,7 @@ impl SqliteAccountStorage {
                     obligation_revision: *revision,
                     loss_revision: expected.loss_revision, route_revision: expected.route_revision,
                     inventory_revision: expected.inventory_revision,
+                    quiet_passes: 0,
                 };
                 if let Some((_, _, format, Some(bytes), 1)) = prior {
                     let previous = decode_scope(*format, bytes)?;
@@ -483,6 +619,14 @@ impl SqliteAccountStorage {
                         && (!compatible_columns || previous.required_endpoints != plan.required_endpoints)
                     {
                         return Err(StorageError::Serialization("recovery goal changed without a new revision".into()));
+                    }
+                    // The quiet streak belongs to this goal: new evidence or a
+                    // new route starts it over.
+                    if compatible_columns && previous.obligation_revision == *revision
+                        && previous.route_revision == expected.route_revision
+                        && previous.required_endpoints == plan.required_endpoints
+                    {
+                        payload.quiet_passes = previous.quiet_passes;
                     }
                     if compatible_columns && previous.obligation_revision == *revision
                         && previous.loss_revision == expected.loss_revision
@@ -537,6 +681,50 @@ impl SqliteAccountStorage {
         checkpoints: &[RecoveryScopeCheckpoint],
         incomplete: RecoveryEligibility,
     ) -> StorageResult<bool> {
+        self.checkpoint_recovery_obligation_inner(
+            expected,
+            attempt_serial,
+            obligation_id,
+            checkpoints,
+            incomplete,
+            None,
+        )
+    }
+
+    /// [`Self::checkpoint_recovery_obligation`] for a comparison pass, which
+    /// also counts each compared scope's quiet streak in the same transaction.
+    /// A retryable obligation parks once every uncertified scope has
+    /// [`RECOVERY_PARK_AFTER_QUIET_PASSES`] quiet comparisons in a row for its
+    /// goal. Progress restarts a scope's streak, an unserved comparison leaves
+    /// it where it was, and a scope this pass did not compare is not listed.
+    pub fn checkpoint_recovery_comparison(
+        &self,
+        expected: &RecoveryRevisionFence,
+        attempt_serial: u64,
+        obligation_id: [u8; 16],
+        checkpoints: &[RecoveryScopeCheckpoint],
+        incomplete: RecoveryEligibility,
+        progress: &[(u64, RecoveryPassProgress)],
+    ) -> StorageResult<bool> {
+        self.checkpoint_recovery_obligation_inner(
+            expected,
+            attempt_serial,
+            obligation_id,
+            checkpoints,
+            incomplete,
+            Some(progress),
+        )
+    }
+
+    fn checkpoint_recovery_obligation_inner(
+        &self,
+        expected: &RecoveryRevisionFence,
+        attempt_serial: u64,
+        obligation_id: [u8; 16],
+        checkpoints: &[RecoveryScopeCheckpoint],
+        incomplete: RecoveryEligibility,
+        progress: Option<&[(u64, RecoveryPassProgress)]>,
+    ) -> StorageResult<bool> {
         let Some((_, revision)) = expected
             .obligations
             .iter()
@@ -580,6 +768,15 @@ impl SqliteAccountStorage {
                     return Ok(false);
                 }
                 validate_checkpoints(&payload, &checkpoint.endpoints)?;
+                match progress.and_then(|progress| {
+                    progress.iter().find(|(scope, _)| *scope == token.scope_id)
+                }) {
+                    Some((_, RecoveryPassProgress::Progressed)) => payload.quiet_passes = 0,
+                    Some((_, RecoveryPassProgress::Quiet)) => {
+                        payload.quiet_passes = payload.quiet_passes.saturating_add(1);
+                    }
+                    Some((_, RecoveryPassProgress::Unserved)) | None => {}
+                }
                 for incoming in &checkpoint.endpoints {
                     if let Some(existing) = payload.checkpoints.iter_mut().find(|existing| existing.endpoint == incoming.endpoint) {
                         *existing = incoming.clone();
@@ -599,14 +796,51 @@ impl SqliteAccountStorage {
                     params![obligation_id.as_slice(), sqlite_integer(scope_id)?, payload],
                 ).storage()?;
             }
-            let predicate: i64 = conn.query_row_cached(
-                "SELECT predicate FROM account_recovery_obligations WHERE id = ?1",
-                [obligation_id.as_slice()], |row| row.get(0),
+            let (predicate, cause, dismissed): (i64, i64, Option<Vec<u8>>) = conn.query_row_cached(
+                "SELECT predicate, cause, dismissed_scopes FROM account_recovery_obligations WHERE id = ?1",
+                [obligation_id.as_slice()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).storage()?;
             let qualified = scopes_qualify(&conn, expected, Some(attempt_serial), obligation_id, predicate)?;
+            let mut eligibility = incomplete;
+            let quiet_now = progress.is_some_and(|progress| {
+                progress.iter().any(|(_, pass)| *pass == RecoveryPassProgress::Quiet)
+            });
+            if !qualified
+                && quiet_now
+                && incomplete == RecoveryEligibility::Retry
+                && quiet_scopes_exhausted(&conn, &obligation_id, predicate)?
+            {
+                eligibility = RecoveryEligibility::NeedsDeepRepair;
+            }
+            // The user already dismissed incremental history stuck on these
+            // routes. Parking on none but them retires it again, silently.
+            if !qualified
+                && eligibility == RecoveryEligibility::NeedsDeepRepair
+                && cause == RecoveryCause::IncrementalHistory as i64
+                && let Some(dismissed) = dismissed
+            {
+                let dismissed: Vec<UncertifiedScopeKey> =
+                    serde_json::from_slice(&dismissed).map_err(|_| invalid_scope())?;
+                let stuck = uncertified_scope_keys(&conn, &obligation_id, predicate)?;
+                if !stuck.is_empty() && stuck.iter().all(|key| dismissed.binary_search(key).is_ok()) {
+                    super::notice::retire_obligation_tx(
+                        &conn,
+                        &obligation_id,
+                        crate::codec::unix_now_ms().max(0),
+                    )?;
+                    return Ok(false);
+                }
+            }
+            // Parking is what hosts show as "history may be incomplete". Keep
+            // the first parking time across later failed deep repairs.
             conn.execute_cached(
-                "UPDATE account_recovery_obligations SET state = ?2, eligibility = ?3 WHERE id = ?1",
-                params![obligation_id.as_slice(), if qualified { 1 } else { 0 }, incomplete as i64],
+                "UPDATE account_recovery_obligations SET state = ?2, eligibility = ?3,
+                     parked_at_ms = CASE WHEN ?2 = 0 AND ?3 = 4 THEN
+                         CASE WHEN eligibility = 4 AND parked_at_ms IS NOT NULL THEN parked_at_ms ELSE ?4 END
+                     END
+                 WHERE id = ?1",
+                params![obligation_id.as_slice(), if qualified { 1 } else { 0 }, eligibility as i64,
+                    crate::codec::unix_now_ms().max(0)],
             ).storage()?;
             Ok(qualified)
         })
@@ -666,6 +900,162 @@ mod tests {
             endpoints,
             retained_known_event: false,
         }
+    }
+
+    #[test]
+    fn quiet_streaks_belong_to_each_scope_and_goal() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("alice").unwrap();
+        store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+        let loss = store.recovery_revision_fence().unwrap().obligations[0].0;
+        let history = store
+            .request_recovery(RecoveryRequest::IncrementalHistory, 1)
+            .unwrap()
+            .id;
+        let mut group = plan(&["a", "b"]);
+        group.scope_id = 1;
+        group.route_kind = 1;
+        group.group_id = Some(vec![7]);
+        group.transport_group_id = Some([7; 32]);
+        let scopes = [plan(&["a", "b"]), group];
+        let now = std::cell::Cell::new(1_000_u64);
+        // One pass: each listed obligation compares the listed scopes.
+        type ScopePasses<'a> = &'a [(u64, RecoveryPassProgress)];
+        let pass = |passes: &[([u8; 16], ScopePasses)]| {
+            let fence = store.recovery_revision_fence().unwrap();
+            now.set(now.get() + 100_000);
+            let attempt = store
+                .reserve_recovery_attempt(&fence, now.get(), 1_000, false)
+                .unwrap()
+                .expect("a retryable pass is reserved")
+                .attempt_serial;
+            for (id, progress) in passes {
+                let tokens = store
+                    .install_recovery_scope_plan(&fence, attempt, *id, &scopes)
+                    .unwrap()
+                    .unwrap();
+                let checkpoints = progress
+                    .iter()
+                    .map(|(scope, _)| checkpoint(&tokens[*scope as usize], Vec::new()))
+                    .collect::<Vec<_>>();
+                assert!(
+                    !store
+                        .checkpoint_recovery_comparison(
+                            &fence,
+                            attempt,
+                            *id,
+                            &checkpoints,
+                            RecoveryEligibility::Retry,
+                            progress,
+                        )
+                        .unwrap()
+                );
+            }
+        };
+        let eligibility = |id: [u8; 16]| {
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.ticket.id == id)
+                .unwrap()
+                .eligibility
+        };
+        use RecoveryPassProgress::{Progressed, Quiet, Unserved};
+        // A slice that compares one scope quietly cannot park the other, and
+        // progress on another obligation never resets this one.
+        for _ in 0..3 {
+            pass(&[
+                (loss, &[(0, Quiet)]),
+                (history, &[(0, Progressed), (1, Progressed)]),
+            ]);
+        }
+        assert_eq!(eligibility(loss), RecoveryEligibility::Retry);
+        pass(&[(loss, &[(1, Quiet)]), (history, &[(0, Quiet)])]);
+        pass(&[(loss, &[(1, Unserved)]), (history, &[(0, Quiet)])]);
+        pass(&[(loss, &[(1, Quiet)]), (history, &[(0, Quiet)])]);
+        assert_eq!(eligibility(loss), RecoveryEligibility::Retry);
+        pass(&[(loss, &[(1, Quiet)]), (history, &[(1, Quiet)])]);
+        assert_eq!(
+            eligibility(loss),
+            RecoveryEligibility::NeedsDeepRepair,
+            "every uncertified scope has its own three quiet comparisons"
+        );
+        assert_eq!(
+            eligibility(history),
+            RecoveryEligibility::Retry,
+            "one scope's first quiet comparison after others' passes cannot park it"
+        );
+        // New evidence is a new goal, which starts every streak over.
+        store.mark_account_delivery_recovery("alice", 1, 2).unwrap();
+        for _ in 0..2 {
+            pass(&[(loss, &[(0, Quiet), (1, Quiet)])]);
+        }
+        assert_eq!(eligibility(loss), RecoveryEligibility::Retry);
+        pass(&[(loss, &[(0, Quiet), (1, Quiet)])]);
+        assert_eq!(eligibility(loss), RecoveryEligibility::NeedsDeepRepair);
+    }
+
+    #[test]
+    fn required_relays_alone_certify_and_best_effort_checkpoints_are_kept() {
+        let (store, fence, attempt, id) = fixture();
+        // "a" certifies; "b" is admitted best effort; "c" is required but the
+        // dial policy refused it in the second plan.
+        let mut goal = plan(&["a", "b"]);
+        goal.required_endpoints = vec!["a".into()];
+        let token = store
+            .install_recovery_scope_plan(&fence, attempt, id, &[goal])
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        let mut failed = covered("b");
+        failed.outcome = RecoveryScopeOutcome::Unavailable;
+        failed.exhaustive = false;
+        assert!(
+            store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt,
+                    id,
+                    &[checkpoint(&token, vec![covered("a"), failed])],
+                    RecoveryEligibility::Retry
+                )
+                .unwrap(),
+            "a best-effort relay's gap never withholds the certificate"
+        );
+
+        let (store, fence, attempt, id) = fixture();
+        let mut refused = plan(&["a"]);
+        refused.required_endpoints = vec!["a".into(), "c".into()];
+        let token = store
+            .install_recovery_scope_plan(&fence, attempt, id, &[refused])
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        assert!(
+            !store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt,
+                    id,
+                    &[checkpoint(&token, vec![covered("a"), covered("c")])],
+                    RecoveryEligibility::Retry
+                )
+                .unwrap(),
+            "a required relay that was never admitted cannot vouch"
+        );
+        assert!(
+            store
+                .checkpoint_recovery_obligation(
+                    &fence,
+                    attempt,
+                    id,
+                    &[checkpoint(&token, vec![covered("d")])],
+                    RecoveryEligibility::Retry
+                )
+                .is_err(),
+            "a checkpoint names only a required or admitted relay"
+        );
     }
 
     #[test]

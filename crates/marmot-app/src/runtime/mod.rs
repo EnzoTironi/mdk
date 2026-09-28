@@ -330,15 +330,6 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 ];
 
 #[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct BoundedResultWitness {
-    pub(crate) account_label: String,
-    pub(crate) attempt_serial: u64,
-    pub(crate) event_id: [u8; 32],
-    pub(crate) matching_items: usize,
-}
-
-#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct OrdinaryDeliveryDropTarget {
     pub(crate) account_label: String,
@@ -353,12 +344,9 @@ pub(crate) struct RecoverySelectionWitnessTarget {
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
-    /// Off until the production SDK acquisition backend passes its two-relay
-    /// conformance gate. Controlled worker fixtures opt in explicitly.
-    pub(crate) bounded_group_recovery_enabled: Arc<AtomicBool>,
     /// Every production runtime points at the same process capacity. The
     /// indirection permits explicit isolation of capacity-sensitive fixtures.
-    recovery_credits: Arc<StdMutex<Arc<account_worker::bounded_recovery::RecoveryCreditPool>>>,
+    recovery_credits: Arc<StdMutex<Arc<account_worker::recovery_credits::RecoveryCreditPool>>>,
     #[cfg(test)]
     pub(crate) comparison_test_trace: Arc<StdMutex<Vec<&'static str>>>,
     #[cfg(test)]
@@ -366,23 +354,6 @@ pub struct RuntimeSharedServices {
         Arc<StdMutex<Option<(String, crate::client::TestComparisonActivityWitness)>>>,
     #[cfg(test)]
     pub(crate) recovery_selection_witness: Arc<StdMutex<Option<RecoverySelectionWitnessTarget>>>,
-    #[cfg(test)]
-    pub(crate) recovery_phase_witness:
-        Arc<StdMutex<Option<(String, crate::client::TestRecoveryPhaseWitness)>>>,
-    #[cfg(test)]
-    pub(crate) bounded_recovery_finished: Arc<Notify>,
-    #[cfg(test)]
-    pub(crate) bounded_preparation_probes: Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)]
-    pub(crate) bounded_result_ready: Arc<Notify>,
-    #[cfg(test)]
-    pub(crate) bounded_result_witness: Arc<StdMutex<Option<BoundedResultWitness>>>,
-    #[cfg(test)]
-    pub(crate) bounded_prefix_admitted: Arc<Notify>,
-    #[cfg(test)]
-    pub(crate) bounded_pause_before_admission: Arc<AtomicBool>,
-    #[cfg(test)]
-    pub(crate) bounded_pause_after_first_admission: Arc<AtomicBool>,
     /// One exact ordinary SDK delivery may be omitted before worker ingest.
     #[cfg(test)]
     pub(crate) ordinary_drop_once: Arc<StdMutex<Option<OrdinaryDeliveryDropTarget>>>,
@@ -483,9 +454,8 @@ impl MessageSubscriptionSeenIds {
 impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
-            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
             recovery_credits: Arc::new(StdMutex::new(
-                account_worker::bounded_recovery::shared_recovery_credit_pool(),
+                account_worker::recovery_credits::shared_recovery_credit_pool(),
             )),
             #[cfg(test)]
             comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
@@ -493,22 +463,6 @@ impl Default for RuntimeSharedServices {
             comparison_activity_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            recovery_phase_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            bounded_recovery_finished: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            bounded_result_ready: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_result_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            bounded_prefix_admitted: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             ordinary_drop_once: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -547,15 +501,15 @@ impl Default for RuntimeSharedServices {
 impl RuntimeSharedServices {
     pub(in crate::runtime) fn recovery_credit_pool(
         &self,
-    ) -> Arc<account_worker::bounded_recovery::RecoveryCreditPool> {
+    ) -> Arc<account_worker::recovery_credits::RecoveryCreditPool> {
         self.recovery_credits.lock().unwrap().clone()
     }
 
     #[cfg(test)]
     pub(in crate::runtime) fn use_private_recovery_credit_pool_for_test(
         &self,
-    ) -> Arc<account_worker::bounded_recovery::RecoveryCreditPool> {
-        let pool = account_worker::bounded_recovery::private_recovery_credit_pool_for_test();
+    ) -> Arc<account_worker::recovery_credits::RecoveryCreditPool> {
+        let pool = account_worker::recovery_credits::private_recovery_credit_pool_for_test();
         self.set_recovery_credit_pool_for_test(pool.clone());
         pool
     }
@@ -563,7 +517,7 @@ impl RuntimeSharedServices {
     #[cfg(test)]
     pub(in crate::runtime) fn set_recovery_credit_pool_for_test(
         &self,
-        pool: Arc<account_worker::bounded_recovery::RecoveryCreditPool>,
+        pool: Arc<account_worker::recovery_credits::RecoveryCreditPool>,
     ) {
         *self.recovery_credits.lock().unwrap() = pool;
     }
@@ -588,9 +542,8 @@ impl RuntimeSharedServices {
             lifecycle.clone(),
         );
         Self {
-            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
             recovery_credits: Arc::new(StdMutex::new(
-                account_worker::bounded_recovery::shared_recovery_credit_pool(),
+                account_worker::recovery_credits::shared_recovery_credit_pool(),
             )),
             #[cfg(test)]
             comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
@@ -598,22 +551,6 @@ impl RuntimeSharedServices {
             comparison_activity_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            recovery_phase_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            bounded_recovery_finished: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            bounded_result_ready: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_result_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            bounded_prefix_admitted: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             ordinary_drop_once: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -1511,6 +1448,15 @@ pub enum MarmotAppEvent {
         outcome: cgka_traits::engine::SupersededIntentOutcome,
         reason: &'static str,
     },
+    /// The account's "history may be incomplete" notices changed: recovery
+    /// parked, new evidence re-armed a parked occurrence, or the user
+    /// dismissed one. Re-read `history_notices`. Carries no notice or group
+    /// identities; a group whose own notices changed also gets
+    /// `GroupStateUpdated`.
+    HistoryNoticesChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 impl MarmotAppRuntime {
@@ -2380,6 +2326,36 @@ impl MarmotAppRuntime {
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
         self.accounts
             .group_recovery_status(account_ref, group_id)
+            .await
+    }
+
+    /// The account's "history may be incomplete" notices, oldest first: each
+    /// is one occurrence of automatic recovery parking because it could not
+    /// prove some history complete. Durable and local; refresh on
+    /// `HistoryNoticesChanged`. Group-scoped occurrences also appear in that
+    /// group's `GroupRecoveryStatus`.
+    pub async fn history_notices(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::HistoryNotice>, AppError> {
+        self.accounts.history_notices(account_ref).await
+    }
+
+    /// Dismiss one notice after the user accepts that this history may be
+    /// incomplete. The dismissal is durable and is recorded as its own
+    /// outcome, never as recovered history. Returns false, changing nothing,
+    /// for a stale id: new evidence re-armed recovery, or the notice was
+    /// already dismissed. Dismissing a delivery-loss notice lets the transport
+    /// cursor advance again once no loss recovery remains pending. New loss,
+    /// a higher missing epoch or a new repair request later raises a new
+    /// notice with a new id. A malformed id is an `AppError::Hex`.
+    pub async fn dismiss_history_notice(
+        &self,
+        account_ref: &str,
+        notice_id: &str,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .dismiss_history_notice(account_ref, notice_id)
             .await
     }
 

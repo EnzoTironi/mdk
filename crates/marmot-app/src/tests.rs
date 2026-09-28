@@ -705,15 +705,6 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
 }
 
 impl ScriptedPushRelayClient {
-    pub(crate) fn last_published_group_event(&self) -> Option<NostrTransportEvent> {
-        self.published_events
-            .lock()
-            .unwrap()
-            .iter()
-            .rev()
-            .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
-            .cloned()
-    }
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
@@ -1481,7 +1472,7 @@ async fn inject_epoch_gap_probe(app: &MarmotApp, event: NostrTransportEvent) {
 }
 
 #[test]
-fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
+fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
     run_composed_app_runtime_test("explicit-catch-up-backfill", || async {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -1577,58 +1568,30 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
         );
-        relay.block_next_subscribes(2);
         runtime
             .advance_recovery_clock_for_test("alice", Duration::from_secs(300))
             .await;
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(15)).await;
         tokio::time::resume();
-        tokio::time::timeout(
-            EXPLICIT_CATCH_UP_BACKFILL_DEADLINE,
-            relay.wait_for_blocked_subscribes(4),
-        )
+        // The owner tick compares the gap's routes off the worker. It reuses
+        // the live tail: it issues no subscription at all.
+        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, async {
+            while storage.recovery_retry_state().unwrap().attempt_serial == retry.attempt_serial {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
         .expect("the existing maintenance tick must service quiet pending debt");
         assert_eq!(
             storage.recovery_retry_state().unwrap().attempt_serial,
             retry.attempt_serial + 1
         );
-
-        // Model the relay's stored-event response to that unfloored REQ. The
-        // target is older than the persisted cursor's 120-second floor and is
-        // offered only after replay starts; no later live delivery is published.
-        let below_floor_target = epoch_gap_probe(
-            &group.nostr_routing.nostr_group_id_hex,
-            cursor.saturating_sub(600),
-            "below-floor-target",
-        );
-        let below_floor_target_id = below_floor_target.id.clone();
-        inject_epoch_gap_probe(&app, below_floor_target).await;
-        relay.release_subscribe();
-
-        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, async {
-            loop {
-                if app
-                    .load_state("alice")
-                    .unwrap()
-                    .seen_events
-                    .iter()
-                    .any(|event_id| event_id == &below_floor_target_id)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the below-floor target must be ingested without later traffic");
-
         runtime.drain_in_flight_work().await.unwrap();
         assert_eq!(
             relay.unfloored_account_subscription_count(),
-            unfloored_before + 1,
-            "the owner-issued replay has no nested follow-up"
+            unfloored_before,
+            "owner-issued automatic recovery never replays unfloored history"
         );
         let final_local_epoch = runtime
             .group_mls_state("alice", &group_id)
@@ -1687,7 +1650,6 @@ fn explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic() {
             completed_rows[0]["event"]["activation_outcome"],
             "succeeded"
         );
-        assert!(completed_rows[0]["event"]["deliveries"].as_u64().unwrap() >= 1);
         assert!(
             storage
                 .pending_recovery_demands()
@@ -3512,7 +3474,8 @@ fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
         );
         assert_eq!(
             relay.unfloored_account_subscription_count(),
-            subscriptions + 1
+            subscriptions,
+            "automatic recovery restores only the live tail"
         );
         let pending = storage
             .pending_recovery_demands()
@@ -3631,7 +3594,8 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
         );
         assert_eq!(
             relay.unfloored_account_subscription_count(),
-            subscriptions + 1
+            subscriptions,
+            "automatic recovery restores only the live tail"
         );
         // A separate caller operation may override the new cooldown once. Its
         // executor cannot spend another reservation on a follow-up replay.
@@ -3647,7 +3611,8 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
         );
         assert_eq!(
             relay.unfloored_account_subscription_count(),
-            subscriptions + 2
+            subscriptions,
+            "an explicit catch-up of automatic debt restores only the live tail"
         );
     });
 }
@@ -13299,7 +13264,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
 }
 
 #[test]
-fn reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment() {
+fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
     run_composed_app_runtime_test("delivery-overflow-reopen", || async {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -13374,20 +13339,20 @@ fn reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment
         client
             .sync()
             .await
-            .expect("ordinary catch-up admits the replay prefix without certifying coverage");
+            .expect("ordinary catch-up runs its floored pass without certifying coverage");
         assert!(
             reopened
                 .load_state("alice")
                 .unwrap()
                 .seen_events
                 .contains(&omitted_id),
-            "the unfloored recovery must ingest the older event omitted below the ordinary cursor floor"
+            "live delivery ingests the older event without any replay"
         );
         assert!(
             client.delivery_overflow_recovery_pending,
-            "EOSE without an exhaustive admission certificate cannot acknowledge loss"
+            "a loss with no known bound cannot be certified by comparison"
         );
-        assert_eq!(relay.unfloored_account_subscription_count(), 1);
+        assert_eq!(relay.unfloored_account_subscription_count(), 0);
         let storage = reopened.account_storage("alice").unwrap();
         assert!(
             storage
@@ -13401,7 +13366,11 @@ fn reopened_overflow_uses_one_owner_replay_and_requires_qualified_acknowledgment
         // delivery/admission, token fencing and live acknowledgment stay real.
         client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
         client.repair_full_history().await.unwrap();
-        assert_eq!(relay.unfloored_account_subscription_count(), 2);
+        assert_eq!(
+            relay.unfloored_account_subscription_count(),
+            1,
+            "only explicit full-history repair widens the replay"
+        );
         assert!(!client.delivery_overflow_recovery_pending);
         assert!(
             reopened
@@ -13577,7 +13546,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let attempts = marker_attempts.clone();
         let storage = app.account_storage("alice").unwrap();
         let marker: crate::relay_plane::AccountDeliveryRecoveryMarker =
-            Arc::new(move |marker_token, dropped| {
+            Arc::new(move |marker_token, dropped, _| {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if !release.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable);

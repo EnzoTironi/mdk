@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-09-27
+updated: 2026-09-28
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -34,7 +34,7 @@ shipped) and against the new code.
 
 The simulator comes first; Jeff validates on a phone.
 
-## Decisions (agreed with Jeff, 2026-09-27)
+## Decisions (agreed with Jeff, 2026-09-27; revised 2026-09-28)
 
 1. **Completion is tiered.**
    - Known-event loss completes when that exact event is durably stored, or has a durable
@@ -59,19 +59,33 @@ The simulator comes first; Jeff validates on a phone.
      comparison, although the comparison still fetches every difference inside the window.
      Such an obligation completes only on its own evidence, for example the missing epoch
      arriving, or it parks for explicit deep repair.
-   - Otherwise, after **3 completed attempts in a row that admit nothing new and certify
-     nothing**, the obligation parks.
+   - Cold-start and incremental history have no lost delivery to bound them. Their goal is
+     the retained inventory window, the last 30 days, and a comparison over that window
+     certifies them. The earlier rule that an unresolved placeholder had no proven lower
+     bound, and so could never certify, is gone.
+   - Otherwise, once **every route the obligation still cannot certify has been compared 3
+     times in a row without admitting or certifying anything**, the obligation parks. Each
+     route counts its own comparisons, so a pass that compares a slice of routes cannot park
+     the rest. New evidence, or durable admission on a route, starts that route's count over.
      It shows "history may be incomplete" and offers an explicit deep repair, which can
      still complete it with qualified coverage, or an explicit retirement. There are no
      further automatic retries.
-   - Attempts that fail only because relays were unreachable do not count toward the budget.
+   - Comparisons whose required relays failed or timed out do not count toward the budget. A
+     relay that answered but could not hand over a claimed event, an event that was not
+     durably admitted, and a backend that cannot compare a route all give a finished answer,
+     so they do count.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
-3. **Required relays are per route.** A group route requires its group relays. Today those
-   are the whitenoise.chat relays we operate, and NIP-77 is a hard requirement for group
-   relays from now on. The account inbox route requires the account's inbox relays. An
-   empty required set never certifies a scope. A required relay that does not support NIP-77
-   cannot certify its scope, so the scope never completes on the relays that do.
+3. **Required relays are the relays we operate.** `MarmotAppConfig::recovery_operated_relays`
+   names them; the default is `wss://relay.eu.whitenoise.chat` and
+   `wss://relay.us.whitenoise.chat`, and NIP-77 is a hard requirement for them. A route that
+   lists any operated relay requires exactly those. A route that lists none requires all of
+   its relays, so its history can still certify. Every other relay is best effort: it is
+   still compared and its events are admitted, but its failure, truncation or missing NIP-77
+   support never withholds a certificate or schedules a retry. The operated set is part of
+   the route policy, so changing it rebuilds every pending scope. An empty required set
+   never certifies a scope. A required relay that does not support NIP-77 cannot certify its
+   scope, so the scope never completes on the relays that do.
    Acquisition keeps admitting what the supporting relays still hold. The decision 1
    budget applies unchanged: the obligation parks after three completed attempts in a row
    that admit nothing new and certify nothing, and an attempt that admits a batch resets
@@ -81,8 +95,6 @@ The simulator comes first; Jeff validates on a phone.
    account never admitted, and an unreachable required relay proves nothing. The only
    other way out is an explicit, user-authorized retirement. It is recorded as a distinct
    outcome ("history may be incomplete"), never as coverage.
-   Treating relays we do not operate as best-effort needs a configured set of operated
-   relays. Until one exists, every relay on a route is required.
 4. Both implementation steps land before the next MarmotKit release.
 
 ## Design
@@ -158,13 +170,18 @@ Every cause runs the same job:
    unsupported.
 3. **Admit** (worker, bounded turns). A few events per turn go straight into the normal
    ingest path, never through the live queue. The worker yields between turns, so commands
-   and live input interleave. The admission loop from `bounded_recovery.rs` is the starting
-   point.
+   and live input interleave. A turn admits at most four events.
 4. **Settle** (worker, short turn). Checkpoint, then complete, retry or park according to
    the tier rules, using the existing revision checks. Old attempts still cannot clear newer
    demand.
 
 The worker never awaits the network. There is one recovery job per account.
+
+After step 2 the inline executor remains for maintenance boundaries, explicit repair,
+known-event demand and routes with more than four relays. It activates transport floored at
+the cursor, compares on the worker, and feeds what it fetched back through the live queue.
+The startup grant activates the session's first live subscriptions before its off-worker
+comparison.
 
 Rules kept from the current design: complete coverage with a still-stuck engine means no
 replay; the blocked reason is recorded; the existing one-shot wedge report still escalates
@@ -175,19 +192,56 @@ row that admit nothing new and certify nothing.
 NIP-77 cost scales with the difference, not the set size, so comparing the whole retained
 window is cheap once we are caught up.
 
+### 4. Parked history is a notice the user can dismiss
+
+Decided with Jeff: parked history is shown to the user as "history may be incomplete",
+and the user can dismiss a particular occurrence durably. That dismissal is decision 3's
+explicit user-authorized retirement, recorded as its own outcome, never as coverage.
+
+- Every pending obligation parked for deep repair is one notice. Its id encodes the
+  obligation and its revision, so new evidence that re-arms the obligation removes the
+  notice, and a later parking is a new notice with a new id. The notice carries the cause,
+  the group for group-scoped demand, and when it parked.
+- A group's own occurrences (today an epoch gap) also show in its recovery status.
+  Account-wide ones, such as delivery loss and incremental or explicit history, appear only
+  in the account's list. One account event announces any change to the list.
+- Dismissal runs on the account worker. In one transaction, and only while that exact
+  revision is still parked, it marks the obligation retired and, for loss, gives every
+  evidence generation of that cause a retired watermark. Evidence not yet imported is
+  newer loss and makes the dismissal stale. Retired evidence bounds no goal and never
+  counts as coverage.
+- When no loss obligation remains pending, dismissal also releases the cursor fence, with
+  the plane's exact-generation guard and without counting a recovery success. A later
+  observation of the same retired loss releases it too, rather than raising it again.
+- New demand for the same key reopens a retired row as fresh debt: new loss or a count
+  above the watermark, a higher missing epoch, a new explicit repair, or a later startup's
+  incremental comparison.
+- A dismissed incremental-history notice stays dismissed while nothing changes (decided with
+  Jeff, 2026-09-28). Dismissal records the routes and required relays it could not certify.
+  Each later startup still runs its comparison, which fetches what it finds, but when it
+  parks on none but those routes and relays it retires again without a new notice. A route
+  stuck on relays the user never dismissed raises a new one. Loss keeps its own notices.
+
 ## What gets deleted
 
-- `client/sync/comparison_job.rs`: per-trigger offload, its eligibility rules, and the
-  online epoch-gap job.
-- The inline broad executor inside `execute_recovery_grant`: activation, broad replay, and
-  drain-based completion (`DrainVerdict` mapping). The same goes for
-  `recover_delivery_overflow*`, the QueueLoss control-token deferral, and the
-  `queue_reconciled_event` → `handle_reconciled_event` path back into the live queue.
-- Conservative mode (`RecoveryExecutorMode`). It is internal to `marmot-app` and not in the
+Deleted in step 2:
+
+- The per-trigger offload rules in `client/sync/comparison_job.rs`, the online epoch-gap
+  job and the test-only bounded exact-ID path. That file is now the one comparison job for
+  every automatic cause.
+- Activation and broad replay in automatic recovery. Only explicit repair widens.
+- Conservative mode (`RecoveryExecutorMode`). It was internal to `marmot-app` and not in the
   bindings.
-- Three recovery job slots and their yield flags in the worker loop, replaced by one.
+- The recovery job slots, replaced by one comparison job and one admission loop.
 - The 22 recovery notes, replaced by this one. The bounded-acquisition interface contract
   stays in its own document.
+
+Still to delete:
+
+- The inline executor inside `execute_recovery_grant` that the causes above still use: its
+  activation, drain-based completion (`DrainVerdict` mapping), `recover_delivery_overflow*`,
+  and the `queue_reconciled_event` → `handle_reconciled_event` path back into the live
+  queue.
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
 Each PR reports exact before/after line counts. The goal is a large net reduction across
@@ -209,9 +263,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   row cap, until qualified completion (an explicit deep repair counts only when it achieves
   that coverage) or an explicit user-authorized retirement, which is recorded as "history
   may be incomplete" rather than as coverage.
-  [runtime-state-bounds.md](../runtime-state-bounds.md) records the no-cap rule for
-  qualified completion; step 2 adds the retirement ending there when it implements it. A
-  cap on that debt would need its own reviewed retirement rule.
+  [runtime-state-bounds.md](../runtime-state-bounds.md) records the no-cap rule and both
+  endings: qualified completion, and the retirement in design section 4. A cap on that
+  debt would need its own reviewed retirement rule.
 
 ## Storage
 
@@ -248,17 +302,17 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 | Step | Contents | Status |
 | --- | --- | --- |
-| 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Nightly and #2060 done; docs in review; scorecard in progress |
-| 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | In review |
-| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | In progress |
+| 0 | Restore the production-policy nightly (#2064); close #2060; slim the docs to this file; add a scorecard harness with a baseline | Done (#2063, #2064, #2069) |
+| 1 | Durable spill of queue overflow, admitted through the live ingest path (#2065) | Merged |
+| 2 | One execution path for every cause, removal of activation and broad replay, tier completion, parking and status, deletions | In review (#2068). The fix for the notification-lag issue (#2070) follows in a PR stacked on it. The inline executor for maintenance, explicit repair, known events and routes over four relays remains. |
 
 ## Risks and open items
 
 - Spill write latency under a burst, and cursor safety while writes are pending (covered by
   tests).
 - Truncated comparisons. The whitenoise relays' own match-set cap is 5,000,000, so the
-  adapter's request limit is the binding one. `NostrReconciliationSummary` reports only
-  aggregate relay success and failure, with no truncation outcome. The adapter therefore
+  adapter's request limit is the binding one. `NostrReconciliationSummary` names each
+  failed relay but has no truncation outcome. The adapter therefore
   asks for one item more than the inventory cap (16,385). It reconstructs each endpoint's
   relay-side set size from the SDK sync summary: local items in the window, minus the
   local-only IDs, plus the remote-only IDs. The remote difference alone is not that set.

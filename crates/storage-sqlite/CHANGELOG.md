@@ -2,7 +2,42 @@
 
 ## Unreleased
 
+### Changed
+
+- A recovery scope may admit relays it does not require. Completion checks only the
+  required relays, each of which must be admitted and covered. Checkpoints may name any
+  required or admitted relay, and joining comparison debt replaces its required relays
+  instead of accumulating them. (#2068)
+
 ### Added
+
+- Add `checkpoint_recovery_comparison`, which takes each compared scope's
+  `RecoveryPassProgress` and keeps that scope's quiet streak in its checkpoint payload for its
+  goal: progress restarts it and an unserved comparison leaves it alone. A retryable obligation
+  parks, in the same transaction, once every scope it still cannot certify has
+  `RECOVERY_PARK_AFTER_QUIET_PASSES` quiet comparisons in a row, so a pass that compares a slice
+  of routes cannot park the rest. `StoredRecoveryScope::quiet_passes` reports the streak. (#2068)
+
+- Add schema 0098 for "history may be incomplete" notices. `parked_recovery_obligations` and
+  `parked_group_recovery_obligations` list each pending obligation parked for deep repair as a
+  `ParkedRecoveryObligation` (ticket, cause, optional group and new `parked_at_ms`, which parking
+  now records). `retire_parked_recovery_obligation(id, revision, now_ms)` is the explicit,
+  user-authorized ending: in one transaction, and only for that exact parked revision, it records
+  `state = 2` with a documented `incomplete_reason`, never coverage. For queue or notification loss
+  it retires every evidence generation of that cause at its imported count (new `retired_count`)
+  and refuses while newer evidence is unimported; for incremental history it settles the comparison
+  slot that served only that debt, and records the routes and required relays it could not
+  certify (new `dismissed_scopes`); parking again on none but those retires it again silently.
+  Retired watermarks no longer bound loss goals or legacy
+  restoration, and a delayed duplicate observation cannot reopen them. New loss above a watermark,
+  a new generation, a higher epoch, a comparison join or a new known-event, incremental or explicit
+  request reopens the row as fresh pending debt. (#2068)
+
+- Add schema 0097 `bound_state` and `bound_seconds` on `account_delivery_loss_evidence`: a
+  running minimum of the wire `created_at` charged to each loss generation, which becomes
+  unknown for good after any charge without one. Rows written before 0097 are unknown.
+  `record_account_recovery_loss_bounded` and the other `*_bounded` writers maintain it, and
+  `recovery_loss_goal_floor` reads it. (#2068)
 
 - Add schema 0096 `account_delivery_spill`, the durable overflow tail of the in-memory account
   delivery queue, with `spill_account_deliveries`, `spilled_account_deliveries` and

@@ -97,6 +97,8 @@ pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod error;
 mod external_signer;
 mod groups;
+mod history_notices;
+pub use history_notices::{HistoryNotice, HistoryNoticeCause};
 mod ids;
 mod key_package_records;
 #[cfg(test)]
@@ -189,14 +191,12 @@ pub use cgka_traits::{
     PollProjection, PollType,
 };
 pub use client::AppClient;
-pub(crate) use client::{
-    ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
-};
+pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
     AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
-    RecoveryExecutorMode, RelayTelemetryExportConfig, RelayTelemetryResource,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings,
 };
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
@@ -1793,13 +1793,12 @@ impl MarmotApp {
                 cap: EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
             }
         };
-        let mut recovery_owner = client::recovery::AccountRecoveryOwner::open(
+        let recovery_owner = client::recovery::AccountRecoveryOwner::open(
             &self.account_storage(&open.state.label)?,
             client::recovery::wall_now_ms()?,
             Instant::now(),
             recovery_policy,
         )?;
-        recovery_owner.select_executor_mode(self.config.recovery_executor_mode);
         if relay_plane
             .subscription_rebuild_since(open.state.last_transport_timestamp)
             .is_none()
@@ -1813,8 +1812,6 @@ impl MarmotApp {
         let mut client = AppClient {
             #[cfg(test)]
             test_recovery_selection_witness: None,
-            #[cfg(test)]
-            test_recovery_phase_witness: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
             audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
             #[cfg(test)]
@@ -1844,6 +1841,7 @@ impl MarmotApp {
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_recovery_status_updates: std::collections::HashSet::new(),
+            history_notice_baseline: None,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_failed_sync_summary: SyncSummary::default(),
@@ -1903,6 +1901,8 @@ impl MarmotApp {
             client.reconcile_hydrated_account_state()?;
             client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
         }
+        // Hosts read the notice list after open; later changes raise an event.
+        client.take_history_notice_changes();
         Ok(client)
     }
 
@@ -4157,13 +4157,14 @@ impl MarmotApp {
         let recovery_storage = self.account_storage(label)?;
         let recovery_label = label.to_owned();
         let recovery_marker: relay_plane::AccountDeliveryRecoveryMarker =
-            Arc::new(move |marker_token, dropped| {
+            Arc::new(move |marker_token, dropped, earliest_created_at| {
                 recovery_storage
-                    .record_account_delivery_loss(
+                    .record_account_delivery_loss_bounded(
                         &recovery_label,
                         marker_token,
                         dropped,
                         unix_now_seconds(),
+                        earliest_created_at,
                     )
                     .map_err(|error| {
                         if error.is_closed() {
