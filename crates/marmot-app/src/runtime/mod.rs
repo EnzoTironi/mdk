@@ -1251,6 +1251,8 @@ pub struct AccountSetupRequest {
     pub import_nsec: Option<Zeroizing<String>>,
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
+    /// Public directory indexers. Existing accounts use them for reads;
+    /// generated accounts also copy relay lists and kind-0 metadata to them.
     pub discovery_relays: Vec<TransportEndpoint>,
     pub publish_missing_relay_lists: bool,
     pub publish_initial_key_package: bool,
@@ -4224,6 +4226,12 @@ impl MarmotAppRuntime {
             profile,
             &merge_source_relays,
             publish_endpoints,
+            bootstrap.indexer_relays,
+            bootstrap
+                .default_relays
+                .into_iter()
+                .chain(bootstrap.bootstrap_relays)
+                .collect(),
         )
         .await
     }
@@ -4236,6 +4244,20 @@ impl MarmotAppRuntime {
         &self,
         account_ref: &str,
         profile: UserProfileMetadata,
+    ) -> Result<UserProfileMetadata, AppError> {
+        self.publish_user_profile_using_account_relays_and_indexers(
+            account_ref,
+            profile,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn publish_user_profile_using_account_relays_and_indexers(
+        &self,
+        account_ref: &str,
+        profile: UserProfileMetadata,
+        indexer_relays: Vec<TransportEndpoint>,
     ) -> Result<UserProfileMetadata, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
@@ -4255,6 +4277,19 @@ impl MarmotAppRuntime {
             profile,
             &endpoints,
             endpoints.clone(),
+            indexer_relays,
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .chain(&relay_lists.nip65.read_relays)
+                .chain(&relay_lists.nip65.write_relays)
+                .chain(&relay_lists.inbox.relays)
+                .chain(&relay_lists.bootstrap_relays)
+                .chain(&relay_lists.default_relays)
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
         )
         .await
     }
@@ -4265,6 +4300,8 @@ impl MarmotAppRuntime {
         mut profile: UserProfileMetadata,
         merge_source_relays: &[TransportEndpoint],
         publish_endpoints: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+        declared_relays: Vec<TransportEndpoint>,
     ) -> Result<UserProfileMetadata, AppError> {
         if let Some(current) = self
             .latest_known_user_profile_for_publish(&account.account_id_hex, merge_source_relays)
@@ -4285,7 +4322,13 @@ impl MarmotAppRuntime {
         stamp_published_profile_created_at(&mut profile, unix_now_seconds());
         self.accounts
             .app
-            .publish_user_profile_to_endpoints(&account.label, profile.clone(), publish_endpoints)
+            .publish_user_profile_to_endpoints_and_indexers(
+                &account.label,
+                profile.clone(),
+                publish_endpoints,
+                indexer_relays,
+                declared_relays,
+            )
             .await?;
         self.accounts
             .app
@@ -4593,10 +4636,31 @@ impl MarmotAppRuntime {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_nip65_relays_with_indexers(
+            account_ref,
+            relays,
+            bootstrap_relays,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn set_account_nip65_relays_with_indexers(
+        &self,
+        account_ref: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts
             .app
-            .set_account_nip65_relays(&account.label, relays, bootstrap_relays)
+            .set_account_nip65_relays_with_indexers(
+                &account.label,
+                relays,
+                bootstrap_relays,
+                indexer_relays,
+            )
             .await
     }
 
@@ -4606,10 +4670,31 @@ impl MarmotAppRuntime {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_inbox_relays_with_indexers(
+            account_ref,
+            relays,
+            bootstrap_relays,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn set_account_inbox_relays_with_indexers(
+        &self,
+        account_ref: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts
             .app
-            .set_account_inbox_relays(&account.label, relays, bootstrap_relays)
+            .set_account_inbox_relays_with_indexers(
+                &account.label,
+                relays,
+                bootstrap_relays,
+                indexer_relays,
+            )
             .await
     }
 
@@ -5641,6 +5726,9 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        for task in self.accounts.app.abort_all_public_indexer_copies() {
+            let _ = task.await;
+        }
         self.shared.stop_relay_telemetry_exporter();
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::DirectorySync)
@@ -5748,6 +5836,7 @@ impl MarmotAppRuntime {
 
     async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
         self.shared.lifecycle().begin_shutdown();
+        let indexer_copies = self.accounts.app.abort_all_public_indexer_copies();
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::StorageClose)
             .await;
@@ -5762,6 +5851,9 @@ impl MarmotAppRuntime {
             crate::ProductUnit::Attempt,
         );
         let close_result = blocking_app_task(move || app.close_storage()).await;
+        for task in indexer_copies {
+            let _ = task.await;
+        }
         if let Some(observation) = close_observation {
             observation.finish(if close_result.is_ok() {
                 "success"
@@ -6158,6 +6250,12 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
+        for task in self
+            .app
+            .abort_public_indexer_copies_for_account(&account.account_id_hex)
+        {
+            let _ = task.await;
+        }
         let audit_export = self.app.audit_export_lifecycle.clone();
         let account_id = account.account_id_hex.clone();
         let _audit_export_mutation =
@@ -6183,6 +6281,12 @@ impl AccountManager {
             self.app
                 .remove_account_key_package_artifacts(&account.label)?;
             self.app.account_home().remove_account(&account.label)?;
+            for task in self
+                .app
+                .abort_public_indexer_copies_for_account(&account.account_id_hex)
+            {
+                let _ = task.await;
+            }
             self.clear_startup_retry(&account.account_id_hex);
             // The account no longer exists on this device, so the host callback
             // handle it registered must not outlive it. This runs only after
@@ -7334,7 +7438,6 @@ impl AccountManager {
         self.app
             .account_home()
             .complete_account_setup(&account.label)?;
-
         Ok(AccountSetupResult {
             account,
             relay_lists,
@@ -7647,7 +7750,8 @@ impl AccountManager {
         let bootstrap = AccountRelayListBootstrap::new(
             request.default_relays.clone(),
             request.bootstrap_relays.clone(),
-        );
+        )
+        .with_indexer_relays(request.discovery_relays.clone());
         // Validate before advancing the durable publication phase. The
         // publisher validates again at its own action boundary because it is
         // also called directly outside this setup orchestrator.
@@ -7677,6 +7781,27 @@ impl AccountManager {
                 profile = cached;
             }
             if status.complete {
+                // A prior attempt may have failed after confirming bootstrap
+                // but before scheduling its best-effort indexer copy.
+                match self
+                    .app
+                    .prepare_generated_account_indexer_copy(
+                        &account.label,
+                        &status,
+                        &profile,
+                        &request.discovery_relays,
+                    )
+                    .await
+                {
+                    Ok(Some(copy)) => self.app.spawn_public_indexer_copy(copy),
+                    Ok(None) => {}
+                    Err(err) => tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "setup_generated_account_bootstrap",
+                        error_kind = err.privacy_safe_kind(),
+                        "could not prepare resumed public indexer copy"
+                    ),
+                }
                 return Ok((status, Some(profile)));
             }
             // The durable publication phase is authoritative, but the local
@@ -7729,6 +7854,11 @@ impl AccountManager {
             }
         };
         self.mark_bootstrap_publication_confirmed(&account.label)?;
+        // The copy must be scheduled before any later KeyPackage or reconcile
+        // failure can drop it. Indexer publication itself stays off this path.
+        if let Some(copy) = publication.indexer_copy {
+            self.app.spawn_public_indexer_copy(copy);
+        }
         Ok((publication.status, Some(profile)))
     }
 
@@ -8185,6 +8315,9 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        for task in self.app.abort_all_public_indexer_copies() {
+            let _ = task.await;
+        }
         self.onboarding_updates
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -8321,8 +8454,8 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
     }
 }
 
-/// Public indexer relays used to resolve a pre-existing identity's outbox
-/// metadata during setup.
+/// Public indexer relays used to resolve existing identities and spread newly
+/// generated accounts' public relay lists and profile metadata.
 ///
 /// A brand-new external-signer account (or an imported nsec) keeps its NIP-65
 /// relay list (kind:10002) and profile (kind:0) on public indexers, not on the
@@ -8330,8 +8463,7 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
 /// app's relays therefore finds nothing and the display name never resolves —
 /// the exact bug the external-signer work exists to fix. These indexers give
 /// the directory preflight a discovery set distinct from the operational
-/// messaging relays. They are used only to read the outbox list and profile,
-/// they are never adopted as the account's messaging relays.
+/// messaging relays. They are never adopted as the account's messaging relays.
 pub(crate) const VERTEX_DIRECTORY_RELAY: &str = "wss://relay.vertexlab.io";
 
 const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[

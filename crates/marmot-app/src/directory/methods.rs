@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use cgka_traits::TransportEndpoint;
+use cgka_traits::{MemberId, TransportEndpoint};
 use marmot_account::AccountSummary;
 use nostr_sdk::prelude::PublicKey;
 #[cfg(test)]
@@ -769,19 +769,31 @@ impl MarmotApp {
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
-        self.publish_user_profile_to_endpoints(&account.label, profile, endpoints)
-            .await
+        self.publish_user_profile_to_endpoints_and_indexers(
+            &account.label,
+            profile,
+            endpoints,
+            bootstrap.indexer_relays,
+            bootstrap
+                .default_relays
+                .into_iter()
+                .chain(bootstrap.bootstrap_relays)
+                .collect(),
+        )
+        .await
     }
 
     /// Publish kind-0 metadata to an already-selected, account-scoped route.
     ///
     /// This is the action boundary used when the runtime has captured one
     /// coherent relay-list snapshot and must not re-read it before publishing.
-    pub(crate) async fn publish_user_profile_to_endpoints(
+    pub(crate) async fn publish_user_profile_to_endpoints_and_indexers(
         &self,
         label: &str,
         profile: UserProfileMetadata,
         endpoints: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+        declared_relays: Vec<TransportEndpoint>,
     ) -> Result<(), AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::Directory,
@@ -789,7 +801,13 @@ impl MarmotApp {
             crate::ProductUnit::Attempt,
         );
         let result = self
-            .publish_user_profile_to_endpoints_unobserved(label, profile, endpoints)
+            .publish_user_profile_to_endpoints_unobserved(
+                label,
+                profile,
+                endpoints,
+                indexer_relays,
+                declared_relays,
+            )
             .await;
         if let Some(observation) = observation {
             observation.finish(if result.is_ok() { "success" } else { "failure" });
@@ -802,19 +820,43 @@ impl MarmotApp {
         label: &str,
         profile: UserProfileMetadata,
         endpoints: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+        declared_relays: Vec<TransportEndpoint>,
     ) -> Result<(), AppError> {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let content = serde_json::to_string(&profile_content_json(&profile))?;
-        let event = NostrTransportEvent::new_unsigned(
+        let mut event = NostrTransportEvent::new_unsigned(
             account.account_id_hex.clone(),
             KIND_NOSTR_METADATA,
             Vec::new(),
             content,
         );
-        self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer())
-            .publish_event(&endpoints, &event, 1)
-            .await?;
+        let indexers = self.public_indexer_publish_endpoints(
+            &indexer_relays,
+            &endpoints,
+            &endpoints,
+            &declared_relays,
+        );
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let nostr_signer = signer.as_nostr_signer();
+        if !indexers.is_empty() {
+            event = crate::sign_account_publication_event(nostr_signer.clone(), &event).await?;
+        }
+        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
+        let outcome = relay_client
+            .publish_event_for_account(&account_id, &endpoints, &event, 1)
+            .await;
+        if outcome?.accepted.is_empty() {
+            return Err(AppError::Publish(
+                "no account relay acknowledged profile metadata".into(),
+            ));
+        }
+        if let Some(copy) =
+            crate::PublicIndexerCopy::new(relay_client, account_id, vec![event], indexers)
+        {
+            self.spawn_public_indexer_copy(copy);
+        }
         Ok(())
     }
 
