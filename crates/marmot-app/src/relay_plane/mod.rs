@@ -313,6 +313,14 @@ impl AccountDeliveryOverflowState {
             .fetch_max(depth, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    fn spill_in_flight(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .spill_in_flight
+    }
+
     fn begin_spill(&self) {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         state.spill_in_flight = state.spill_in_flight.saturating_add(1);
@@ -1099,6 +1107,14 @@ impl MarmotRelayPlane {
         &self,
         account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
+        // Settle in-flight spill writes while this route can still record
+        // their loss, and before a replacement adapter reads the table.
+        let spill = account_deliveries_read(&self.inner.transport.account_deliveries)
+            .get(account_id)
+            .and_then(|route| route.spill.clone());
+        if let Some(spill) = spill {
+            spill.retire().await;
+        }
         account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
         self.inner
             .transport

@@ -2258,6 +2258,90 @@ async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
     assert!(matches!(woke, AccountDeliveryWait::SpillReady));
 }
 
+/// Retirement waits for an in-flight spill write while the route still
+/// exists: a committed write is durable before any replacement reads the
+/// table, and a failed one records durable loss through that route.
+#[tokio::test]
+async fn retirement_settles_an_in_flight_spill_write_before_removing_the_route() {
+    for commit in [true, false] {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let alice = MemberId::new(vec![0xA1; 32]);
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = release.clone();
+        let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+            while !gate.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if commit {
+                Ok(vec![
+                    storage_sqlite::DeliverySpillDisposition::Stored;
+                    deliveries.len()
+                ])
+            } else {
+                Err(AccountDeliveryRecoveryMarkerError::Closed)
+            }
+        });
+        let marked = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = marked.clone();
+        let marker: AccountDeliveryRecoveryMarker = Arc::new(move |token, dropped| {
+            recorded.lock().unwrap().push((token, dropped));
+            Ok(())
+        });
+        let adapter = relay_plane.account_adapter_with_recovery_marker(
+            alice.clone(),
+            relay.clone(),
+            Some(marker),
+            Some(store),
+        );
+        fill_account_queue(&relay_plane, &adapter, &alice, 1).await;
+        timeout(Duration::from_secs(5), async {
+            while !adapter.delivery_loss_blocks_cursor() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the overflowed delivery is handed to the spill writer");
+
+        let retiring = relay_plane.clone();
+        let account = alice.clone();
+        let deactivate =
+            tokio::spawn(async move { retiring.deactivate_account_context(&account).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !deactivate.is_finished(),
+            "retirement waits for the in-flight write"
+        );
+        release.store(true, Ordering::SeqCst);
+        timeout(Duration::from_secs(5), deactivate)
+            .await
+            .expect("retirement completes once the write settles")
+            .unwrap()
+            .unwrap();
+        assert_eq!(adapter.delivery_overflow.spill_in_flight(), 0);
+        if commit {
+            assert!(
+                !adapter.delivery_loss_blocks_cursor(),
+                "a committed spill leaves no loss"
+            );
+            assert!(marked.lock().unwrap().is_empty());
+        } else {
+            timeout(Duration::from_secs(5), async {
+                while marked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, dropped)| *dropped == 0)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("a failed write records durable loss through the still-registered route");
+        }
+    }
+}
+
 #[tokio::test]
 async fn pending_spill_wakeup_wins_over_a_ready_live_queue() {
     let relay = Arc::new(RecordingRelayClient::default());

@@ -136,11 +136,14 @@ impl AppClient {
         let Some((seq, event_id)) = self.delivery_spill.in_flight.take() else {
             return;
         };
+        // An unreadable receipt view proves nothing either way. The row is
+        // read again later without spending one of its attempts.
         let admitted = self
             .transport_receipts()
-            .is_ok_and(|receipts| receipts.contains(&event_id));
+            .map(|receipts| receipts.contains(&event_id));
         let now = unix_now_seconds();
         let settled = (|| -> Result<(), AppError> {
+            let admitted = admitted?;
             let storage = self.app.account_storage(&self.state.label)?;
             if admitted {
                 storage.remove_spilled_account_delivery(seq)?;
@@ -298,6 +301,48 @@ mod tests {
                 .unwrap()
                 .deliveries
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_receipts_keep_the_row_without_spending_an_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap();
+        let now = unix_now_seconds();
+        storage
+            .spill_account_deliveries(&[delivery(3)], ACCOUNT_DELIVERY_SPILL_LIMITS, now)
+            .unwrap();
+        let seq = storage
+            .spilled_account_deliveries(10, now)
+            .unwrap()
+            .deliveries[0]
+            .seq;
+
+        client.delivery_spill.in_flight = Some((seq, hex::encode([3_u8; 32])));
+        client.released_backfill_reload_pending = true;
+        client.fail_next_released_backfill_reload = true;
+        client.settle_spilled_delivery();
+        assert_eq!(
+            storage
+                .spilled_account_deliveries(10, now)
+                .unwrap()
+                .deliveries
+                .len(),
+            1,
+            "the row stays due: no attempt was spent"
+        );
+        assert!(
+            client.spill_retry_wait().is_some(),
+            "the row is read again later"
         );
     }
 
