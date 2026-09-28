@@ -305,9 +305,15 @@ impl AccountManager {
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
+        let state = &c.snapshot.steps[step.index()];
+        let passed_with_retired = state.status == OnboardingStatus::Passed
+            && state
+                .findings
+                .iter()
+                .any(|finding| finding.issue == OnboardingIssue::RetiredRelay);
         if !step.relay()
             || c.approved
-            || c.snapshot.steps[step.index()].status != OnboardingStatus::NeedsInput
+            || (state.status != OnboardingStatus::NeedsInput && !passed_with_retired)
         {
             return Err(onboarding_error());
         }
@@ -316,6 +322,9 @@ impl AccountManager {
             c.records[step.index()].as_ref(),
             &c.options.default_relays,
         );
+        if passed_with_retired && repair.mode != OnboardingRelayRepairMode::RemovalOnly {
+            return Err(onboarding_error());
+        }
         // Removing a retired declaration cannot make a timed-out usable route
         // complete inspection. Do not present that removal as an approvable fix.
         if repair.mode == OnboardingRelayRepairMode::RemovalOnly

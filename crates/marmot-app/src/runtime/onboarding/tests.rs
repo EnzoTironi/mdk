@@ -858,6 +858,100 @@ async fn inspection_failures_never_select_allowed_endpoints_for_removal() {
 }
 
 #[tokio::test]
+async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_only_repair() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let source = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["client".into(), "keep".into()],
+            vec!["r".into(), "wss://custom.example".into()],
+            vec!["r".into(), "wss://relay.damus.io".into()],
+        ],
+        "opaque content",
+        unix_now_seconds() - 1,
+    );
+    *network.events.lock().unwrap() = vec![source.clone()];
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let (status, findings, record) = manager
+        .check_onboarding_step(&checkpoint, OnboardingStep::Relays)
+        .await;
+    assert_eq!(status, OnboardingStatus::Passed);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::RetiredRelay)
+    );
+    checkpoint.set(OnboardingStep::Relays, status, findings);
+    checkpoint.records[OnboardingStep::Relays.index()] = record;
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    let saved = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    assert!(!saved.approved);
+    assert_eq!(
+        saved.snapshot.steps[OnboardingStep::Relays.index()].status,
+        OnboardingStatus::Passed
+    );
+    assert!(
+        saved.snapshot.steps[OnboardingStep::Relays.index()]
+            .findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::RetiredRelay)
+    );
+
+    let preview = manager
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let repair = preview
+        .proposal
+        .as_ref()
+        .unwrap()
+        .relay_repair
+        .as_ref()
+        .unwrap();
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalOnly);
+    assert_eq!(
+        repair.original_event_id.as_deref(),
+        Some(source.id.as_str())
+    );
+    assert_eq!(repair.proposed_content, source.content);
+    assert_eq!(
+        repair
+            .after_tags
+            .iter()
+            .map(|t| &t.fields)
+            .collect::<Vec<_>>(),
+        vec![&source.tags[0], &source.tags[1]]
+    );
+    assert!(
+        preview.steps[OnboardingStep::Relays.index()]
+            .actions
+            .contains(&OnboardingAction::ApproveRepair)
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    assert!(
+        manager
+            .approve_onboarding_repair(&id, preview.revision - 1)
+            .await
+            .is_err()
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    network.zero_acks.store(true, Ordering::SeqCst);
+    manager
+        .approve_onboarding_repair(&id, preview.revision)
+        .await
+        .unwrap();
+    let published = network.attempts.lock().unwrap()[0].clone();
+    assert_eq!(
+        published.tags,
+        vec![source.tags[0].clone(), source.tags[1].clone()]
+    );
+    assert_eq!(published.content, source.content);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let source = signed(
