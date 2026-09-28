@@ -50,14 +50,17 @@ The simulator comes first; Jeff validates on a phone.
      transaction that deletes a spill row and records its loss. A later drop can carry an
      earlier `created_at`, for example an inbox wrap tweaked by NIP-59. Neither the
      checkpoint nor the live subscription floor is a bound: each subscription keeps the
-     `since` it was built with, which can be far older than the current checkpoint.
+     `since` it was built with, which can be far older than the current checkpoint. A
+     charge with no known `created_at` clears the generation's bound in that same update,
+     so a goal is bounded only when every delivery charged to it contributed a timestamp.
    - Loss with no known bound has an unbounded goal. That covers SDK notification lag, an
      undecodable spill row, count-only rows written before step 2, and an epoch gap whose
      commit time is unknown. So does a goal that reaches below the retained-inventory floor. None of these can be certified by
      comparison, although the comparison still fetches every difference inside the window.
      Such an obligation completes only on its own evidence, for example the missing epoch
      arriving, or it parks for explicit deep repair.
-   - Otherwise, after **3 completed attempts that make no progress**, the obligation parks.
+   - Otherwise, after **3 completed attempts in a row that admit nothing new and certify
+     nothing**, the obligation parks.
      It shows "history may be incomplete" and offers an explicit deep repair. There are no
      further automatic retries.
    - Attempts that fail only because relays were unreachable do not count toward the budget.
@@ -67,9 +70,13 @@ The simulator comes first; Jeff validates on a phone.
    are the whitenoise.chat relays we operate, and NIP-77 is a hard requirement for group
    relays from now on. The account inbox route requires the account's inbox relays. An
    empty required set never certifies a scope. A required relay that does not support NIP-77
-   cannot certify its scope. That attempt counts toward the no-progress budget, so the
-   obligation parks for explicit deep repair instead of waiting indefinitely or completing
-   vacuously.
+   cannot certify its scope, so the scope never completes on the relays that do.
+   Acquisition keeps admitting what the supporting relays still hold. An attempt counts
+   toward the no-progress budget only when it admits nothing new, so three quiet attempts
+   park the obligation instead of it waiting indefinitely or completing vacuously. A
+   completed explicit deep repair, an unfloored replay with EOSE coverage from every
+   reachable required relay, closes the parked scopes it covered without a NIP-77
+   certificate.
    Treating relays we do not operate as best-effort needs a configured set of operated
    relays. Until one exists, every relay on a route is required.
 4. Both implementation steps land before the next MarmotKit release.
