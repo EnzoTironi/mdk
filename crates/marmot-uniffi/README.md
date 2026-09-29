@@ -80,7 +80,7 @@ All methods, including less common management/diagnostic operations, are listed 
 | Accounts and onboarding | Identity creation/import, setup readiness, local sign-in/out, wipe/export and external signers. Keep local removal, leaving groups, remote publication and wiping credentials distinct; inspect returned cleanup/send outcomes. Interactive onboarding is a persisted approval workflow, not a series of unconditional setters. |
 | Directory and profiles | Canonical member-reference parsing, safe names, cached identities, profile/relay refresh and user search. Cached reads and explicit network refresh are separate. Use prepared identity references on chat screens instead of per-row lookups. |
 | Groups and administration | Creation, staged/prepared images, invitations, membership/admin changes, retention, archive/leave/disband, recovery, quarantine and maintenance. Use current capabilities; a displayed roster is not authorization. Queued operations and uncertain publication require result-aware UI. "History may be incomplete" notices report parked recovery; see [History may be incomplete notices](#history-may-be-incomplete-notices). |
-| Messages, edits, reactions and polls | Send/reply/edit/custom events, reaction changes, encrypted NIP-88 polls, deletion and edit history. Render effective prepared content and viewer reaction/poll state; use raw history only when the feature needs it. |
+| Messages, edits, reactions and polls | Send/reply/edit/custom events, reaction changes, encrypted NIP-88 polls, deletion and edit history. Render effective prepared content and viewer reaction/poll state; use raw history only when the feature needs it. Every client must render and answer polls, because peers can send them. |
 | Moderation and blocking | Typed reports, individual dismissals, deletion-masked report targets and live block lists. Reports are not deletion evidence; the host designs moderation queue UI from the provided records. |
 | Screens, read state and drafts | Prepared bounded lists/conversations, account attention, read markers, manual unread, pins, mutes and revisioned composers. MDK owns persistent projection state; the host owns viewport/layout. |
 | Media and avatars | Sending/uploading media is separate from discovery, receiving, retained-byte access and decoding. Use original source slots and current opaque references; preserve rejected attachment positions. |
@@ -150,8 +150,8 @@ They use the runtime registry's `app_runtime_host_*` OTLP series with the same
 started/completed counters, five outcomes, histogram and live gauges. Hosts report
 the actual outcome; merely leaving a scope does not establish success. These
 completed-duration reports have no live observation, so their live gauges are zero.
-Record only stages your client can observe. Nested stages overlap and must not be
-summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
+Hosts should record every stage they can observe, and only those. Nested stages overlap and
+must not be summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
 [metric catalog](../../docs/marmot-architecture/telemetry.md#registered-host-stage-metrics).
 Regenerate Swift/Kotlin bindings with the matching library to adopt the new enum
 cases; the snapshot record fields and constructors are unchanged.
@@ -365,13 +365,16 @@ object, subscription objects, records, enums, and error variants.
 
 ## Audit v5 recording and delivery
 
-`AuditLogSettingsFfi.enabled` remains the recording opt-in. New account sessions and the live
-runtime switch write `marmot-forensics-audit/v5` to `audit-<engine_id>-v5.jsonl`; existing v4 files
-remain on disk. To deliver v5, supply a dedicated OTLP `/v1/logs` destination and bearer token
-with `set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi)`. The configuration is held in memory and
-the returned record omits the token. Set `enabled: false` to remove delivery configuration.
+v5 replaces v4 as the audit format. `AuditLogSettingsFfi.enabled` remains the recording opt-in.
+New account sessions and the live runtime switch write only `marmot-forensics-audit/v5` to
+`audit-<engine_id>-v5.jsonl`; no new v4 files are written, and existing v4 files remain on disk.
+Hosts that record audit logs must configure v5 delivery, or new evidence never leaves the
+device. Deploy a receiver that accepts every v5 event kind first. To deliver v5, supply a dedicated OTLP `/v1/logs` destination and bearer token
+with `set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi)`. The configuration is held in memory, so
+apply it on every launch; the returned record omits the token. Set `enabled: false` to remove delivery configuration.
 An exact loopback endpoint requires `allow_loopback_dev: true`; public endpoints require HTTPS.
-The host then calls `post_audit_log_tracker_update_v5()` for an immediate pass; the existing
+The host then calls `post_audit_log_tracker_update_v5()`, in place of
+`post_audit_log_tracker_update()`, for an immediate pass; the existing
 audit tracker also uses this configuration on its activity triggers with the usual batching,
 retry, and shutdown behavior. The v5 result reports accepted batches, pending accounts, blocked
 accounts, and idle accounts separately from legacy v4 uploads. No host should infer receiver
@@ -380,7 +383,9 @@ v5 records.
 
 ## Legacy audit v4 upload
 
-Audit uploads now accept only `marmot-forensics-audit/v4`; old local files are never migrated or sent.
+The v4 whole-file route only drains v4 files written before 0.11.0; keep its configuration until
+they are gone, and do not build new v4 infrastructure. Whole-file uploads accept only
+`marmot-forensics-audit/v4`; older local files are never migrated or sent.
 App construction automatically removes recognized v1-v3 forensic files and rotated segments after acquiring the
 root lease, including files in failed account-wipe remnants, even with recording disabled. V4 files and the separate
 key-reveal log are preserved; failures are nonfatal and retried on the next open. No additional Swift/Kotlin cleanup
@@ -391,7 +396,7 @@ The versioned config type changes the setter ABI checksum so old generated bindi
 reinterpret a device label as a hardware model.
 Populate this field from system model information (e.g. `iPhone17,3` or `Pixel 9a`), never from a device name,
 hostname or serial number. Omit it if unavailable. Platform and app version are unchanged.
-Deploy a v4-compatible Goggles endpoint before expecting successful uploads from these bindings.
+Uploads of leftover v4 files still need a v4-compatible Goggles endpoint; new evidence goes to v5.
 Native metadata lift/lower checks: `./crates/marmot-uniffi/audit-v4-smoke.sh swift` and
 `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars> ./crates/marmot-uniffi/audit-v4-smoke.sh kotlin`.
 These regenerate host bindings and execute DTO round trips; platform package builds remain separate.

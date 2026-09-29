@@ -39,6 +39,9 @@ deadline should also close its controls from the `endsAt` timestamp instead of w
 lists suppress alerts and presentation for blocked senders but do not rewrite the shared poll tally; every authenticated
 member's valid response remains part of the group result.
 
+Every client must handle polls: peers on 0.11.0 can create them, and a client that ignores
+`poll` shows only the bare question with no way to answer.
+
 Polls are coordination tools, not anonymous or election-grade voting. Every group member receives authenticated voter
 identity with each response, and distributed clients/relays do not provide a global sequencer at the closing boundary.
 Hosts must not describe the feature as anonymous or use the result for high-stakes elections.

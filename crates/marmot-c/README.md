@@ -182,16 +182,19 @@ release dependencies.
 
 ## Audit v5 recording and delivery
 
-Recording remains opt-in through `MarmotAuditLogSettings`. New recordings use v5 JSONL files.
-For v5 delivery, call `marmot_set_audit_otlp_config_v5` with a dedicated OTLP `/v1/logs`
-destination and bearer token, then call `marmot_post_audit_log_tracker_update_v5` for a manual
-pass. The returned config redacts the token; free it with `marmot_audit_otlp_config_v5_free`.
+v5 replaces v4 as the audit format. Recording remains opt-in through `MarmotAuditLogSettings`,
+and new recordings write only v5 JSONL files. Hosts that record audit logs must configure v5
+delivery, or new evidence never leaves the device. Call `marmot_set_audit_otlp_config_v5` with a
+dedicated OTLP `/v1/logs` destination and bearer token on every launch, because it is held in
+memory only. Then call `marmot_post_audit_log_tracker_update_v5`, in place of the v4 tracker
+update, for a manual pass. The returned config redacts the token; free it with
+`marmot_audit_otlp_config_v5_free`.
 Free the versioned result with `marmot_audit_log_tracker_update_result_v5_free`. It reports v5
 accepted, pending, blocked, and idle counts independently of v4 whole-file uploads. The existing
 tracker activity triggers use the same in-memory v5 config with their batching and retry policy.
 Set `enabled` to false to clear the destination. Loopback requires the explicit
-`allow_loopback_dev` flag, while public destinations require HTTPS. Existing v4 files remain
-available for the legacy endpoint; v5 bytes never go there.
+`allow_loopback_dev` flag, while public destinations require HTTPS. v4 files written before
+0.11.0 remain available to drain through the legacy endpoint; v5 bytes never go there.
 
 ## Legacy audit v4 upload
 
