@@ -5278,16 +5278,54 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
     // Exercise every durable mutation through the same production projection
     // used by live delivery and replay.
-    connector
-        .runtime
-        .edit_message(
+    assert!(matches!(
+        connector
+            .edit_message_response(
+                &agent.account.account_id_hex,
+                &group_id_hex,
+                &target_message_id_hex,
+                "must not edit another author",
+            )
+            .await,
+        Err(crate::error::ConnectorError::Unauthorized)
+    ));
+    assert!(
+        connector
+            .edit_message_response(
+                &human.account.account_id_hex,
+                "not-hex",
+                &target_message_id_hex,
+                "invalid group",
+            )
+            .await
+            .is_err()
+    );
+    let edited = connector
+        .edit_message_response(
             &human.account.account_id_hex,
-            &group_id,
+            &group_id_hex,
             &target_message_id_hex,
             "edited while lagging",
         )
         .await
         .unwrap();
+    assert!(
+        matches!(edited, AgentControlResponse::FinalSent { message_ids_hex, .. } if !message_ids_hex.is_empty())
+    );
+    let materialized = connector
+        .timeline_message_response(
+            &human.account.account_id_hex,
+            &group_id_hex,
+            &target_message_id_hex,
+        )
+        .unwrap();
+    assert!(matches!(
+        materialized,
+        AgentControlResponse::TimelineMessage {
+            message: Some(message),
+            ..
+        } if message.text.as_deref() == Some("edited while lagging")
+    ));
     let reaction = connector
         .runtime
         .react_to_message(

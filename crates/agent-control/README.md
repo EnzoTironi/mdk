@@ -63,6 +63,19 @@ discover reaction event ids. An optional `emoji` retracts all of the calling
 account's active reactions with that exact content. Omitting `emoji` retracts
 all of the account's active reactions on the target in one durable delete event.
 
+## Editing a durable message
+
+`edit_message` lets a control client update a message authored by the selected
+local account. Supply `account_id_hex`, `group_id_hex`, `target_message_id_hex`,
+and replacement `text`. Before publishing, `wn-agent` checks that the target is
+visible, available, and self-authored; a foreign, deleted, or missing target is
+rejected. A successful request returns `final_sent` with the edit event id. This
+lets an agent update a pinned status message without adding another chat row.
+
+An edit has no idempotency key. If the response is lost after publication, read
+the materialized target with `timeline_message_get` before deciding whether to
+retry; do not blindly replay an uncertain edit.
+
 ## Materialized timeline reads
 
 `timeline_message_get` resolves one durable message id and `timeline_list` pages a

@@ -371,6 +371,20 @@ impl AgentConnector {
                 )
                 .await
             }
+            AgentControlRequest::EditMessage {
+                account_id_hex,
+                group_id_hex,
+                target_message_id_hex,
+                text,
+            } => {
+                self.edit_message_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    &target_message_id_hex,
+                    &text,
+                )
+                .await
+            }
             AgentControlRequest::DeleteMessage {
                 account_id_hex,
                 group_id_hex,
