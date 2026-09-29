@@ -773,7 +773,7 @@ impl AppClient {
 
     pub(crate) fn request_bounded_comparison(&mut self) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
-        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        self.synchronize_recovery_loss(&storage)?;
         drop(self.transport_receipts()?);
         self.observe_recovery_route_policy()?;
         let now = wall_now_ms()?;
@@ -942,7 +942,7 @@ impl AppClient {
             });
         }
         let storage = self.app.account_storage(&self.state.label)?;
-        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        self.synchronize_recovery_loss(&storage)?;
         self.observe_recovery_route_policy()?;
         let domain_updates = self.runtime.post_join_eose_updates(group_id)?;
         storage.with_transaction(|storage| {
@@ -1268,7 +1268,7 @@ impl AppClient {
             return Ok(None);
         }
         let storage = self.app.account_storage(&self.state.label)?;
-        storage.synchronize_account_delivery_loss(&self.state.label)?;
+        self.synchronize_recovery_loss(&storage)?;
         // Failed detector persistence is retried before any selection. These
         // observations carry demand only; SQL remains the retry authority.
         let arms = self
@@ -3138,6 +3138,19 @@ mod tests {
             .unwrap();
         client.delivery_overflow_recovery_pending = true;
         client.delivery_overflow_recovery_marker_token = Some(42);
+        // Every compared relay answers and certifies nothing. Only answered
+        // passes spend the parking budget; a route with no comparison
+        // backend would not.
+        client.test_comparison_results =
+            Some(crate::client::sync::ScriptedComparisons::by_route(|_| {
+                Ok(Some((
+                    transport_nostr_adapter::NostrReconciliationSummary {
+                        relays_succeeded: 1,
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )))
+            }));
         let grant = client
             .authorize_account_recovery(
                 None,

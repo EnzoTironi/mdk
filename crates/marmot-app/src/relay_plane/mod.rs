@@ -132,7 +132,43 @@ struct RelayPlaneTransport {
     /// [`NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`] in milliseconds; tests shorten
     /// it.
     eose_repair_settle_ms: AtomicU64,
+    /// Finished lag-lost EOSE repairs waiting for an account worker to record
+    /// them, oldest first, bounded by [`EOSE_REPAIR_REPORTS_MAX`]. The
+    /// repair only pushes; recording happens on the worker, so it never
+    /// waits on audit.
+    eose_repair_reports: std::sync::Mutex<EoseRepairReports>,
     shutting_down: AtomicBool,
+}
+
+/// At most this many unrecorded repair reports are kept; older ones are
+/// dropped and counted.
+const EOSE_REPAIR_REPORTS_MAX: usize = 64;
+
+#[derive(Default)]
+struct EoseRepairReports {
+    pending: std::collections::VecDeque<EoseRepairReport>,
+    /// Evicted reports whose receiver had no later pending report to carry
+    /// the count. A scalar, so the accounting stays bounded with the queue.
+    dropped_unattributed: u64,
+}
+
+/// One finished lag-lost EOSE repair pass, for its audit row.
+#[derive(Clone, Debug)]
+pub(crate) struct EoseRepairReport {
+    /// The lagging receiver's account, or `None` for a receiver shared
+    /// across accounts.
+    pub(crate) scope: Option<MemberId>,
+    /// Whether this pass followed an earlier one that left relays
+    /// unrepaired, rather than a lag directly.
+    pub(crate) follow_up: bool,
+    /// Lags folded into this pass while its receiver settled.
+    pub(crate) lags: u64,
+    pub(crate) summary: transport_nostr_adapter::EoseReissueSummary,
+    /// Whether a follow-up repair was scheduled for the failed relays.
+    pub(crate) follow_up_scheduled: bool,
+    /// Earlier reports for this scope dropped at the queue bound, carried
+    /// forward onto this one when they were evicted.
+    pub(crate) dropped_before: u64,
 }
 
 /// A lag-lost EOSE repair waiting for its receiver to settle.
@@ -141,6 +177,10 @@ struct EoseRepairSchedule {
     due: tokio::time::Instant,
     /// The latest lag: only REQs issued by then are re-issued.
     lag: NotificationLagMark,
+    /// Audit only: lags folded into this schedule, and whether it retries an
+    /// earlier pass's unrepaired relays.
+    lags: u64,
+    follow_up: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +277,15 @@ pub(crate) struct AccountDeliveryOverflow {
     pub(crate) notification_floor: Option<u64>,
     pub(crate) queue_depth: usize,
     pub(crate) elapsed_ms: u64,
+}
+
+/// Cumulative placements one account queue made, as counts only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccountDeliveryPlacementCounts {
+    pub(crate) spilled_below_floor: u64,
+    pub(crate) spilled_queue_full: u64,
+    pub(crate) spill_already_seen: u64,
+    pub(crate) queue_dropped: u64,
 }
 
 #[derive(Debug)]
@@ -388,6 +437,11 @@ struct AccountDeliveryMetrics {
     dropped: AtomicU64,
     spilled: AtomicU64,
     spill_already_seen: AtomicU64,
+    /// Deliveries `place` sent to the spill because a cursor commit had
+    /// raised the restart floor past them, and because the queue was full.
+    /// Counted at placement; `spilled` counts what the writer stored.
+    spill_diverted_below_floor: AtomicU64,
+    spill_diverted_queue_full: AtomicU64,
     recovery_attempts: AtomicU64,
     recovery_successes: AtomicU64,
     recovery_failures: AtomicU64,
@@ -470,6 +524,14 @@ impl AccountDeliveryOverflowState {
         }
         if spill {
             state.spill_in_flight = state.spill_in_flight.saturating_add(1);
+            RelayNotificationForwarderHealth::increment(
+                if queue_full {
+                    &self.metrics.spill_diverted_queue_full
+                } else {
+                    &self.metrics.spill_diverted_below_floor
+                },
+                1,
+            );
             AccountDeliveryPlacement::Spill
         } else {
             AccountDeliveryPlacement::Omit
@@ -1259,6 +1321,7 @@ impl MarmotRelayPlane {
             eose_repair_settle_ms: AtomicU64::new(
                 NOTIFICATION_LAG_EOSE_REPAIR_SETTLE.as_millis() as u64
             ),
+            eose_repair_reports: std::sync::Mutex::new(EoseRepairReports::default()),
             shutting_down: AtomicBool::new(false),
         });
         let this = Self {
@@ -1450,6 +1513,39 @@ impl MarmotRelayPlane {
         self.inner
             .subscription_rebuild_lookback
             .map(|lookback| lookback.as_secs())
+    }
+
+    /// Take the finished lag-lost EOSE repair reports this account records:
+    /// its own receiver's, and, when `shared` is set, those of a receiver
+    /// shared across accounts, which the first account to take them records
+    /// once. An account with no v5 recorder takes only its own, so it never
+    /// consumes a shared report another account could record.
+    pub(crate) fn take_eose_repair_reports(
+        &self,
+        account: &MemberId,
+        shared: bool,
+    ) -> Vec<EoseRepairReport> {
+        let mut reports = self
+            .inner
+            .transport
+            .eose_repair_reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reports.pending.is_empty() {
+            return Vec::new();
+        }
+        let mut taken = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+        for report in std::mem::take(&mut reports.pending) {
+            let own = report.scope.as_ref() == Some(account);
+            if own || (shared && report.scope.is_none()) {
+                taken.push(report);
+            } else {
+                kept.push_back(report);
+            }
+        }
+        reports.pending = kept;
+        taken
     }
 
     /// Drain the per-relay subscription-registration outcomes `account`
@@ -2956,6 +3052,15 @@ fn schedule_eose_repair(
     account_id: Option<&MemberId>,
     lag: NotificationLagMark,
 ) {
+    schedule_eose_repair_pass(transport, account_id, lag, false);
+}
+
+fn schedule_eose_repair_pass(
+    transport: &Arc<RelayPlaneTransport>,
+    account_id: Option<&MemberId>,
+    lag: NotificationLagMark,
+    follow_up: bool,
+) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
@@ -2969,9 +3074,23 @@ fn schedule_eose_repair(
     if let Some(pending) = repairs.get_mut(&scope) {
         pending.due = due;
         pending.lag = pending.lag.max(lag);
+        if !follow_up {
+            // A lag that postpones a pending follow-up owns the pass: it
+            // widens it to the REQs issued by the lag.
+            pending.lags = pending.lags.saturating_add(1);
+            pending.follow_up = false;
+        }
         return;
     }
-    repairs.insert(scope.clone(), EoseRepairSchedule { due, lag });
+    repairs.insert(
+        scope.clone(),
+        EoseRepairSchedule {
+            due,
+            lag,
+            lags: u64::from(!follow_up),
+            follow_up,
+        },
+    );
     drop(repairs);
     runtime.spawn(run_eose_repair(Arc::downgrade(transport), scope));
 }
@@ -2980,7 +3099,7 @@ fn schedule_eose_repair(
 /// that a relay has not answered with end-of-stored-events. Holds the plane
 /// only weakly, so it never keeps a shut-down plane alive.
 async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<MemberId>) {
-    let (transport, lag) = loop {
+    let (transport, lag, lags, follow_up) = loop {
         let due = {
             let Some(transport) = transport.upgrade() else {
                 return;
@@ -3004,16 +3123,16 @@ async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<Mem
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match repairs.get(&scope) {
-                Some(pending) if pending.due <= tokio::time::Instant::now() => {
-                    repairs.remove(&scope).map(|pending| pending.lag)
-                }
+                Some(pending) if pending.due <= tokio::time::Instant::now() => repairs
+                    .remove(&scope)
+                    .map(|pending| (pending.lag, pending.lags, pending.follow_up)),
                 // A later lag postponed it.
                 Some(_) => None,
                 None => return,
             }
         };
-        if let Some(lag) = lag {
-            break (transport, lag);
+        if let Some((lag, lags, follow_up)) = lag {
+            break (transport, lag, lags, follow_up);
         }
     };
     if transport.shutting_down.load(Ordering::SeqCst) {
@@ -3036,25 +3155,63 @@ async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<Mem
         "repaired subscriptions whose end-of-stored-events a notification lag may have lost",
     );
     let unrepaired = summary.failed_relays;
-    if unrepaired == 0 {
+    let Some(transport) = weak.upgrade() else {
+        return;
+    };
+    let follow_up_scheduled = unrepaired > 0 && !transport.shutting_down.load(Ordering::SeqCst);
+    push_eose_repair_report(
+        &transport,
+        EoseRepairReport {
+            scope: scope.clone(),
+            follow_up,
+            lags,
+            summary,
+            follow_up_scheduled,
+            dropped_before: 0,
+        },
+    );
+    if !follow_up_scheduled {
         return;
     }
     // Each unrepaired relay's claim was released. A relay that keeps failing
     // is tried again at most once per settle window, while a re-issue that
     // went out keeps its claim, so a replay that lags again cannot loop.
-    let Some(transport) = weak.upgrade() else {
-        return;
-    };
-    if transport.shutting_down.load(Ordering::SeqCst) {
-        return;
-    }
     tracing::info!(
         target: "marmot_app::relay_plane",
         method = "repair_lag_lost_eose",
         unrepaired_relays = unrepaired,
         "scheduling another lag-lost end-of-stored-events repair",
     );
-    schedule_eose_repair(&transport, scope.as_ref(), lag);
+    schedule_eose_repair_pass(&transport, scope.as_ref(), lag, true);
+}
+
+/// Queue a finished repair for its audit row, dropping the oldest at the
+/// bound. Never waits: the lock guards a small in-memory queue.
+fn push_eose_repair_report(transport: &RelayPlaneTransport, report: EoseRepairReport) {
+    let mut reports = transport
+        .eose_repair_reports
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut report = report;
+    if reports.pending.len() >= EOSE_REPAIR_REPORTS_MAX
+        && let Some(dropped) = reports.pending.pop_front()
+    {
+        // Carry the count to this receiver's next surviving report, the new
+        // one included; otherwise keep only a bounded scalar.
+        let carried = dropped.dropped_before.saturating_add(1);
+        if let Some(next) = reports
+            .pending
+            .iter_mut()
+            .find(|pending| pending.scope == dropped.scope)
+        {
+            next.dropped_before = next.dropped_before.saturating_add(carried);
+        } else if report.scope == dropped.scope {
+            report.dropped_before = report.dropped_before.saturating_add(carried);
+        } else {
+            reports.dropped_unattributed = reports.dropped_unattributed.saturating_add(carried);
+        }
+    }
+    reports.pending.push_back(report);
 }
 
 impl MarmotRelayPlaneAccountAdapter {
@@ -3420,6 +3577,19 @@ impl MarmotRelayPlaneAccountAdapter {
             .admission
             .settled_since
             .is_some()
+    }
+
+    /// Cumulative account-queue placement counts for the transport-cursor
+    /// audit row. Relaxed counters: a reader sees a recent value, never a
+    /// torn one, and the row reports differences between two reads.
+    pub(crate) fn delivery_placement_counts(&self) -> AccountDeliveryPlacementCounts {
+        let metrics = &self.delivery_overflow.metrics;
+        AccountDeliveryPlacementCounts {
+            spilled_below_floor: metrics.spill_diverted_below_floor.load(Ordering::Relaxed),
+            spilled_queue_full: metrics.spill_diverted_queue_full.load(Ordering::Relaxed),
+            spill_already_seen: metrics.spill_already_seen.load(Ordering::Relaxed),
+            queue_dropped: metrics.dropped.load(Ordering::Relaxed),
+        }
     }
 
     /// Process-local overflow evidence becomes visible at the exact omission,

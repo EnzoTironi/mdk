@@ -1620,9 +1620,12 @@ async fn run_app_runtime_account_worker(
                     .take()
                     .expect("settling comparison exists");
                 let result = match (turn, job.failure) {
-                    (Err(error), _) | (_, Some(error)) => {
-                        Err(client.fail_comparison_grant(job.grant, job.execution, error))
-                    }
+                    (Err(error), _) | (_, Some(error)) => Err(client.fail_comparison_grant(
+                        job.grant,
+                        job.execution,
+                        job.admission.as_ref(),
+                        error,
+                    )),
                     _ if job.abandoned => client.abandon_comparison_grant(job.grant, job.execution),
                     _ => {
                         client
@@ -1732,7 +1735,7 @@ async fn run_app_runtime_account_worker(
                         // ended; keep it through owner admission/checkpoint.
                         job.credit = Some(credit);
                         match client
-                            .accept_comparison_network(&job.grant, &job.execution, network)
+                            .accept_comparison_network(&job.grant, &mut job.execution, network)
                             .await
                         {
                             Ok(admission) => job.admission = admission,
@@ -6810,6 +6813,9 @@ fn publish_history_notice_changes(
     account_id_hex: &str,
     account_label: &str,
 ) {
+    // The relay plane's lag-lost EOSE repairs queue their reports; this seam
+    // records them, off the repair's path.
+    client.record_eose_repair_reports();
     let Some(groups) = client.take_history_notice_changes() else {
         return;
     };

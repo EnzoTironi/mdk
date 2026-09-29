@@ -4,6 +4,10 @@
 
 ### Changed
 
+- A recovery scope whose route no comparison backend could compare is no longer counted as
+  a quiet pass. No relay answered it, so it spends none of the three-pass parking budget and
+  is recorded as unserved; incremental history still waits for a capability change.
+
 - Generated accounts can copy signed kind 10002, kind 10050, and kind 0 records
   to separate public indexers after bootstrap confirmation. Relay-list and
   profile edits also schedule indexer copies after account-relay acknowledgement;
@@ -203,6 +207,23 @@
   replaced as its group's current route. Struct literals must set it. (#2070)
 
 ### Added
+
+- Record account recovery in the opt-in v5 audit log. The recovery owner writes
+  `recovery_need_changed` when loss or demand is charged to an obligation (with its cause,
+  goal bound and newly charged count), when a parked obligation's notice is shown or
+  dismissed, and when a parked obligation closes; `recovery_attempt_started` and
+  `recovery_attempt_finished` for every reserved attempt (obligations, endpoints, budgets,
+  compared and certified routes, events retrieved, duplicate, rejected, retained and
+  refused, relay counts, and a `progressed` / `quiet` / `unserved` / `deadline` /
+  `cancelled` / `superseded` / `failed` outcome); and `recovery_obligation_reassessed`, its
+  verdict on each obligation it settled (including an explicit request closed below the
+  retained window) and whether another attempt may follow. The
+  transport cursor writes `transport_cursor_advanced` for drain checkpoints, settled loss
+  and retired notices, and for a live promotion only when it moves the cursor past the
+  rebuild lookback, with spill and queue-loss placement counts. Each lag-lost end-of-stored-events repair
+  pass writes `subscription_eose_repaired` with its relay counts (awaiting, completed without
+  traffic, re-issued, re-issued earlier, failed) and whether a follow-up was scheduled. Rows carry enums, counts
+  and hashed references only, and are written only when a v5 recorder is installed.
 
 - Route reviewed host stages through the existing runtime telemetry registry,
   including its fixed metric names and all five outcomes in snapshots and OTLP.
