@@ -7682,6 +7682,82 @@ mod tests {
         assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
     }
 
+    /// A lag that lost the end-of-stored-events a quiet drain ends on would
+    /// hold every later drain to its full first wait. The lag's repair
+    /// re-issues the unanswered REQ, and once the relay's fresh answer
+    /// completes coverage, a drain after the loss is in recovery ends at its
+    /// first quiet wait again.
+    #[tokio::test]
+    async fn quiet_drain_ends_early_again_after_a_lag_lost_its_eose() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let account = cgka_traits::MemberId::new(hex::decode(&alice.account_id_hex).unwrap());
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.prepare_transport().await.unwrap();
+        assert!(!relay.accepted_subscriptions().is_empty());
+
+        // No relay's answer reached the account: the lag lost them all.
+        app.relay_plane
+            .set_eose_repair_settle_for_test(Duration::from_millis(10));
+        app.relay_plane.simulate_notification_lag_for_test(
+            &account,
+            1,
+            transport_nostr_adapter::NostrNotificationLossFloor::Unbounded,
+        );
+        let reissued = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let reissued = relay.reissued_subscriptions();
+                if !reissued.is_empty() {
+                    break reissued;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the repair re-issues the unanswered REQ");
+        let live = relay
+            .accepted_subscriptions()
+            .last()
+            .cloned()
+            .expect("the live activation's inbox REQ");
+        assert_eq!(
+            reissued,
+            vec![(live.subscription_id(), live.endpoints().to_vec())],
+            "only the live activation's REQ is re-issued"
+        );
+        for (id, endpoints) in reissued {
+            for endpoint in endpoints {
+                app.relay_plane
+                    .handle_relay_eose_for_test(endpoint, id.clone())
+                    .await;
+            }
+        }
+        let Some(crate::relay_plane::AccountDeliveryReceive::Overflow(overflow)) =
+            client.adapter.try_receive_account_delivery()
+        else {
+            panic!("the lag queued its control record");
+        };
+        client.adapter.notification_loss_persisted(overflow);
+        let _recovery = client
+            .adapter
+            .start_delivery_overflow_recovery(overflow.marker_token);
+
+        assert!(client.adapter.account_subscription_eose().await.complete());
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        client.sync_sdk_relay().await.unwrap();
+        assert!(
+            started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1),
+            "the drain ends at its first quiet wait instead of its full first wait"
+        );
+    }
+
     #[tokio::test]
     async fn idle_drain_skips_directory() {
         let dir = tempfile::tempdir().unwrap();

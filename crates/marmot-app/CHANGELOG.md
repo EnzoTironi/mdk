@@ -138,6 +138,25 @@
   current one in full. A locally deleted group no longer lists its current route twice.
   A hidden group's route replaced while it was hidden keeps a full backfill until the
   group is restored. (#2070)
+- Recover end-of-stored-events (EOSE) that a relay notification lag lost. A lost EOSE left
+  its subscription's replay coverage incomplete for good: the next activation
+  re-subscribed instead of reusing the live one, live cursor promotion stayed off, quiet
+  drains waited out their full first wait, and post-join maintenance did not observe its
+  boundary. A lag still marks no EOSE complete,
+  since it cannot tell a lost one from one still coming. Once the receiver has gone 30
+  seconds without another lag, each REQ issued before the lag that has not reported EOSE on
+  a relay is repaired there. When the SDK recorded that relay's EOSE, the lag lost only the
+  notification, and the EOSE is recorded with no network traffic. Otherwise the REQ's CLOSE
+  and the REQ again, unchanged and under its own id, are queued together or not at all, and
+  the relay replays from the same `since` before a fresh EOSE; the relay never sees a
+  repeated live id, and the SDK keeps the REQ it restores on reconnect. A relay whose
+  re-issue went out is not re-issued again, but later repairs still read the SDK's record,
+  so a fresh EOSE that a later lag lost still completes; one that got nothing is repaired
+  again after the settle window. The notification-loss floor does not move. `NostrRelayClient` gains
+  `reissue_subscription` and `subscription_eose_received`, unsupported by default, and `NostrTransportAdapter` gains
+  `reissue_subscriptions_awaiting_eose`. The `nostr-sdk` fork pin moves to
+  `a9c7a6423d104c603de6ea8244265ea17f0f9d89` for `Relay::batch_msg` and
+  `Relay::subscription_received_eose`. (#2070)
 
 - Preserve normalized line breaks in ingested kind:0 `about` text while still removing
   unsafe controls from every known profile string. Previously flattened cached bios stay

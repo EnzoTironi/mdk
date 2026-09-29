@@ -16,9 +16,10 @@ use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     AcquisitionEnd as SdkAcquisitionEnd, AcquisitionLimits as SdkAcquisitionLimits, Client,
-    ClientNotification, Event, EventBuilder, EventId, Filter, FinalizeEventAsync, Kind, PublicKey,
-    RelayAcquisition, RelayCapabilities, RelayMessage, RelayStatus, RelayUrl, ReqTarget,
-    SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions, Tag, Timestamp as NostrTimestamp,
+    ClientMessage, ClientNotification, Event, EventBuilder, EventId, Filter, FinalizeEventAsync,
+    Kind, PublicKey, Relay, RelayAcquisition, RelayCapabilities, RelayMessage, RelayStatus,
+    RelayUrl, ReqTarget, SingleLetterTag, SubscriptionId, SyncDirection, SyncOptions, Tag,
+    Timestamp as NostrTimestamp,
 };
 use nostr_sdk::relay::EventSendStatus;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
@@ -33,7 +34,8 @@ use crate::{
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
     NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
     NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
-    NostrRelayClient, NostrRelayEvent, NostrSubscription, NostrTransportAdapter,
+    NostrRelayClient, NostrRelayEvent, NostrSubscription, NostrTransportAdapter, RelayReissue,
+    SubscriptionReissue,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -1406,6 +1408,83 @@ impl NostrSdkRelayClient {
         }
     }
 
+    /// The REQ's retained filters on this relay, recorded with its floor
+    /// before it goes out again. `None` when this context no longer holds the
+    /// REQ: a REQ it closed stays closed.
+    async fn reissuable_filters(&self, relay: &Relay, id: &SubscriptionId) -> Option<Vec<Filter>> {
+        let filters = relay
+            .subscription(id)
+            .await
+            .filter(|filters| !filters.is_empty())?;
+        // It carries the filter it was issued with, so this cannot lower the
+        // floor. Only an account context records floors.
+        if let Some(mut floors) = self.account_subscription_floors() {
+            if !floors.live.contains_key(id) {
+                return None;
+            }
+            floors.open(id, req_since(&filters));
+        }
+        Some(filters)
+    }
+
+    /// The relay holding this live REQ, and whether it answered the REQ's
+    /// current send with EOSE. `None` when this context no longer holds the
+    /// REQ there.
+    ///
+    /// The SDK records EOSE in its relay read loop, which a notification lag
+    /// cannot drop. An EOSE still in flight for an earlier send of the same
+    /// REQ on this connection also sets it; the filters are the same, so that
+    /// answer covers the same stored events.
+    async fn received_eose_on(
+        &self,
+        endpoint: &TransportEndpoint,
+        id: &SubscriptionId,
+    ) -> Option<(Relay, bool)> {
+        let url = RelayUrl::parse(endpoint.as_str()).ok()?;
+        let relay = self.client.relay(&url).await.ok()??;
+        if self
+            .account_subscription_floors()
+            .is_some_and(|floors| !floors.live.contains_key(id))
+        {
+            return None;
+        }
+        let received_eose = relay.subscription_received_eose(id).await?;
+        Some((relay, received_eose))
+    }
+
+    /// Repair one live REQ on one relay: report it complete when the relay
+    /// already answered its current send with EOSE, or queue its CLOSE and
+    /// the REQ again together.
+    async fn reissue_on(&self, endpoint: &TransportEndpoint, id: &SubscriptionId) -> RelayReissue {
+        let Some((relay, received_eose)) = self.received_eose_on(endpoint, id).await else {
+            return RelayReissue::Gone;
+        };
+        if received_eose {
+            return RelayReissue::Complete;
+        }
+        // A disconnected relay's reconnect sends the REQ again itself.
+        if !relay.status().is_connected() {
+            return RelayReissue::Unsent;
+        }
+        let Some(filters) = self.reissuable_filters(&relay, id).await else {
+            return RelayReissue::Gone;
+        };
+        // Both frames or neither: a lone CLOSE would leave the relay without
+        // the REQ, and a lone REQ would repeat a live id, which a relay may
+        // refuse. Queueing the REQ resets its EOSE flag in the SDK registry.
+        let queued = relay
+            .batch_msg(vec![
+                ClientMessage::close(id.clone()),
+                ClientMessage::req(id.clone(), filters),
+            ])
+            .await;
+        if queued.is_ok() {
+            RelayReissue::Sent
+        } else {
+            RelayReissue::Unsent
+        }
+    }
+
     /// Issue one planned REQ on this client and record where it registered.
     async fn subscribe_planned(
         &self,
@@ -2437,6 +2516,84 @@ impl NostrRelayClient for NostrSdkRelayClient {
         Ok(())
     }
 
+    async fn subscription_eose_received(
+        &self,
+        account_id: &MemberId,
+        subscription_id: &str,
+        endpoints: &[TransportEndpoint],
+    ) -> Result<Vec<(TransportEndpoint, bool)>, TransportAdapterError> {
+        if let Some(account_client) = self.account_client(account_id).await? {
+            return Box::pin(account_client.subscription_eose_received(
+                account_id,
+                subscription_id,
+                endpoints,
+            ))
+            .await;
+        }
+        let id = SubscriptionId::new(subscription_id);
+        let mut received = Vec::new();
+        for endpoint in endpoints {
+            if let Some((_, eose)) = self.received_eose_on(endpoint, &id).await {
+                received.push((endpoint.clone(), eose));
+            }
+        }
+        Ok(received)
+    }
+
+    /// On each relay that holds this REQ, report it complete when the SDK
+    /// recorded EOSE for its current send, or else queue its CLOSE and the
+    /// filters the SDK retained for it again under the same id, in one
+    /// all-or-nothing batch. The relay replays from the same `since` and
+    /// reports EOSE again.
+    ///
+    /// The batch leaves the SDK's registry in place, so it still restores the
+    /// REQ on reconnect. A relay-level unsubscribe and subscribe would not:
+    /// each drops the registry entry when its send fails. The CLOSE goes first
+    /// and a relay reads a connection in order, so no relay sees a repeated
+    /// live id. The SDK would drop the REQ from its registry if a relay
+    /// refused a repeat with `CLOSED duplicate:` rather than replacing the
+    /// subscription as NIP-01 says. A batch stranded by a disconnect goes out
+    /// once: the SDK's reconnect skips a REQ already queued. Nothing here
+    /// waits for room; a batch without room queues nothing.
+    async fn reissue_subscription(
+        &self,
+        account_id: &MemberId,
+        subscription_id: &str,
+        endpoints: &[TransportEndpoint],
+    ) -> Result<SubscriptionReissue, TransportAdapterError> {
+        if let Some(account_client) = self.account_client(account_id).await? {
+            return Box::pin(account_client.reissue_subscription(
+                account_id,
+                subscription_id,
+                endpoints,
+            ))
+            .await;
+        }
+        let id = SubscriptionId::new(subscription_id);
+        let mut reissue = SubscriptionReissue::default();
+        for endpoint in endpoints {
+            let outcome = self.reissue_on(endpoint, &id).await;
+            reissue.relays.push((endpoint.clone(), outcome));
+        }
+        tracing::debug!(
+            target: "transport_nostr_adapter::sdk_client",
+            method = "reissue_subscription",
+            endpoint_count = endpoints.len(),
+            complete_count = reissue
+                .relays
+                .iter()
+                .filter(|(_, outcome)| *outcome == RelayReissue::Complete)
+                .count(),
+            sent_count = reissue
+                .relays
+                .iter()
+                .filter(|(_, outcome)| *outcome == RelayReissue::Sent)
+                .count(),
+            "repaired SDK relay subscription"
+        );
+        Ok(reissue)
+    }
+
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
@@ -2742,6 +2899,16 @@ fn parse_endpoints(
             })
         })
         .collect()
+}
+
+/// The `since` floor a REQ's filters put on the events it can deliver: the
+/// lowest among them, or `None` when any filter has none.
+fn req_since(filters: &[Filter]) -> Option<u64> {
+    filters
+        .iter()
+        .map(|filter| filter.since.map(|since| since.as_secs()))
+        .reduce(|lowest, since| lowest.zip(since).map(|(a, b)| a.min(b)))
+        .flatten()
 }
 
 fn member_id_to_pubkey(
@@ -3387,6 +3554,791 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(account.notification_loss_floor(), Since(50));
+        root.shutdown_accounts().await;
+    }
+
+    /// The outcome of a re-issue on its one relay.
+    fn only_relay(reissue: SubscriptionReissue) -> RelayReissue {
+        assert_eq!(reissue.relays.len(), 1);
+        reissue.relays[0].1
+    }
+
+    /// Raw relay copies a REQ replays up to its end-of-stored-events, in order.
+    async fn replay_until_eose(
+        notifications: &mut (impl futures::Stream<Item = ClientNotification> + Unpin),
+        id: &SubscriptionId,
+    ) -> Vec<EventId> {
+        timeout(Duration::from_secs(5), async {
+            let mut replayed = Vec::new();
+            while let Some(notification) = notifications.next().await {
+                let ClientNotification::Message { message, .. } = notification else {
+                    continue;
+                };
+                match *message {
+                    RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    } if subscription_id.as_ref() == id => replayed.push(event.id),
+                    RelayMessage::EndOfStoredEvents(subscription_id)
+                        if subscription_id.as_ref() == id =>
+                    {
+                        return replayed;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("notifications ended before end-of-stored-events");
+        })
+        .await
+        .expect("the relay reports end-of-stored-events")
+    }
+
+    fn stored_group_event(transport_group_id: &[u8], created_at: u64) -> Event {
+        EventBuilder::new(Kind::MlsGroupMessage, "stored")
+            .tags([Tag::custom("h", [hex::encode(transport_group_id)])])
+            .custom_created_at(NostrTimestamp::from_secs(created_at))
+            .finalize(&Keys::generate())
+            .unwrap()
+    }
+
+    /// A relay that already answered a REQ with end-of-stored-events is
+    /// reported complete, with nothing sent: the SDK keeps that answer where
+    /// a notification lag cannot drop it. A relay the REQ never went to is
+    /// skipped, and a closed REQ is never reopened.
+    #[tokio::test]
+    async fn reissue_reports_an_answered_req_complete_and_never_reopens_a_closed_one() {
+        use NostrNotificationLossFloor::Since;
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoints = vec![TransportEndpoint(relay.url().await.to_string())];
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let transport_group_id = vec![0xD4; 32];
+        let after = stored_group_event(&transport_group_id, 3_000);
+        relay
+            .add_event(stored_group_event(&transport_group_id, 1_000))
+            .await
+            .unwrap();
+        relay.add_event(after.clone()).await.unwrap();
+        let group = NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: cgka_traits::GroupId::new(vec![0xC3; 16]),
+            transport_group_id,
+            endpoints: endpoints.clone(),
+            since: Some(Timestamp(2_000)),
+            attempt: SubscriptionAttempt::INITIAL.next(),
+        };
+        let wire_id = group.subscription_id();
+        let id = SubscriptionId::new(wire_id.clone());
+        let mut notifications = account.client().notifications();
+        root.subscribe(group.clone()).await.unwrap();
+        assert_eq!(
+            replay_until_eose(&mut notifications, &id).await,
+            vec![after.id]
+        );
+
+        assert_eq!(
+            only_relay(
+                root.reissue_subscription(&account_id, &wire_id, &endpoints)
+                    .await
+                    .unwrap()
+            ),
+            RelayReissue::Complete
+        );
+        assert_eq!(account.notification_loss_floor(), Since(2_000));
+        assert_eq!(
+            root.reissue_subscription(
+                &account_id,
+                &wire_id,
+                &[TransportEndpoint("wss://elsewhere.example".into())],
+            )
+            .await
+            .unwrap()
+            .relays[0]
+                .1,
+            RelayReissue::Gone
+        );
+        root.unsubscribe(group).await.unwrap();
+        assert_eq!(
+            only_relay(
+                root.reissue_subscription(&account_id, &wire_id, &endpoints)
+                    .await
+                    .unwrap()
+            ),
+            RelayReissue::Gone,
+            "a closed REQ stays closed"
+        );
+        assert!(
+            root.reissue_subscription(&MemberId::new(vec![0xEE; 32]), &wire_id, &endpoints)
+                .await
+                .is_err(),
+            "an account without a context cannot re-issue"
+        );
+        root.shutdown_accounts().await;
+        relay.shutdown();
+    }
+
+    /// End to end on a real relay: a consumer that loses a REQ's
+    /// end-of-stored-events, as a lag does, leaves the activation's coverage
+    /// incomplete. The relay did answer, and the SDK kept that answer, so the
+    /// lag repair completes coverage from it without re-issuing anything.
+    #[tokio::test]
+    async fn lag_repair_recovers_an_end_of_stored_events_the_consumer_lost() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let adapter = NostrTransportAdapter::new(Arc::new(root.clone()));
+        let group = cgka_traits::TransportGroupSubscription {
+            group_id: cgka_traits::GroupId::new(vec![0xC3; 16]),
+            transport_group_id: vec![0xD4; 32],
+            endpoints: vec![endpoint.clone()],
+            retained_since: None,
+        };
+        relay
+            .add_event(stored_group_event(&group.transport_group_id, 5_000))
+            .await
+            .unwrap();
+        let group_req = NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: group.group_id.clone(),
+            transport_group_id: group.transport_group_id.clone(),
+            endpoints: group.endpoints.clone(),
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL.next(),
+        }
+        .subscription_id();
+        // Forward end-of-stored-events as the relay plane's consumer does,
+        // except every answer to the group REQ.
+        let lost = Arc::new(AtomicU64::new(0));
+        let mut notifications = account.client().notifications();
+        let consumer = tokio::spawn({
+            let adapter = adapter.clone();
+            let group_req = group_req.clone();
+            let lost = lost.clone();
+            async move {
+                while let Some(notification) = notifications.next().await {
+                    if let ClientNotification::Message { relay_url, message } = notification
+                        && let RelayMessage::EndOfStoredEvents(id) = *message
+                    {
+                        if id.as_str() == group_req {
+                            lost.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        adapter
+                            .handle_relay_eose(
+                                TransportEndpoint(relay_url.to_string()),
+                                id.to_string(),
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![group],
+                since: Some(Timestamp(1_000)),
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while lost.load(Ordering::SeqCst) == 0
+                || adapter
+                    .account_subscription_eose(&account_id)
+                    .await
+                    .relay_subscription_attempts_with_eose
+                    == 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the relay answered both REQs, and the inbox's answer is recorded");
+        let coverage = adapter.account_subscription_eose(&account_id).await;
+        assert_eq!(coverage.relay_subscription_attempts, 2);
+        assert!(!coverage.complete(), "the lost answer leaves coverage open");
+        let floor = account.notification_loss_floor();
+
+        let lag = adapter.notification_lag_mark();
+        let repair = adapter
+            .reissue_subscriptions_awaiting_eose(Some(&account_id), lag)
+            .await;
+        assert_eq!(
+            repair,
+            crate::EoseReissueSummary {
+                awaiting_relays: 1,
+                complete_relays: 1,
+                reissued_earlier_relays: 0,
+                reissued_relays: 0,
+                failed_relays: 0,
+            }
+        );
+        assert!(
+            adapter
+                .account_subscription_eose(&account_id)
+                .await
+                .complete(),
+            "the SDK's record of the answer completes coverage at once"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            lost.load(Ordering::SeqCst),
+            1,
+            "nothing was re-issued, so the relay answered nothing more"
+        );
+        assert_eq!(account.notification_loss_floor(), floor);
+        consumer.abort();
+        root.shutdown_accounts().await;
+        relay.shutdown();
+    }
+
+    /// A scripted relay. `log` holds each REQ, CLOSE and refusal it handled,
+    /// with its connection number, except frames whose id starts with
+    /// `filler`. While `answering` holds false it answers no REQ, as a relay
+    /// still sending stored events. While `paused` holds true it stops
+    /// reading, so the client's socket backs up. Notifying `drop_connection`
+    /// closes the current connection.
+    struct ScriptedRelay {
+        url: String,
+        log: Arc<Mutex<Vec<String>>>,
+        drop_connection: Arc<tokio::sync::Notify>,
+        answering: watch::Sender<bool>,
+        paused: watch::Sender<bool>,
+    }
+
+    /// A relay that holds one subscription per id on each connection and
+    /// refuses a REQ whose id is still live with `CLOSED duplicate:`, keeping
+    /// the live one, where NIP-01 says to replace it. It answers every other
+    /// REQ with EOSE while `answering`.
+    async fn duplicate_refusing_relay() -> ScriptedRelay {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let drop_connection = Arc::new(tokio::sync::Notify::new());
+        let (answering, answering_rx) = watch::channel(true);
+        let (paused, paused_rx) = watch::channel(false);
+        let (server_log, server_drop) = (log.clone(), drop_connection.clone());
+        tokio::spawn(async move {
+            let mut connection = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                connection += 1;
+                let (log, drop_connection) = (server_log.clone(), server_drop.clone());
+                let answering = answering_rx.clone();
+                let mut paused = paused_rx.clone();
+                tokio::spawn(async move {
+                    let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let mut live = HashSet::new();
+                    loop {
+                        while *paused.borrow_and_update() {
+                            tokio::select! {
+                                () = drop_connection.notified() => return,
+                                changed = paused.changed() => if changed.is_err() {
+                                    return;
+                                },
+                            }
+                        }
+                        let message = tokio::select! {
+                            () = drop_connection.notified() => return,
+                            changed = paused.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            message = websocket.next() => message,
+                        };
+                        let Some(Ok(message)) = message else {
+                            return;
+                        };
+                        let Ok(text) = message.into_text() else {
+                            continue;
+                        };
+                        let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        let (Some(verb), Some(id)) = (
+                            frame.get(0).and_then(serde_json::Value::as_str),
+                            frame.get(1).and_then(serde_json::Value::as_str),
+                        ) else {
+                            continue;
+                        };
+                        if id.starts_with("filler") {
+                            continue;
+                        }
+                        log.lock().await.push(format!("{connection} {verb} {id}"));
+                        let reply = match verb {
+                            "REQ" if live.insert(id.to_owned()) => {
+                                if !*answering.borrow() {
+                                    continue;
+                                }
+                                serde_json::json!(["EOSE", id])
+                            }
+                            "REQ" => {
+                                log.lock().await.push(format!("{connection} CLOSED {id}"));
+                                serde_json::json!(["CLOSED", id, "duplicate: subscription is live"])
+                            }
+                            "CLOSE" => {
+                                live.remove(id);
+                                continue;
+                            }
+                            _ => continue,
+                        };
+                        if websocket.send(reply.to_string().into()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        ScriptedRelay {
+            url: format!("ws://{addr}"),
+            log,
+            drop_connection,
+            answering,
+            paused,
+        }
+    }
+
+    /// Stall a relay connection's sender and fill its outbound queue behind it,
+    /// as happens when a relay stops reading and the socket buffers fill: large
+    /// frames until the sender blocks on a write, then small ones until the
+    /// queue refuses more.
+    async fn saturate_outbound_queue(relay: &Relay) {
+        let large = SubscriptionId::new(format!("filler-{}", "x".repeat(64 * 1024)));
+        let mut stalled = false;
+        for _ in 0..2_000 {
+            if relay
+                .send_msg(ClientMessage::close(large.clone()))
+                .wait_until_sent(Duration::from_millis(200))
+                .await
+                .is_err()
+            {
+                stalled = true;
+                break;
+            }
+        }
+        assert!(
+            stalled,
+            "the sender blocks once the socket buffers are full"
+        );
+        for index in 0..10_000 {
+            if relay
+                .send_msg(ClientMessage::close(SubscriptionId::new(format!(
+                    "filler-{index}"
+                ))))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        panic!("the outbound queue never filled");
+    }
+
+    async fn wait_for_entry(log: &Mutex<Vec<String>>, entry: &str, expect: &str) {
+        timeout(Duration::from_secs(20), async {
+            while !log.lock().await.iter().any(|logged| logged == entry) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect(expect);
+    }
+
+    /// One account's inbox REQ, issued through the adapter on a scripted
+    /// relay, with no consumer: no end-of-stored-events reaches the adapter,
+    /// as if a lag lost it.
+    struct ScriptedAccount {
+        root: NostrSdkRelayClient,
+        account: NostrSdkRelayClient,
+        account_id: MemberId,
+        adapter: NostrTransportAdapter,
+        relay_url: RelayUrl,
+        wire_id: String,
+        id: SubscriptionId,
+        /// The `since` the inbox REQ was issued with.
+        since: Option<u64>,
+        notifications: std::pin::Pin<Box<dyn futures::Stream<Item = ClientNotification> + Send>>,
+    }
+
+    impl ScriptedAccount {
+        /// Issue the inbox REQ. It returns once the relay has seen the REQ,
+        /// and has answered it when the relay is `answering`.
+        async fn open(relay: &ScriptedRelay) -> Self {
+            let root = NostrSdkRelayClient::multi_account();
+            let keys = Keys::generate();
+            let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+            let account = root
+                .register_account(account_id.clone(), Arc::new(keys))
+                .await
+                .unwrap();
+            let adapter = NostrTransportAdapter::new(Arc::new(root.clone()));
+            let mut notifications = account.client().notifications();
+            adapter
+                .activate_account(crate::TransportAccountActivation {
+                    account_id: account_id.clone(),
+                    inbox_endpoints: vec![TransportEndpoint(relay.url.clone())],
+                    group_subscriptions: Vec::new(),
+                    since: Some(Timestamp(2_000)),
+                })
+                .await
+                .unwrap();
+            let wire_id = NostrSubscription::AccountInbox {
+                account_id: account_id.clone(),
+                endpoints: vec![TransportEndpoint(relay.url.clone())],
+                since: None,
+                attempt: adapter
+                    .account_subscription_attempt(&account_id)
+                    .await
+                    .unwrap(),
+            }
+            .subscription_id();
+            let id = SubscriptionId::new(wire_id.clone());
+            if *relay.answering.borrow() {
+                replay_until_eose(&mut notifications, &id).await;
+            } else {
+                wait_for_entry(
+                    &relay.log,
+                    &format!("1 REQ {wire_id}"),
+                    "the relay sees the REQ",
+                )
+                .await;
+            }
+            let relay_url = RelayUrl::parse(&relay.url).unwrap();
+            let since = req_since(
+                &account
+                    .client()
+                    .relay(&relay_url)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .subscription(&id)
+                    .await
+                    .unwrap(),
+            );
+            Self {
+                root,
+                account,
+                account_id,
+                adapter,
+                relay_url,
+                wire_id,
+                id,
+                since,
+                notifications,
+            }
+        }
+
+        fn entry(&self, connection: u8, verb: &str) -> String {
+            format!("{connection} {verb} {}", self.wire_id)
+        }
+
+        async fn repair(&self, lag: crate::NotificationLagMark) -> crate::EoseReissueSummary {
+            self.adapter
+                .reissue_subscriptions_awaiting_eose(Some(&self.account_id), lag)
+                .await
+        }
+
+        async fn relay(&self) -> Relay {
+            self.account
+                .client()
+                .relay(&self.relay_url)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn log(&self, relay: &ScriptedRelay) -> Vec<String> {
+            relay
+                .log
+                .lock()
+                .await
+                .iter()
+                .filter(|entry| entry.ends_with(&self.wire_id))
+                .cloned()
+                .collect()
+        }
+
+        /// The REQ's filters in the SDK registry that restores it on
+        /// reconnect, with the `since` the REQ was issued with.
+        async fn registered_filters(&self) -> Vec<Filter> {
+            let filters = self
+                .relay()
+                .await
+                .subscription(&self.id)
+                .await
+                .expect("the SDK registry still holds the REQ for this relay");
+            assert_eq!(req_since(&filters), self.since);
+            assert_eq!(
+                self.account.notification_loss_floor(),
+                NostrNotificationLossFloor::Since(self.since.unwrap())
+            );
+            filters
+        }
+    }
+
+    /// A relay whose answer the SDK has recorded needs nothing sent: the lag
+    /// lost only the notification, and the repair completes coverage from the
+    /// SDK's record, once.
+    #[tokio::test]
+    async fn lag_repair_completes_an_answered_req_without_traffic() {
+        let relay = duplicate_refusing_relay().await;
+        let req = ScriptedAccount::open(&relay).await;
+        assert!(
+            !req.adapter
+                .account_subscription_eose(&req.account_id)
+                .await
+                .complete()
+        );
+        let lag = req.adapter.notification_lag_mark();
+        let repair = req.repair(lag).await;
+        assert_eq!(repair.complete_relays, 1);
+        assert_eq!(repair.reissued_relays, 0);
+        assert!(
+            req.adapter
+                .account_subscription_eose(&req.account_id)
+                .await
+                .complete()
+        );
+        assert_eq!(req.repair(lag).await.awaiting_relays, 0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(req.log(&relay).await, vec![req.entry(1, "REQ")]);
+        req.root.shutdown_accounts().await;
+    }
+
+    /// A relay that refuses a repeated live id with `CLOSED duplicate:` makes
+    /// the SDK drop that REQ from its registry, so a reconnect would not
+    /// restore it. The re-issue queues the REQ's CLOSE with it, so that relay
+    /// answers it with EOSE instead, and the SDK still restores the REQ on
+    /// reconnect. A relay gets the REQ again at most once per lag.
+    #[tokio::test]
+    async fn reissue_keeps_the_req_on_a_relay_that_refuses_repeated_ids() {
+        let relay = duplicate_refusing_relay().await;
+        relay.answering.send_replace(false);
+        let mut req = ScriptedAccount::open(&relay).await;
+        relay.answering.send_replace(true);
+
+        let lag = req.adapter.notification_lag_mark();
+        let repair = req.repair(lag).await;
+        assert_eq!(repair.awaiting_relays, 1);
+        assert_eq!(repair.reissued_relays, 1);
+        replay_until_eose(&mut req.notifications, &req.id).await;
+        assert_eq!(
+            req.log(&relay).await,
+            vec![
+                req.entry(1, "REQ"),
+                req.entry(1, "CLOSE"),
+                req.entry(1, "REQ")
+            ],
+            "the relay never saw a repeated live id"
+        );
+        assert_eq!(
+            req.relay().await.subscription_received_eose(&req.id).await,
+            Some(true)
+        );
+        let again = req.repair(lag).await;
+        assert_eq!(
+            (again.complete_relays, again.reissued_relays),
+            (1, 0),
+            "a later repair reads the SDK's record and never re-issues again"
+        );
+        let filters = req.registered_filters().await;
+
+        // The registry restores the REQ on the SDK's next reconnect.
+        relay.drop_connection.notify_one();
+        wait_for_entry(
+            &relay.log,
+            &req.entry(2, "REQ"),
+            "the SDK restores the REQ when the relay reconnects",
+        )
+        .await;
+
+        // The hazard: the same REQ repeated without a CLOSE is refused, and the
+        // SDK drops it from the registry.
+        let sdk_relay = req.relay().await;
+        sdk_relay
+            .send_msg(ClientMessage::req(req.id.clone(), filters))
+            .await
+            .unwrap();
+        wait_for_entry(
+            &relay.log,
+            &req.entry(2, "CLOSED"),
+            "the relay refuses the repeated id",
+        )
+        .await;
+        timeout(Duration::from_secs(5), async {
+            while sdk_relay.subscription(&req.id).await.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a refused repeat drops the REQ from the SDK registry");
+        req.root.shutdown_accounts().await;
+    }
+
+    /// A re-issued replay can itself overflow the consumer, and a second lag
+    /// can lose its fresh end-of-stored-events. The second repair does not
+    /// re-issue the REQ again, but it still reads the SDK's record of that
+    /// answer, which completes coverage with no traffic.
+    #[tokio::test]
+    async fn second_lag_completes_a_reissued_req_from_the_sdk_record() {
+        let relay = duplicate_refusing_relay().await;
+        relay.answering.send_replace(false);
+        let req = ScriptedAccount::open(&relay).await;
+        relay.answering.send_replace(true);
+
+        let first = req.repair(req.adapter.notification_lag_mark()).await;
+        assert_eq!(first.reissued_relays, 1);
+        let sdk_relay = req.relay().await;
+        timeout(Duration::from_secs(5), async {
+            while sdk_relay.subscription_received_eose(&req.id).await != Some(true) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the relay answers the re-issued REQ");
+        // No consumer forwards that answer: the second lag lost it.
+        assert!(
+            !req.adapter
+                .account_subscription_eose(&req.account_id)
+                .await
+                .complete()
+        );
+
+        let second = req.repair(req.adapter.notification_lag_mark()).await;
+        assert_eq!(
+            second,
+            crate::EoseReissueSummary {
+                awaiting_relays: 1,
+                complete_relays: 1,
+                reissued_earlier_relays: 0,
+                reissued_relays: 0,
+                failed_relays: 0,
+            }
+        );
+        assert!(
+            req.adapter
+                .account_subscription_eose(&req.account_id)
+                .await
+                .complete()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            req.log(&relay).await,
+            vec![
+                req.entry(1, "REQ"),
+                req.entry(1, "CLOSE"),
+                req.entry(1, "REQ")
+            ],
+            "the REQ went out again only once"
+        );
+        req.root.shutdown_accounts().await;
+    }
+
+    /// With no room for both frames, the re-issue queues neither: the old REQ
+    /// stays live, and the relay's claim is released. The follow-up repair
+    /// sends the pair once the queue drains.
+    #[tokio::test]
+    async fn reissue_queues_nothing_without_room_and_the_follow_up_sends_it() {
+        let relay = duplicate_refusing_relay().await;
+        relay.answering.send_replace(false);
+        let req = ScriptedAccount::open(&relay).await;
+        relay.paused.send_replace(true);
+        saturate_outbound_queue(&req.relay().await).await;
+
+        let lag = req.adapter.notification_lag_mark();
+        let repair = req.repair(lag).await;
+        assert_eq!(repair.awaiting_relays, 1);
+        assert_eq!(repair.failed_relays, 1);
+        relay.paused.send_replace(false);
+        let sdk_relay = req.relay().await;
+        timeout(Duration::from_secs(10), async {
+            while sdk_relay
+                .send_msg(ClientMessage::close(SubscriptionId::new("filler-probe")))
+                .wait_until_sent(Duration::from_secs(10))
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the queue drains");
+        assert_eq!(
+            req.log(&relay).await,
+            vec![req.entry(1, "REQ")],
+            "neither frame went out"
+        );
+
+        let follow_up = req.repair(lag).await;
+        assert_eq!(follow_up.awaiting_relays, 1, "the claim was released");
+        assert_eq!(follow_up.reissued_relays, 1);
+        wait_for_entry(&relay.log, &req.entry(1, "CLOSE"), "the CLOSE goes out").await;
+        wait_for_entry(
+            &relay.log,
+            &format!("1 REQ {}", req.wire_id),
+            "the REQ goes out",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            req.log(&relay).await,
+            vec![
+                req.entry(1, "REQ"),
+                req.entry(1, "CLOSE"),
+                req.entry(1, "REQ")
+            ]
+        );
+        req.root.shutdown_accounts().await;
+    }
+
+    /// A relay that is not connected is left alone: when it reconnects, the
+    /// SDK sends the REQ again itself and the relay reports EOSE for it then.
+    #[tokio::test]
+    async fn reissue_skips_a_relay_that_is_not_connected() {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoints = vec![TransportEndpoint(format!(
+            "ws://{}",
+            reservation.local_addr().unwrap()
+        ))];
+        drop(reservation);
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        root.register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let inbox = NostrSubscription::AccountInbox {
+            account_id: account_id.clone(),
+            endpoints: endpoints.clone(),
+            since: Some(Timestamp(2_000)),
+            attempt: SubscriptionAttempt::INITIAL.next(),
+        };
+        let wire_id = inbox.subscription_id();
+        root.subscribe(inbox).await.unwrap();
+        assert_eq!(
+            only_relay(
+                root.reissue_subscription(&account_id, &wire_id, &endpoints)
+                    .await
+                    .unwrap()
+            ),
+            RelayReissue::Unsent,
+            "nothing goes out, and a later repair may try again"
+        );
         root.shutdown_accounts().await;
     }
 

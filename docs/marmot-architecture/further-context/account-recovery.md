@@ -516,9 +516,35 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   comparison, or the epoch gap it causes, recovers it.
   An old Welcome can floor maintenance below the retained-inventory window, and a goal
   there cannot certify. The inbox's two-day NIP-59 widening sets that floor at least two
-  days back on every route; per-route floors would need per-scope storage. An EOSE lost
-  in a lag is not recovered, so the next activation re-subscribes instead of reusing the
-  live one. Relays that ignore `since` are not detected.
+  days back on every route; per-route floors would need per-scope storage. Relays that
+  ignore `since` are not detected.
+- End-of-stored-events lost in a notification lag (#2070). A lag cannot tell a lost EOSE
+  from one still coming, so it marks none complete. Once the receiver has gone 30 seconds
+  without another lag, each REQ issued before the lag that the adapter still sees awaiting
+  EOSE on a relay is repaired there. The SDK records each REQ's EOSE in its relay read
+  loop, before it sends the notification, so a lag cannot drop it
+  (`Relay::subscription_received_eose`). When it has one, the lag lost only the
+  notification: the adapter records that EOSE with no network traffic. Every repair reads
+  that record for every such relay, including one an earlier repair re-issued the REQ to,
+  so a re-issued replay whose fresh EOSE a later lag lost still completes. Otherwise the REQ's CLOSE and the REQ again, unchanged and under its own id, are
+  queued in one all-or-nothing batch (`Relay::batch_msg`) to a connected relay. The CLOSE
+  goes first, so no relay sees a repeated live id, which a relay could refuse instead of
+  replacing the subscription, and the SDK's registry keeps the REQ it restores on
+  reconnect. The relay replays from the same `since` and answers with a fresh EOSE, so
+  activation reuse returns, live cursor promotion resumes, quiet drains end early again,
+  and post-join maintenance observes its boundary. The loss floor does not move. A batch stranded by a disconnect
+  goes out once: the SDK's reconnect skips a REQ already queued. Only the network re-issue
+  is limited: a relay gets the REQ again at most once, so a replay that keeps lagging
+  cannot loop. A relay that got
+  nothing, because it was not connected or had no room for both frames, still has the old
+  REQ live; its claim is released and the repair runs again after the settle window for
+  the same lag, until its EOSE is recorded or the REQ goes out. One known behaviour: an
+  EOSE for the old REQ still in flight on the same connection sets the SDK's flag for the
+  re-issued one. That is harmless here, because the filters are identical, so it answers
+  for the same stored events. What remains: a replay still running 30 seconds after the
+  last lag restarts once; a group route removed before its EOSE keeps the activation's
+  frozen coverage incomplete; and a relay that stays unreachable is retried once per
+  settle window.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored

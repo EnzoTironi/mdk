@@ -116,6 +116,16 @@ returns the lowest of these as a `NostrNotificationLossFloor`: no event whose no
 is older. An unfloored REQ, no REQ at all, or a shared receiver reads as `Unbounded`. The floor only falls over the
 context's life, so reading it at the lag gives the tightest bound.
 
+A lag can also lose end-of-stored-events. `reissue_subscription` recovers them on the relays that never answered a live
+REQ. When the SDK recorded EOSE for the REQ's current send (`Relay::subscription_received_eose`), the lag lost only the
+notification, and the relay is reported complete with no traffic. Otherwise the client queues the REQ's CLOSE and the
+REQ again, unchanged and under its own id, in one all-or-nothing `Relay::batch_msg`, so no relay sees the id repeated
+while it is live there and the SDK's reconnect registry keeps the REQ. It never waits: a relay that is not connected
+or has no room for both frames gets nothing, keeps the old REQ live, and is repaired again later. The account context
+records the REQ again first, with the `since` it was issued with, and never reopens a closed REQ, so the re-issue
+leaves the floor where it was. `subscription_eose_received` reads the same record without sending anything; the
+adapter uses it on relays it already re-issued a REQ to, which never get the REQ a second time.
+
 The recovery consumer subscribes for each activated account and never infers a group from a receiver gap. The backend
 must update the watch without waiting for room in the event-delivery queue, so loss stays observable when event
 delivery is saturated.
