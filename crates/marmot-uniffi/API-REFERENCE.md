@@ -2292,6 +2292,25 @@ send time, and an accepted open poll remains votable after conversation reclassi
 
 [Source](src/commands/message.rs#L236)
 
+### `Marmot::poll_votes`
+
+**Current.** Use for a "View votes" sheet that lists who chose each option.
+
+```rust
+pub fn poll_votes( &self, account_ref: String, group_id_hex: String, poll_event_id: String, after_voted_at: Option<u64>, after_voter_account_id_hex: Option<String>, limit: u32, ) -> Result<crate::conversions::PollVotePageFfi, MarmotKitError>
+```
+
+Returns one page of each voter's effective selection, resolved by the same rules as `TimelineMessageRecordFfi.poll`:
+all pages together hold `participants` entries whose selections sum to each option's `votes`. Polls are not anonymous;
+every member can already read each response and its sender. Blocked voters stay listed because the shared tally still
+counts them; mark them with the account's block list. A missing, deleted, hidden, or non-poll row returns an empty
+page. Votes are ordered by `(voted_at, voter_account_id_hex)`. Omit both cursor fields for the first page, then pass the
+last vote's `voted_at` and `voter_account_id_hex` while `has_more_after` is true. `limit` is 1..=100 because retained
+votes from former members are not bounded by the current group size. Re-read from the start when the poll row is
+reprojected, and run this synchronous query off the UI thread. See [Polls](POLLS.md).
+
+[Source](src/commands/timeline.rs#L54)
+
 ### `Marmot::messages`
 
 **Lower-level.** Raw stored messages; complete conversation screens use open_conversation_window.
@@ -3159,7 +3178,7 @@ pub fn timeline_messages( &self, account_ref: String, query: TimelineMessageQuer
 
 Materialized conversation timeline for a group or account-wide tail.
 
-[Source](src/commands/timeline.rs#L57)
+[Source](src/commands/timeline.rs#L99)
 
 </details>
 

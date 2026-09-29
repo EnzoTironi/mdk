@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- `MarmotAppRuntime::poll_votes` pages each voter's effective poll selection
+  (`PollVotePage` of `PollVote`) with the same rules as the timeline poll
+  tally. (#2091)
+
 ### Fixed
 
 - Messages are no longer withdrawn as undecryptable by a convergence pass that selected
