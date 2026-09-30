@@ -161,7 +161,20 @@ Durable send budgets survive restarts. Startup and periodic reconciliation
 replay staged chunks only for turns that have finished, charge each replay
 attempt against the same budget, and mark a turn limited instead of sending once
 its budget is exhausted. Records written before budgets existed get a fresh
-finite budget on first replay.
+finite budget on first replay. Each admitted send attempt rewrites the private
+delivery-state file before its request, so a turn performs at most
+`MAX_DURABLE_SENDS` such writes.
+
+If the connector stops or restarts while a turn is running, that turn's outcome
+is unknown: the backend may have acted or breached a limit before the stop.
+Startup therefore loads it as limited behind the same discardable barrier, and
+its staged but unacknowledged chunks are not replayed. Other groups and turns
+that had already finished are unaffected. Send `/discard-last` in that chat to
+release it. Discarding does not clear a saved backend session.
+
+While a chat waits on `/retry-last` or `/discard-last` for a limited or
+interrupted turn, each newly queued message gets one activity notice naming the
+available command, then stays queued until the barrier is released.
 
 ## Chat Commands
 

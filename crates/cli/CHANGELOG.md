@@ -22,8 +22,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   backend session is known). A completed buffered reply batch that would
   exceed the chunk cap is rejected before any of it is sent, and a
   `/retry-last` that breaches a limit keeps the earlier turn's pending
-  deliveries. Durable send
-  budgets persist across restarts and also cap reconciliation replays. See the
+  deliveries. Durable send budgets persist across restarts and also cap
+  reconciliation replays. A turn interrupted by a connector restart is loaded
+  as a limited turn that `/discard-last` clears, and a message queued behind a
+  limited turn receives one notice naming the recovery command instead of
+  waiting silently. See the
   [terminal harness output limits](../../integrations/terminal-harness/README.md#output-limits).
 
 ## [0.11.0] - 2026-09-29

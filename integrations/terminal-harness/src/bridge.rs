@@ -42,6 +42,7 @@ const SEND_RETRY_ATTEMPTS: usize = 3;
 const LIVENESS_UNKNOWN_TEXT: &str = "The backend is still running, but the connector cannot confirm progress. No action is needed; it will keep checking until the configured total limit.";
 const TEXT_FINAL_ACK_UNKNOWN_TEXT: &str = "The backend finished, but the connector could not confirm delivery of its final response. No action is needed; it is reconciling delivery.";
 const INCOMPLETE_FINAL_TEXT: &str = "The backend finished, but the connector could not persist the complete final response. Send `/retry-last` to retry it, or `/discard-last` to abandon it and continue queued work.";
+const UNRESOLVED_TURN_TEXT: &str = "An earlier turn in this chat stopped before it completed, and its remaining output is withheld.";
 
 /// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
 pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
@@ -561,8 +562,18 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     } else {
         let mut recovery_changes = permit.queue.recovery_changed.subscribe();
         let mut delivery_changes = ctx.deliveries.subscribe();
+        let mut recovery_notice_sent = false;
         loop {
             while fifo_is_blocked(&ctx, &inbound.group_ref).await {
+                if !recovery_notice_sent
+                    && ctx
+                        .deliveries
+                        .requires_recovery_command(&inbound.group_ref)
+                        .await
+                {
+                    recovery_notice_sent = true;
+                    send_recovery_required_notice(&ctx, &inbound).await;
+                }
                 tokio::select! {
                     result = recovery_changes.changed() => {
                         if result.is_err() {
@@ -1967,6 +1978,33 @@ async fn send_artifact_failure_activity(
         ),
     ))
     .await
+}
+
+/// Tells a message queued behind a turn that only a recovery command can
+/// release why it is waiting. Activity carries no reply idempotency key, so it
+/// cannot collide with the queued message's own later replies.
+async fn send_recovery_required_notice(ctx: &BridgeContext, inbound: &InboundPrompt) {
+    let commands = if ctx.recovery.get(&inbound.group_ref).await.is_some() {
+        "Send `/retry-last` to retry it, or `/discard-last` to abandon it"
+    } else {
+        "Send `/discard-last` to abandon it"
+    };
+    let text = format!(
+        "[{}] {UNRESOLVED_TURN_TEXT} {commands}; this message stays queued until then.",
+        ctx.cfg.spec.reply_prefix
+    );
+    if let Err(err) = ctx
+        .client
+        .send_agent_activity_error(
+            &inbound.account_ref,
+            &inbound.group_ref,
+            &inbound.message_ref,
+            text,
+        )
+        .await
+    {
+        warn!(target: TRACE_TARGET, method = "recovery_notice", error_kind = err.privacy_safe_kind(), "failed to send the recovery-required notice");
+    }
 }
 
 async fn fifo_is_blocked(ctx: &BridgeContext, group_ref: &str) -> bool {
@@ -5968,6 +6006,159 @@ mod tests {
         server.abort();
     }
 
+    fn recovery_notices(requests: &RecordedRequests) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                AgentControlRequest::SendAgentActivity { text, .. }
+                    if text.contains(UNRESOLVED_TURN_TEXT) =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn wait_for_recovery_notice(requests: &RecordedRequests) -> String {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(notice) = recovery_notices(requests).pop() {
+                    return notice;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a prompt queued behind an unresolved turn must be told how to release it")
+    }
+
+    #[tokio::test]
+    async fn restart_during_a_turn_leaves_a_visible_discardable_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = limited_config(root.path(), |_| {});
+        let delivery_path = config.state_path.with_extension("delivery.json");
+        {
+            // The connector stopped while a live turn had one chunk staged and
+            // its send attempt charged but unacknowledged.
+            let before_restart = FinalDeliveryStore::load(delivery_path).unwrap();
+            before_restart
+                .begin_turn("group", "interrupted", 4)
+                .await
+                .unwrap();
+            before_restart
+                .set(
+                    "group:interrupted:1",
+                    FinalDeliveryRecord {
+                        account_ref: "account".to_owned(),
+                        group_ref: "group".to_owned(),
+                        reply_to_ref: "interrupted".to_owned(),
+                        text: "interrupted chunk".to_owned(),
+                        chunk_index: 1,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                before_restart
+                    .reserve_send("group", "interrupted", SendMode::Live, 4)
+                    .await
+                    .unwrap(),
+                SendAdmission::Admitted
+            );
+        }
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["later reply"]), Some("session")),
+        );
+
+        assert!(ctx.deliveries.requires_recovery_command("group").await);
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 99).await;
+        assert!(requests.lock().unwrap().is_empty());
+
+        let queued = tokio::spawn(dispatch_test_message(ctx.clone(), "later", "later work"));
+        let notice = wait_for_recovery_notice(&requests).await;
+        assert!(notice.starts_with("[wn-opencode] "));
+        assert!(notice.contains("`/discard-last`"));
+        assert!(
+            !notice.contains("/retry-last"),
+            "no recovery record exists for an interrupted turn"
+        );
+        assert!(final_texts(&requests).is_empty());
+        assert!(!queued.is_finished());
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), queued)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        let finals = final_texts(&requests);
+        assert_eq!(finals.len(), 2);
+        assert!(finals[0].contains("discarded"));
+        assert_eq!(finals[1], "later reply");
+        assert_eq!(recovery_notices(&requests).len(), 1);
+        assert!(ctx.deliveries.list().await.is_empty());
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "interrupted")
+                .await
+                .is_none()
+        );
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn prompt_queued_behind_a_limited_turn_is_told_its_recovery_commands_once() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = limited_config(root.path(), |settings| settings.max_text_events = 1);
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["one", "two"]), Some("limited-session")),
+        );
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+        assert_eq!(final_texts(&requests), vec!["one"]);
+        assert!(recovery_notices(&requests).is_empty());
+
+        let queued = tokio::spawn(dispatch_test_message(ctx.clone(), "later", "later work"));
+        let notice = wait_for_recovery_notice(&requests).await;
+        assert!(notice.contains("`/retry-last`") && notice.contains("`/discard-last`"));
+        // Reconciliation and unrelated store changes do not repeat the notice.
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 99).await;
+        ctx.deliveries.begin_turn("other", "work", 4).await.unwrap();
+        ctx.deliveries
+            .finish_turn("other", "work", false)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!queued.is_finished());
+        assert_eq!(recovery_notices(&requests).len(), 1);
+        assert_eq!(final_texts(&requests), vec!["one"]);
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), queued)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(recovery_notices(&requests).len(), 1);
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn durable_send_budget_stops_final_and_status_requests_at_the_cap() {
         let root = tempfile::tempdir().unwrap();
@@ -6081,7 +6272,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let export_root = root.path().join("exports");
-        std::fs::create_dir(&export_root).unwrap();
+        fs_private::create_dir_all_private(&export_root).unwrap();
         let mut config = limited_config(root.path(), |settings| {
             settings.max_reply_chunks = max_reply_chunks;
         });

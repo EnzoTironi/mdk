@@ -90,12 +90,12 @@ pub(crate) struct FinalDeliveryRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TurnPhase {
-    /// The live handler owns the turn; replay is excluded. Left behind by a
-    /// crash, it blocks the group until explicitly discarded.
+    /// The live handler owns the turn; replay is excluded.
     Active,
     /// Collection completed safely; pending work may be replayed within budget.
     Reconcilable,
-    /// An output limit was exceeded; nothing is sent until explicit discard.
+    /// An output limit was exceeded, or the connector stopped while the turn
+    /// was active; nothing is sent until explicit discard.
     Limited,
 }
 
@@ -137,8 +137,10 @@ pub(crate) enum SendAdmission {
     Withheld,
 }
 
+/// Length-prefixed so no `(group_ref, reply_to_ref)` pair can alias another,
+/// whatever alphabet the refs use.
 fn turn_key(group_ref: &str, reply_to_ref: &str) -> String {
-    format!("{group_ref}:{reply_to_ref}")
+    format!("{}:{group_ref}:{reply_to_ref}", group_ref.len())
 }
 
 #[derive(Deserialize)]
@@ -454,6 +456,25 @@ impl FinalDeliverySnapshot {
             .get(group_ref)
             .is_some_and(|reply_tos| reply_tos.contains(reply_to_ref))
     }
+
+    /// No handler survives a restart, so a persisted active turn was
+    /// interrupted with an unknown outcome: it may already have breached a
+    /// limit. It is loaded as limited behind the incomplete-final barrier, the
+    /// same discardable state a live breach leaves, and never replayed. Budgets
+    /// are re-keyed from their own identity.
+    fn recover_interrupted_turns(&mut self) {
+        for (_, mut budget) in std::mem::take(&mut self.turn_budgets) {
+            if budget.phase == TurnPhase::Active {
+                budget.phase = TurnPhase::Limited;
+                self.incomplete_finals
+                    .entry(budget.group_ref.clone())
+                    .or_default()
+                    .insert(budget.reply_to_ref.clone());
+            }
+            self.turn_budgets
+                .insert(turn_key(&budget.group_ref, &budget.reply_to_ref), budget);
+        }
+    }
 }
 
 pub(crate) struct FinalDeliveryStore {
@@ -469,7 +490,7 @@ impl FinalDeliveryStore {
         if path.exists() {
             fs_private::tighten_existing_private_file(&path)?;
         }
-        let state = match std::fs::read(&path) {
+        let mut state = match std::fs::read(&path) {
             Ok(bytes) if !bytes.is_empty() => parse_final_delivery_snapshot(&bytes)?,
             Ok(_) => FinalDeliverySnapshot::default(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -477,6 +498,7 @@ impl FinalDeliveryStore {
             }
             Err(err) => return Err(err.into()),
         };
+        state.recover_interrupted_turns();
         let (changed, _) = watch::channel(0);
         Ok(Self {
             path,
@@ -509,8 +531,30 @@ impl FinalDeliveryStore {
             .is_some_and(|reply_tos| !reply_tos.is_empty())
     }
 
-    /// Active budgets left by a crash and limited turns block the group like an
-    /// incomplete final until they are explicitly discarded.
+    /// Whether the group waits only on `/discard-last` (or `/retry-last`): it
+    /// holds an incomplete-final barrier or limited turn and no live turn, as
+    /// opposed to a running turn or pending reconciliation that resolves itself.
+    pub(crate) async fn requires_recovery_command(&self, group_ref: &str) -> bool {
+        let state = self.state.lock().await;
+        let mut unresolved = state
+            .incomplete_finals
+            .get(group_ref)
+            .is_some_and(|reply_tos| !reply_tos.is_empty());
+        for budget in state.turn_budgets.values() {
+            if budget.group_ref != group_ref {
+                continue;
+            }
+            match budget.phase {
+                TurnPhase::Active => return false,
+                TurnPhase::Limited => unresolved = true,
+                TurnPhase::Reconcilable => {}
+            }
+        }
+        unresolved
+    }
+
+    /// Live and limited turns block the group like an incomplete final; a
+    /// limited turn stays until it is explicitly discarded.
     pub(crate) async fn blocks_group(&self, group_ref: &str) -> bool {
         let unresolved_turn =
             self.state.lock().await.turn_budgets.values().any(|budget| {
@@ -1400,7 +1444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_and_limited_turns_survive_restart_block_group_and_withhold_replay() {
+    async fn interrupted_and_limited_turns_survive_restart_block_group_and_withhold_replay() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("delivery.json");
         {
@@ -1410,34 +1454,44 @@ mod tests {
                 .set("active:1", delivery_record("active", 1))
                 .await
                 .unwrap();
+            assert_eq!(
+                store
+                    .reserve_send("group", "active", SendMode::Live, 8)
+                    .await
+                    .unwrap(),
+                SendAdmission::Admitted
+            );
             store.begin_turn("group", "limited", 8).await.unwrap();
             store
                 .set("limited:1", delivery_record("limited", 1))
                 .await
                 .unwrap();
             store.limit_turn("group", "limited", 8).await.unwrap();
+            assert!(!store.requires_recovery_command("other").await);
         }
 
         let store = FinalDeliveryStore::load(path).unwrap();
         assert!(store.blocks_group("group").await);
+        assert!(store.requires_recovery_command("group").await);
         assert!(store.has_incomplete_final("group").await);
         assert!(store.list_reconcilable().await.is_empty());
-        for reply_to in ["active", "limited"] {
-            assert_eq!(
-                store
-                    .reserve_send("group", reply_to, SendMode::Replay, 8)
-                    .await
-                    .unwrap(),
-                SendAdmission::Withheld
-            );
-        }
+        let interrupted = store.turn_budget("group", "active").await.unwrap();
+        assert_eq!(interrupted.phase, TurnPhase::Limited);
         assert_eq!(
-            store
-                .reserve_send("group", "limited", SendMode::Live, 8)
-                .await
-                .unwrap(),
-            SendAdmission::Withheld
+            (interrupted.sends_charged, interrupted.max_durable_sends),
+            (1, 8)
         );
+        for reply_to in ["active", "limited"] {
+            for mode in [SendMode::Replay, SendMode::Live] {
+                assert_eq!(
+                    store
+                        .reserve_send("group", reply_to, mode, 8)
+                        .await
+                        .unwrap(),
+                    SendAdmission::Withheld
+                );
+            }
+        }
         assert_eq!(store.list().await.len(), 2);
         assert_eq!(
             store.discard_incomplete_final("group", None).await.unwrap(),
@@ -1447,6 +1501,85 @@ mod tests {
         assert!(store.list().await.is_empty());
         assert!(store.turn_budget("group", "active").await.is_none());
         assert!(store.turn_budget("group", "limited").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_interrupted_before_any_record_loads_as_a_discardable_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        {
+            let store = FinalDeliveryStore::load(path.clone()).unwrap();
+            store.begin_turn("group", "active", 8).await.unwrap();
+            store.begin_turn("group", "done", 8).await.unwrap();
+            store
+                .set("done:1", delivery_record("done", 1))
+                .await
+                .unwrap();
+            store.finish_turn("group", "done", false).await.unwrap();
+        }
+
+        let store = FinalDeliveryStore::load(path.clone()).unwrap();
+        assert_eq!(store.list().await.len(), 1);
+        assert_eq!(
+            store.turn_budget("group", "active").await.unwrap().phase,
+            TurnPhase::Limited
+        );
+        assert_eq!(
+            store.turn_budget("group", "done").await.unwrap().phase,
+            TurnPhase::Reconcilable
+        );
+        assert!(store.requires_recovery_command("group").await);
+        // A turn that finished before the restart stays reconcilable.
+        assert_eq!(store.list_reconcilable().await.len(), 1);
+
+        // Normalization is idempotent across repeated restarts.
+        drop(store);
+        let store = FinalDeliveryStore::load(path).unwrap();
+        assert_eq!(
+            store.turn_budget("group", "active").await.unwrap().phase,
+            TurnPhase::Limited
+        );
+        // A live turn in the group, such as a running retry, is not waiting on
+        // a recovery command.
+        store.begin_turn("group", "retry", 8).await.unwrap();
+        assert!(!store.requires_recovery_command("group").await);
+        store.finish_turn("group", "retry", false).await.unwrap();
+        assert!(store.requires_recovery_command("group").await);
+        assert_eq!(
+            store.discard_incomplete_final("group", None).await.unwrap(),
+            vec!["active".to_owned()]
+        );
+        assert!(!store.requires_recovery_command("group").await);
+        assert!(store.turn_budget("group", "active").await.is_none());
+        assert_eq!(store.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn turn_budgets_are_rekeyed_from_their_identity_on_load() {
+        assert_ne!(turn_key("a:b", "c"), turn_key("a", "b:c"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        let snapshot = serde_json::json!({
+            "turn_budgets": {
+                "group:message": {
+                    "group_ref": "group",
+                    "reply_to_ref": "message",
+                    "max_durable_sends": 3,
+                    "sends_charged": 3,
+                    "phase": "reconcilable"
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let store = FinalDeliveryStore::load(path).unwrap();
+        assert_eq!(
+            store
+                .reserve_send("group", "message", SendMode::Replay, 99)
+                .await
+                .unwrap(),
+            SendAdmission::Exhausted
+        );
     }
 
     #[tokio::test]
