@@ -63,6 +63,14 @@ By default the control socket is:
 ~/.marmot-agent/dev/wn-agent.sock
 ```
 
+Unix socket addresses have a platform byte limit (107 bytes on Linux, 103 on
+macOS). The private bind also uses a staging address next to the final socket:
+`<parent>/.sock.<pid>.<filename>/<filename>`. Both addresses must fit, so a final
+path below the limit can still be too long after staging. Startup reports
+`socket_path_too_long` before creating socket directories in this case, without
+logging the path. Use a shorter `--home` or an explicit shorter `--socket` path
+inside an appropriately private directory; do not relax its permissions.
+
 In another terminal, create or reuse the local agent account and print the phone invite details:
 
 ```sh
