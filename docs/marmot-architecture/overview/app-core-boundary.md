@@ -14,35 +14,24 @@ Shared product policy and protocol state must remain behind the app-core API.
 
 ## Host-app boundary
 
-White Noise Android is a **minimal display and Android platform layer**. Choose
-ownership by responsibility, rather than the language of the caller:
+White Noise Android is a **minimal display and Android platform layer**:
 
-| Responsibility | Owner |
+| Owner | Responsibilities |
 | --- | --- |
-| Protocol/cryptography, account/group/message rules, validation and shared parsing | MDK engine/session/app runtime |
-| Persistence, durable drafts, query/projection ordering and pagination, unread/delivery state and retention | MDK storage/app runtime |
-| Relay/media acquisition, retry/recovery, durable transfer state and shared diagnostics/consent | MDK runtime and bindings |
-| Rendering, navigation, accessibility, locale formatting, transient editing/optimistic display and subscription lifecycle | Host UI |
-| Permissions, system notifications/background execution, file pickers/sharing, network/device signals and secure-store/external-signer access | Platform adapters supplying inputs to MDK |
+| MDK runtime/bindings | Protocol, account/group/message rules, validation/parsing, persistence, durable drafts, queries/projections, unread/delivery state, retention, relay/media operations, retry/recovery and shared diagnostics/consent |
+| Host UI | Rendering, navigation, accessibility, formatting, transient editing/optimistic display and subscription lifecycle |
+| Platform adapters | Permissions, notifications/background execution, file pickers/sharing, device/network signals and secure-store/external-signer access |
 
-Platform adapters may evaluate OS permissions or connectivity and submit those
-inputs through MDK's supported API. MDK applies shared product rules and owns
-authoritative outcomes; a platform integration is not a second implementation
-of validation, transfer scheduling, recovery or persistent state.
+Adapters supply platform inputs; MDK applies shared rules and owns outcomes.
+Do not add a host database/cache of protocol records or projections to hide slow
+reads: improve MDK queries/indexes/bindings and keep blocking calls off the UI thread.
+Existing compatibility adapters remain until native release and adoption are validated.
 
-Do not introduce a host database or long-lived cache of protocol records or
-projections to hide slow reads. Improve MDK's indexes, bounded local APIs or
-pre-shaped projections, and keep blocking binding calls off the UI thread.
-Transient view state is allowed. Existing host caches/adapters may remain during
-an explicit compatibility migration until the native capability is released and
-its consumer adoption is validated; this does not authorize new duplicate state.
-
-When an API is missing, implement and review the capability in MDK first where
-possible, expose it through the relevant bindings, and test the behavior here.
-Track the upstream prerequisite in the host PR. Adopt a published, immutable
-MarmotKit artifact and verify native/consumer compatibility; do not fork generated
-bindings or fill the gap with client business logic. Keep the public API/reference
-and affected host agent guidance aligned with the change.
+Implement, review and test missing shared capabilities in MDK first where possible;
+expose them through bindings and link the prerequisite in the host PR. Adopt a
+published, immutable MarmotKit artifact and validate compatibility. Never fork
+generated bindings or fill gaps with client business logic; keep API references
+and affected host agent guidance aligned.
 
 ## Ownership
 

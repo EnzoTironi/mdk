@@ -2,8 +2,7 @@
 
 UniFFI bindings for the Marmot app runtime. Read `README.md` first for integration concepts, API selection and platform setup; then `API-REFERENCE.md` for the complete exported method inventory.
 
-Bindings expose MDK-owned behavior to minimal host display/platform layers; keep shared rules in `marmot-app`, not generated Kotlin/Swift or FFI conversion glue.
-Read [the host-app ownership contract](../../docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary) before adding APIs.
+Expose `marmot-app` behavior through bindings, following [MDK's host boundary](../../docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary).
 
 ## Scope
 

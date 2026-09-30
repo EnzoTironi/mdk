@@ -2,8 +2,7 @@
 
 App runtime bridge for the first real Marmot app surfaces.
 
-Shared app behavior belongs in this Rust runtime; hosts render its typed state and provide platform inputs.
-Read [the host-app ownership contract](../../docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary) before adding APIs.
+Implement shared behavior here, following [MDK's host boundary](../../docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary).
 
 ## Scope
 
