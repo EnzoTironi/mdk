@@ -193,6 +193,7 @@ impl AgentConnector {
             | AgentControlRequest::StreamFinish { .. }
             | AgentControlRequest::StreamCancel { .. } => Some("control_preview"),
             AgentControlRequest::SendFinal { .. }
+            | AgentControlRequest::EditMessage { .. }
             | AgentControlRequest::DeleteMessage { .. }
             | AgentControlRequest::SendReaction { .. }
             | AgentControlRequest::RemoveReaction { .. }
