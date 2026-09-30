@@ -60,8 +60,21 @@ pub struct RecoveryDemand {
     pub caller_waiting: bool,
 }
 
-fn invalid_demand() -> StorageError {
+pub(super) fn invalid_demand() -> StorageError {
     StorageError::Serialization("invalid recovery demand".into())
+}
+
+pub(super) fn recovery_cause(value: i64) -> StorageResult<RecoveryCause> {
+    Ok(match value {
+        0 => RecoveryCause::QueueLoss,
+        1 => RecoveryCause::EpochGap,
+        2 => RecoveryCause::Maintenance,
+        3 => RecoveryCause::ExplicitHistory,
+        4 => RecoveryCause::KnownEvent,
+        5 => RecoveryCause::IncrementalHistory,
+        6 => RecoveryCause::NotificationLoss,
+        _ => return Err(invalid_demand()),
+    })
 }
 
 impl SqliteAccountStorage {
@@ -70,6 +83,17 @@ impl SqliteAccountStorage {
         request: RecoveryRequest<'_>,
         now_ms: u64,
     ) -> StorageResult<RecoveryDemandTicket> {
+        self.request_recovery_observed(request, now_ms)
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// [`Self::request_recovery`], also reporting how the write changed the
+    /// obligation, for the owner's audit row.
+    pub fn request_recovery_observed(
+        &self,
+        request: RecoveryRequest<'_>,
+        now_ms: u64,
+    ) -> StorageResult<(RecoveryDemandTicket, super::RecoveryDemandTransition)> {
         let (key, cause, predicate, group, event, caller) = match request {
             RecoveryRequest::MaintenanceBoundary { job_id, group_id } => {
                 if job_id.is_empty() || group_id.is_empty() {
@@ -113,6 +137,20 @@ impl SqliteAccountStorage {
         };
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            // Explicit history shares one obligation under the latest caller's
+            // key, so its prior row is the one explicit row, whatever its key.
+            let before = if cause == 3 {
+                conn.query_row_cached(
+                    "SELECT id, revision, state, eligibility FROM account_recovery_obligations
+                     WHERE cause = 3 LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .storage()?
+            } else {
+                super::observe::demand_row(&conn, &key)?
+            };
             if cause == 3 {
                 // Serialized foreground operations share one account-history
                 // obligation. A new caller expands its revision/goal without
@@ -121,29 +159,33 @@ impl SqliteAccountStorage {
                 // duplicate joins idempotent without an unbounded waiter log.
                 conn.execute_cached(
                     "UPDATE account_recovery_obligations SET demand_key=?1,
-                     revision=revision+1,state=0,eligibility=0,urgency=1,updated_at_ms=?2
+                     revision=revision+1,state=0,eligibility=0,urgency=1,updated_at_ms=?2,
+                     incomplete_reason=NULL
                      WHERE cause=3 AND demand_key!=?1",
                     params![key,sqlite_integer(now_ms)?],
                 ).storage()?;
             }
+            // A new request for a known event or incremental history is new
+            // demand even when that key was satisfied or retired before.
             conn.execute_cached(
                 "INSERT INTO account_recovery_obligations
                  (demand_key,cause,predicate,group_id,created_at_ms,updated_at_ms,caller_origin,urgency)
                  VALUES (?1,?2,?3,?4,?5,?5,?6,?6)
                  ON CONFLICT(demand_key) DO UPDATE SET state=0,revision=revision+1,
-                     eligibility=0,updated_at_ms=excluded.updated_at_ms
-                 WHERE account_recovery_obligations.state=1 AND account_recovery_obligations.cause IN (4,5)",
+                     eligibility=0,updated_at_ms=excluded.updated_at_ms,incomplete_reason=NULL
+                 WHERE account_recovery_obligations.state IN (1,2)
+                     AND account_recovery_obligations.cause IN (4,5)",
                 params![key,cause,predicate,group,sqlite_integer(now_ms)?,caller],
             ).storage()?;
-            let (id,revision): (Vec<u8>,i64) = conn.query_row_cached(
-                "SELECT id,revision FROM account_recovery_obligations WHERE demand_key=?1",
-                [&key], |row| Ok((row.get(0)?,row.get(1)?)),
-            ).storage()?;
+            let after = super::observe::demand_row(&conn, &key)?.ok_or_else(invalid_demand)?;
             conn.execute_cached(
                 "INSERT OR IGNORE INTO account_recovery_scopes(obligation_id,scope_id,group_id,known_event_id)
-                 VALUES (?1,0,?2,?3)", params![id,group,event],
+                 VALUES (?1,0,?2,?3)", params![after.0,group,event],
             ).storage()?;
-            Ok(RecoveryDemandTicket { id: id.try_into().map_err(|_| invalid_demand())?, revision: i64_to_u64(revision)? })
+            Ok((
+                super::observe::ticket(&after)?,
+                super::observe::transition(before.as_ref(), &after),
+            ))
         })
     }
 
@@ -162,22 +204,6 @@ impl SqliteAccountStorage {
                 params![ticket.id.as_slice(), sqlite_integer(ticket.revision)?],
             )
             .storage()?;
-        Ok(())
-    }
-
-    /// A selected account activation replaces all physical subscriptions.
-    /// Include its still-needed maintenance sessions in that same reservation.
-    /// Call within the reservation transaction, only once other work is due.
-    pub fn rearm_recovery_maintenance_for_activation(&self, ids: &[[u8; 16]]) -> StorageResult<()> {
-        let conn = self.lock()?;
-        for id in ids {
-            conn.execute_cached(
-                "UPDATE account_recovery_obligations SET state=0,eligibility=1,revision=revision+1
-                 WHERE id=?1 AND cause=2 AND predicate=2 AND state IN (0,1)",
-                [id.as_slice()],
-            )
-            .storage()?;
-        }
         Ok(())
     }
 
@@ -216,6 +242,31 @@ impl SqliteAccountStorage {
             "DELETE FROM account_recovery_obligations WHERE cause=4 AND predicate=1 AND state=1 AND urgency=0",
             [],
         ).storage()
+    }
+
+    /// Close an explicit full-history request whose pass finished: its goal
+    /// has no lower bound, so nothing can complete it, and leaving it pending
+    /// would only park it into a notice. Closing records neither coverage nor
+    /// a retirement notice. The explicit-history row is reused by a later
+    /// request, which raises its revision, so only this ticket's revision is
+    /// closed: newer debt survives. Returns whether a row was closed.
+    pub fn close_explicit_history_request(
+        &self,
+        ticket: RecoveryDemandTicket,
+    ) -> StorageResult<bool> {
+        let closed = self
+            .lock()?
+            .execute_cached(
+                "DELETE FROM account_recovery_obligations
+                 WHERE id=?1 AND revision=?2 AND cause=?3 AND state=0",
+                params![
+                    ticket.id.as_slice(),
+                    sqlite_integer(ticket.revision)?,
+                    RecoveryCause::ExplicitHistory as i64
+                ],
+            )
+            .storage()?;
+        Ok(closed > 0)
     }
 
     /// A cancelled last foreground waiter loses urgency, not durable work.
@@ -310,16 +361,7 @@ impl SqliteAccountStorage {
                             id: id.try_into().map_err(|_| invalid_demand())?,
                             revision: i64_to_u64(revision)?,
                         },
-                        cause: match cause {
-                            0 => RecoveryCause::QueueLoss,
-                            1 => RecoveryCause::EpochGap,
-                            2 => RecoveryCause::Maintenance,
-                            3 => RecoveryCause::ExplicitHistory,
-                            4 => RecoveryCause::KnownEvent,
-                            5 => RecoveryCause::IncrementalHistory,
-                            6 => RecoveryCause::NotificationLoss,
-                            _ => return Err(invalid_demand()),
-                        },
+                        cause: recovery_cause(cause)?,
                         predicate: match predicate {
                             0 => RecoveryPredicate::AllEndpoints,
                             1 => RecoveryPredicate::RetainedKnownEvent,
@@ -352,6 +394,45 @@ impl SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second explicit request reuses the row and raises its revision. The
+    /// first repair's late close must not delete that newer debt.
+    #[test]
+    fn a_stale_explicit_close_keeps_a_newer_request() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let first = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[1; 16],
+                },
+                1000,
+            )
+            .unwrap();
+        // The second request lands between the first repair's pass and its
+        // close.
+        let second = store
+            .request_recovery(
+                RecoveryRequest::ExplicitHistory {
+                    operation_id: &[2; 16],
+                },
+                2000,
+            )
+            .unwrap();
+        assert_eq!(second.id, first.id, "the explicit row is reused");
+        assert!(second.revision > first.revision);
+        let explicit_pending = |store: &SqliteAccountStorage| {
+            store
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .any(|demand| demand.cause == RecoveryCause::ExplicitHistory)
+        };
+        assert!(!store.close_explicit_history_request(first).unwrap());
+        assert!(explicit_pending(&store), "the newer request survives");
+        assert!(store.close_explicit_history_request(second).unwrap());
+        assert!(!explicit_pending(&store));
+    }
+
     #[test]
     fn cancelling_one_caller_preserves_independent_demand_and_quiescence() {
         let store = SqliteAccountStorage::in_memory().unwrap();

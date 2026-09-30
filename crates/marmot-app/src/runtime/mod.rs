@@ -139,7 +139,7 @@ pub use subscriptions::{
 
 // Bring split-out items the orchestration core references back into scope.
 pub(crate) use account_worker::{
-    AccountWorkerCommand, AccountWorkerRuntime, ManagedAccountWorker,
+    AccountStartupProgress, AccountWorkerCommand, AccountWorkerRuntime, ManagedAccountWorker,
     publish_app_runtime_group_state_updated, spawn_app_runtime_account_worker,
 };
 pub(crate) use audit_tracker::{
@@ -330,15 +330,6 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 ];
 
 #[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct BoundedResultWitness {
-    pub(crate) account_label: String,
-    pub(crate) attempt_serial: u64,
-    pub(crate) event_id: [u8; 32],
-    pub(crate) matching_items: usize,
-}
-
-#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct OrdinaryDeliveryDropTarget {
     pub(crate) account_label: String,
@@ -353,12 +344,9 @@ pub(crate) struct RecoverySelectionWitnessTarget {
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
-    /// Off until the production SDK acquisition backend passes its two-relay
-    /// conformance gate. Controlled worker fixtures opt in explicitly.
-    pub(crate) bounded_group_recovery_enabled: Arc<AtomicBool>,
     /// Every production runtime points at the same process capacity. The
     /// indirection permits explicit isolation of capacity-sensitive fixtures.
-    recovery_credits: Arc<StdMutex<Arc<account_worker::bounded_recovery::RecoveryCreditPool>>>,
+    recovery_credits: Arc<StdMutex<Arc<account_worker::recovery_credits::RecoveryCreditPool>>>,
     #[cfg(test)]
     pub(crate) comparison_test_trace: Arc<StdMutex<Vec<&'static str>>>,
     #[cfg(test)]
@@ -366,23 +354,6 @@ pub struct RuntimeSharedServices {
         Arc<StdMutex<Option<(String, crate::client::TestComparisonActivityWitness)>>>,
     #[cfg(test)]
     pub(crate) recovery_selection_witness: Arc<StdMutex<Option<RecoverySelectionWitnessTarget>>>,
-    #[cfg(test)]
-    pub(crate) recovery_phase_witness:
-        Arc<StdMutex<Option<(String, crate::client::TestRecoveryPhaseWitness)>>>,
-    #[cfg(test)]
-    pub(crate) bounded_recovery_finished: Arc<Notify>,
-    #[cfg(test)]
-    pub(crate) bounded_preparation_probes: Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)]
-    pub(crate) bounded_result_ready: Arc<Notify>,
-    #[cfg(test)]
-    pub(crate) bounded_result_witness: Arc<StdMutex<Option<BoundedResultWitness>>>,
-    #[cfg(test)]
-    pub(crate) bounded_prefix_admitted: Arc<Notify>,
-    #[cfg(test)]
-    pub(crate) bounded_pause_before_admission: Arc<AtomicBool>,
-    #[cfg(test)]
-    pub(crate) bounded_pause_after_first_admission: Arc<AtomicBool>,
     /// One exact ordinary SDK delivery may be omitted before worker ingest.
     #[cfg(test)]
     pub(crate) ordinary_drop_once: Arc<StdMutex<Option<OrdinaryDeliveryDropTarget>>>,
@@ -417,7 +388,13 @@ pub struct RuntimeSharedServices {
     next_startup_sync_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
     #[cfg(any(test, feature = "test-policy-overrides"))]
     next_scheduled_convergence_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    next_catch_up_barrier: Arc<StdMutex<Option<AccountCatchUpBarrier>>>,
 }
+
+/// One account's held catch-up: its account id and the rendezvous barrier.
+#[cfg(any(test, feature = "test-policy-overrides"))]
+type AccountCatchUpBarrier = (String, Arc<tokio::sync::Barrier>);
 
 const MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT: usize = MAX_SEEN_EVENT_IDS;
 
@@ -483,9 +460,8 @@ impl MessageSubscriptionSeenIds {
 impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
-            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
             recovery_credits: Arc::new(StdMutex::new(
-                account_worker::bounded_recovery::shared_recovery_credit_pool(),
+                account_worker::recovery_credits::shared_recovery_credit_pool(),
             )),
             #[cfg(test)]
             comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
@@ -493,22 +469,6 @@ impl Default for RuntimeSharedServices {
             comparison_activity_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            recovery_phase_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            bounded_recovery_finished: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            bounded_result_ready: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_result_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            bounded_prefix_admitted: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             ordinary_drop_once: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -540,22 +500,24 @@ impl Default for RuntimeSharedServices {
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_scheduled_convergence_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_catch_up_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 }
 
 impl RuntimeSharedServices {
-    pub(in crate::runtime) fn recovery_credit_pool(
+    pub(crate) fn recovery_credit_pool(
         &self,
-    ) -> Arc<account_worker::bounded_recovery::RecoveryCreditPool> {
+    ) -> Arc<account_worker::recovery_credits::RecoveryCreditPool> {
         self.recovery_credits.lock().unwrap().clone()
     }
 
     #[cfg(test)]
     pub(in crate::runtime) fn use_private_recovery_credit_pool_for_test(
         &self,
-    ) -> Arc<account_worker::bounded_recovery::RecoveryCreditPool> {
-        let pool = account_worker::bounded_recovery::private_recovery_credit_pool_for_test();
+    ) -> Arc<account_worker::recovery_credits::RecoveryCreditPool> {
+        let pool = account_worker::recovery_credits::private_recovery_credit_pool_for_test();
         self.set_recovery_credit_pool_for_test(pool.clone());
         pool
     }
@@ -563,7 +525,7 @@ impl RuntimeSharedServices {
     #[cfg(test)]
     pub(in crate::runtime) fn set_recovery_credit_pool_for_test(
         &self,
-        pool: Arc<account_worker::bounded_recovery::RecoveryCreditPool>,
+        pool: Arc<account_worker::recovery_credits::RecoveryCreditPool>,
     ) {
         *self.recovery_credits.lock().unwrap() = pool;
     }
@@ -588,9 +550,8 @@ impl RuntimeSharedServices {
             lifecycle.clone(),
         );
         Self {
-            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
             recovery_credits: Arc::new(StdMutex::new(
-                account_worker::bounded_recovery::shared_recovery_credit_pool(),
+                account_worker::recovery_credits::shared_recovery_credit_pool(),
             )),
             #[cfg(test)]
             comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
@@ -598,22 +559,6 @@ impl RuntimeSharedServices {
             comparison_activity_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             recovery_selection_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            recovery_phase_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            bounded_recovery_finished: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            bounded_result_ready: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_result_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            bounded_prefix_admitted: Arc::new(Notify::new()),
-            #[cfg(test)]
-            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             ordinary_drop_once: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -647,6 +592,8 @@ impl RuntimeSharedServices {
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_scheduled_convergence_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_catch_up_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -703,6 +650,35 @@ impl RuntimeSharedServices {
             .lock()
             .unwrap()
             .take()
+    }
+
+    /// Test-only hook: hold one account's next explicit catch-up between two
+    /// rendezvous, while its command owns the account client, so the commands
+    /// it answers meanwhile can be checked deterministically.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub fn set_next_catch_up_barrier(
+        &self,
+        account_id_hex: &str,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) {
+        *self.next_catch_up_barrier.lock().unwrap() = Some((account_id_hex.to_owned(), barrier));
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    fn take_next_catch_up_barrier(
+        &self,
+        account_id_hex: &str,
+    ) -> Option<Arc<tokio::sync::Barrier>> {
+        let mut slot = self.next_catch_up_barrier.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|(account, _)| account == account_id_hex)
+        {
+            slot.take().map(|(_, barrier)| barrier)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn lifecycle(&self) -> RuntimeLifecycle {
@@ -1251,6 +1227,8 @@ pub struct AccountSetupRequest {
     pub import_nsec: Option<Zeroizing<String>>,
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
+    /// Public directory indexers. Existing accounts use them for reads;
+    /// generated accounts also copy relay lists and kind-0 metadata to them.
     pub discovery_relays: Vec<TransportEndpoint>,
     pub publish_missing_relay_lists: bool,
     pub publish_initial_key_package: bool,
@@ -1508,6 +1486,15 @@ pub enum MarmotAppEvent {
         kind: cgka_traits::engine::SupersededIntentKind,
         outcome: cgka_traits::engine::SupersededIntentOutcome,
         reason: &'static str,
+    },
+    /// The account's "history may be incomplete" notices changed: recovery
+    /// parked, new evidence re-armed a parked occurrence, or the user
+    /// dismissed one. Re-read `history_notices`. Carries no notice or group
+    /// identities; a group whose own notices changed also gets
+    /// `GroupStateUpdated`.
+    HistoryNoticesChanged {
+        account_id_hex: String,
+        account_label: String,
     },
 }
 
@@ -2381,6 +2368,36 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// The account's "history may be incomplete" notices, oldest first: each
+    /// is one occurrence of automatic recovery parking because it could not
+    /// prove some history complete. Durable and local; refresh on
+    /// `HistoryNoticesChanged`. Group-scoped occurrences also appear in that
+    /// group's `GroupRecoveryStatus`.
+    pub async fn history_notices(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::HistoryNotice>, AppError> {
+        self.accounts.history_notices(account_ref).await
+    }
+
+    /// Dismiss one notice after the user accepts that this history may be
+    /// incomplete. The dismissal is durable and is recorded as its own
+    /// outcome, never as recovered history. Returns false, changing nothing,
+    /// for a stale id: new evidence re-armed recovery, or the notice was
+    /// already dismissed. Dismissing a delivery-loss notice lets the transport
+    /// cursor advance again once no loss recovery remains pending. New loss,
+    /// a higher missing epoch or a new repair request later raises a new
+    /// notice with a new id. A malformed id is an `AppError::Hex`.
+    pub async fn dismiss_history_notice(
+        &self,
+        account_ref: &str,
+        notice_id: &str,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .dismiss_history_notice(account_ref, notice_id)
+            .await
+    }
+
     /// Call only after showing the authenticated inviter and receiving an
     /// explicit user decision to discard the active copy and rejoin. Pass the
     /// exact offer id and local-state token from the reviewed snapshot.
@@ -2487,6 +2504,38 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Read application-owned state. None means absent; Some(empty) is
+    /// present. Refresh after group events, including convergence changes.
+    /// Ids below `APP_OWNED_APP_COMPONENT_ID_START` are protocol space.
+    pub async fn group_app_component(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: u16,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        self.accounts
+            .group_app_component(account_ref, group_id, component_id)
+            .await
+    }
+
+    /// Admin-only replacement of optional application-owned state. Ids below
+    /// `APP_OWNED_APP_COMPONENT_ID_START`, required components, and data over
+    /// `APP_COMPONENT_DATA_MAX_LEN` are rejected. Apps own their schema and id
+    /// allocation within the application range. Empty bytes are stored, not
+    /// removed. Normal commit publication and convergence apply, including
+    /// GroupChangeSuperseded notifications.
+    pub async fn update_app_component(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: u16,
+        data: Vec<u8>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .update_app_component(account_ref, group_id, component_id, data)
+            .await
+    }
+
     pub async fn update_message_retention(
         &self,
         account_ref: &str,
@@ -2561,6 +2610,32 @@ impl MarmotAppRuntime {
         let summary = self
             .accounts
             .send_message(account_ref, group_id, payload)
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
+    }
+
+    /// Send kind-9 text that also carries application tags, such as NIP-30
+    /// `emoji` tags. `imeta` rows are rejected; attachments use
+    /// [`Self::send_tagged_media`].
+    pub async fn send_tagged_text(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        content: String,
+        tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::TaggedChat { content, tags },
+            )
             .await?;
         let _ = self.publish_chat_list_projection_refresh(
             account_ref,
@@ -3377,6 +3452,29 @@ impl MarmotAppRuntime {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
+        self.react_with_media(
+            account_ref,
+            group_id,
+            target_message_id,
+            emoji,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// React with a custom emoji: `attachments` are already-uploaded images
+    /// (emitted as `imeta`) and `tags` name them, e.g. NIP-30
+    /// `["emoji", shortcode, url]` for `emoji` == `:shortcode:`.
+    pub async fn react_with_media(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        target_message_id: &str,
+        emoji: &str,
+        tags: Vec<Vec<String>>,
+        attachments: Vec<MediaAttachmentReference>,
+    ) -> Result<SendSummary, AppError> {
         self.accounts
             .send_app_event(
                 account_ref,
@@ -3384,6 +3482,8 @@ impl MarmotAppRuntime {
                 AppMessageIntent::Reaction {
                     target_message_id: target_message_id.to_owned(),
                     emoji: emoji.to_owned(),
+                    tags,
+                    attachments,
                 },
             )
             .await
@@ -3494,23 +3594,8 @@ impl MarmotAppRuntime {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
-        let summary = self
-            .accounts
-            .send_app_event(
-                account_ref,
-                group_id,
-                AppMessageIntent::Media {
-                    attachments,
-                    caption,
-                },
-            )
-            .await?;
-        let _ = self.publish_chat_list_projection_refresh(
-            account_ref,
-            &hex::encode(group_id.as_slice()),
-            ChatListUpdateTrigger::NewLastMessage,
-        );
-        Ok(summary)
+        self.send_tagged_media(account_ref, group_id, attachments, caption, Vec::new())
+            .await
     }
 
     pub async fn upload_media(
@@ -3522,6 +3607,36 @@ impl MarmotAppRuntime {
         self.accounts
             .upload_media(account_ref, group_id, request)
             .await
+    }
+
+    /// Send already-uploaded attachments as one kind-9 chat that also carries
+    /// application tags, such as NIP-30 `emoji` tags naming those attachments.
+    pub async fn send_tagged_media(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        attachments: Vec<MediaAttachmentReference>,
+        caption: Option<String>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Media {
+                    message_tags,
+                    attachments,
+                    caption,
+                },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
     }
 
     /// Build an authenticated `imeta` tag for an optimistic host-side record
@@ -4224,6 +4339,12 @@ impl MarmotAppRuntime {
             profile,
             &merge_source_relays,
             publish_endpoints,
+            bootstrap.indexer_relays,
+            bootstrap
+                .default_relays
+                .into_iter()
+                .chain(bootstrap.bootstrap_relays)
+                .collect(),
         )
         .await
     }
@@ -4236,6 +4357,20 @@ impl MarmotAppRuntime {
         &self,
         account_ref: &str,
         profile: UserProfileMetadata,
+    ) -> Result<UserProfileMetadata, AppError> {
+        self.publish_user_profile_using_account_relays_and_indexers(
+            account_ref,
+            profile,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn publish_user_profile_using_account_relays_and_indexers(
+        &self,
+        account_ref: &str,
+        profile: UserProfileMetadata,
+        indexer_relays: Vec<TransportEndpoint>,
     ) -> Result<UserProfileMetadata, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
@@ -4255,6 +4390,19 @@ impl MarmotAppRuntime {
             profile,
             &endpoints,
             endpoints.clone(),
+            indexer_relays,
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .chain(&relay_lists.nip65.read_relays)
+                .chain(&relay_lists.nip65.write_relays)
+                .chain(&relay_lists.inbox.relays)
+                .chain(&relay_lists.bootstrap_relays)
+                .chain(&relay_lists.default_relays)
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
         )
         .await
     }
@@ -4265,6 +4413,8 @@ impl MarmotAppRuntime {
         mut profile: UserProfileMetadata,
         merge_source_relays: &[TransportEndpoint],
         publish_endpoints: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+        declared_relays: Vec<TransportEndpoint>,
     ) -> Result<UserProfileMetadata, AppError> {
         if let Some(current) = self
             .latest_known_user_profile_for_publish(&account.account_id_hex, merge_source_relays)
@@ -4285,7 +4435,13 @@ impl MarmotAppRuntime {
         stamp_published_profile_created_at(&mut profile, unix_now_seconds());
         self.accounts
             .app
-            .publish_user_profile_to_endpoints(&account.label, profile.clone(), publish_endpoints)
+            .publish_user_profile_to_endpoints_and_indexers(
+                &account.label,
+                profile.clone(),
+                publish_endpoints,
+                indexer_relays,
+                declared_relays,
+            )
             .await?;
         self.accounts
             .app
@@ -4593,10 +4749,31 @@ impl MarmotAppRuntime {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_nip65_relays_with_indexers(
+            account_ref,
+            relays,
+            bootstrap_relays,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn set_account_nip65_relays_with_indexers(
+        &self,
+        account_ref: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts
             .app
-            .set_account_nip65_relays(&account.label, relays, bootstrap_relays)
+            .set_account_nip65_relays_with_indexers(
+                &account.label,
+                relays,
+                bootstrap_relays,
+                indexer_relays,
+            )
             .await
     }
 
@@ -4606,10 +4783,31 @@ impl MarmotAppRuntime {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_inbox_relays_with_indexers(
+            account_ref,
+            relays,
+            bootstrap_relays,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn set_account_inbox_relays_with_indexers(
+        &self,
+        account_ref: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts
             .app
-            .set_account_inbox_relays(&account.label, relays, bootstrap_relays)
+            .set_account_inbox_relays_with_indexers(
+                &account.label,
+                relays,
+                bootstrap_relays,
+                indexer_relays,
+            )
             .await
     }
 
@@ -4669,6 +4867,22 @@ impl MarmotAppRuntime {
         self.accounts
             .app
             .message_edit_history(&account.label, group, target, before, limit)
+    }
+
+    /// One page of each voter's effective selection for one visible poll; see
+    /// `SqliteAccountStorage::poll_votes` for the tally, block and cursor rules.
+    pub fn poll_votes(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        poll_event_id: &str,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<crate::PollVotePage, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .poll_votes(&account.label, group_id_hex, poll_event_id, after, limit)
     }
 
     pub fn timeline_message(
@@ -5641,6 +5855,9 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        for task in self.accounts.app.abort_all_public_indexer_copies() {
+            let _ = task.await;
+        }
         self.shared.stop_relay_telemetry_exporter();
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::DirectorySync)
@@ -5748,6 +5965,7 @@ impl MarmotAppRuntime {
 
     async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
         self.shared.lifecycle().begin_shutdown();
+        let indexer_copies = self.accounts.app.abort_all_public_indexer_copies();
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::StorageClose)
             .await;
@@ -5762,6 +5980,9 @@ impl MarmotAppRuntime {
             crate::ProductUnit::Attempt,
         );
         let close_result = blocking_app_task(move || app.close_storage()).await;
+        for task in indexer_copies {
+            let _ = task.await;
+        }
         if let Some(observation) = close_observation {
             observation.finish(if close_result.is_ok() {
                 "success"
@@ -6158,6 +6379,12 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
+        for task in self
+            .app
+            .abort_public_indexer_copies_for_account(&account.account_id_hex)
+        {
+            let _ = task.await;
+        }
         let audit_export = self.app.audit_export_lifecycle.clone();
         let account_id = account.account_id_hex.clone();
         let _audit_export_mutation =
@@ -6183,6 +6410,12 @@ impl AccountManager {
             self.app
                 .remove_account_key_package_artifacts(&account.label)?;
             self.app.account_home().remove_account(&account.label)?;
+            for task in self
+                .app
+                .abort_public_indexer_copies_for_account(&account.account_id_hex)
+            {
+                let _ = task.await;
+            }
             self.clear_startup_retry(&account.account_id_hex);
             // The account no longer exists on this device, so the host callback
             // handle it registered must not outlive it. This runs only after
@@ -6589,6 +6822,7 @@ impl AccountManager {
                     }
                     let account_id = account.account_id_hex.clone();
                     let (ready_tx, ready_rx) = oneshot::channel();
+                    let startup_progress = AccountStartupProgress::default();
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
                     let handle = spawn_app_runtime_account_worker(
@@ -6604,6 +6838,7 @@ impl AccountManager {
                         command_tx.clone(),
                         command_rx,
                         ready_tx,
+                        startup_progress.clone(),
                         shutdown_rx,
                     );
                     workers.insert(
@@ -6616,18 +6851,23 @@ impl AccountManager {
                             shutdown: shutdown_tx,
                         },
                     );
-                    ready_receivers.push((account_id, Instant::now(), ready_rx));
+                    ready_receivers.push((account_id, Instant::now(), ready_rx, startup_progress));
                 }
             }
             let mut ready_waits = FuturesUnordered::new();
-            for (account_id, account_started_at, ready) in ready_receivers {
+            for (account_id, account_started_at, ready, startup_progress) in ready_receivers {
                 ready_waits.push(async move {
                     let ready_result = timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await;
-                    (account_id, account_started_at.elapsed(), ready_result)
+                    (
+                        account_id,
+                        account_started_at.elapsed(),
+                        ready_result,
+                        startup_progress,
+                    )
                 });
             }
             let mut failed_account_ids = Vec::new();
-            while let Some((account_id, account_open_elapsed, ready_result)) =
+            while let Some((account_id, account_open_elapsed, ready_result, startup_progress)) =
                 ready_waits.next().await
             {
                 let (mut outcome, mut classification) = match ready_result {
@@ -6649,15 +6889,32 @@ impl AccountManager {
                             SyncErrorClass::TransportClosed,
                         )),
                     ),
-                    Err(_) => (
-                        Err(AppError::BlockingTask(
-                            "account worker startup timed out".into(),
-                        )),
-                        Some(SyncFailureClassification::new(
-                            SyncFailureStage::AccountWorker,
-                            SyncErrorClass::Timeout,
-                        )),
-                    ),
+                    Err(_) => {
+                        // Name the pre-ready step the worker is blocked in
+                        // (mdk#1911); the stage is the only context exported.
+                        let stage = startup_progress.stage();
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "reconcile",
+                            stage = stage.as_str(),
+                            "account worker startup timed out"
+                        );
+                        self.shared.app_performance_telemetry().record_runtime(
+                            stage.timeout_operation(),
+                            account_open_elapsed,
+                            TelemetryOutcome::Timeout,
+                        );
+                        (
+                            Err(AppError::BlockingTask(format!(
+                                "account worker startup timed out at {}",
+                                stage.as_str()
+                            ))),
+                            Some(SyncFailureClassification::new(
+                                SyncFailureStage::AccountWorker,
+                                SyncErrorClass::Timeout,
+                            )),
+                        )
+                    }
                 };
                 if outcome.is_ok() {
                     let mut workers = self.workers.lock().await;
@@ -7334,7 +7591,6 @@ impl AccountManager {
         self.app
             .account_home()
             .complete_account_setup(&account.label)?;
-
         Ok(AccountSetupResult {
             account,
             relay_lists,
@@ -7647,7 +7903,8 @@ impl AccountManager {
         let bootstrap = AccountRelayListBootstrap::new(
             request.default_relays.clone(),
             request.bootstrap_relays.clone(),
-        );
+        )
+        .with_indexer_relays(request.discovery_relays.clone());
         // Validate before advancing the durable publication phase. The
         // publisher validates again at its own action boundary because it is
         // also called directly outside this setup orchestrator.
@@ -7677,6 +7934,27 @@ impl AccountManager {
                 profile = cached;
             }
             if status.complete {
+                // A prior attempt may have failed after confirming bootstrap
+                // but before scheduling its best-effort indexer copy.
+                match self
+                    .app
+                    .prepare_generated_account_indexer_copy(
+                        &account.label,
+                        &status,
+                        &profile,
+                        &request.discovery_relays,
+                    )
+                    .await
+                {
+                    Ok(Some(copy)) => self.app.spawn_public_indexer_copy(copy),
+                    Ok(None) => {}
+                    Err(err) => tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "setup_generated_account_bootstrap",
+                        error_kind = err.privacy_safe_kind(),
+                        "could not prepare resumed public indexer copy"
+                    ),
+                }
                 return Ok((status, Some(profile)));
             }
             // The durable publication phase is authoritative, but the local
@@ -7729,6 +8007,11 @@ impl AccountManager {
             }
         };
         self.mark_bootstrap_publication_confirmed(&account.label)?;
+        // The copy must be scheduled before any later KeyPackage or reconcile
+        // failure can drop it. Indexer publication itself stays off this path.
+        if let Some(copy) = publication.indexer_copy {
+            self.app.spawn_public_indexer_copy(copy);
+        }
         Ok((publication.status, Some(profile)))
     }
 
@@ -8185,6 +8468,9 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        for task in self.app.abort_all_public_indexer_copies() {
+            let _ = task.await;
+        }
         self.onboarding_updates
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -8321,8 +8607,8 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
     }
 }
 
-/// Public indexer relays used to resolve a pre-existing identity's outbox
-/// metadata during setup.
+/// Public indexer relays used to resolve existing identities and spread newly
+/// generated accounts' public relay lists and profile metadata.
 ///
 /// A brand-new external-signer account (or an imported nsec) keeps its NIP-65
 /// relay list (kind:10002) and profile (kind:0) on public indexers, not on the
@@ -8330,8 +8616,7 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
 /// app's relays therefore finds nothing and the display name never resolves —
 /// the exact bug the external-signer work exists to fix. These indexers give
 /// the directory preflight a discovery set distinct from the operational
-/// messaging relays. They are used only to read the outbox list and profile,
-/// they are never adopted as the account's messaging relays.
+/// messaging relays. They are never adopted as the account's messaging relays.
 pub(crate) const VERTEX_DIRECTORY_RELAY: &str = "wss://relay.vertexlab.io";
 
 const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[

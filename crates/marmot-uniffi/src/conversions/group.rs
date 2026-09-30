@@ -18,6 +18,13 @@ use super::common::SelfMembershipFfi;
 use super::media::EncryptedMediaVersionFfi;
 use crate::errors::MarmotKitError;
 
+/// Opaque application-owned state. Empty data is present state.
+#[derive(Clone, uniffi::Record)]
+pub struct GroupAppComponentFfi {
+    pub component_id: u16,
+    pub data: Vec<u8>,
+}
+
 /// Canonical create result carrying the exact durable chat-list projection.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct CreatedGroupFfi {
@@ -853,6 +860,13 @@ pub struct GroupRecoveryStatusFfi {
     /// Exhausted recovery attempts requiring a new user-initiated invitation.
     pub failed_reinvites: u32,
     pub rejoin_invitations: Vec<GroupRejoinInvitationFfi>,
+    /// Automatic recovery parked on this group's own history: show "history
+    /// may be incomplete". Account-wide occurrences are only in `history_notices`.
+    #[uniffi(default = false)]
+    pub history_may_be_incomplete: bool,
+    /// Ids of those occurrences, oldest first, for `dismiss_history_notice`.
+    #[uniffi(default = [])]
+    pub history_notice_ids: Vec<String>,
 }
 
 impl From<marmot_app::GroupRecoveryStatus> for GroupRecoveryStatusFfi {
@@ -872,6 +886,8 @@ impl From<marmot_app::GroupRecoveryStatus> for GroupRecoveryStatusFfi {
                     local_state_token: offer.local_state_token,
                 })
                 .collect(),
+            history_may_be_incomplete: value.history_may_be_incomplete,
+            history_notice_ids: value.history_notice_ids,
         }
     }
 }

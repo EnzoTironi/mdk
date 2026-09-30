@@ -25,12 +25,14 @@ App runtime bridge for the first real Marmot app surfaces.
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent
   send commands, and the lifecycle helpers and encrypted-media helpers they share), `sync.rs` (transport sync: `sync`,
   `next_event`, `sync_sdk_relay`, `ingest_delivery`, `sync_runtime_groups`, the relay-echo/transport-cursor helpers, and
-  the cursor unit tests; `sync/full_history_tests.rs` covers explicit repair continuation), `projection.rs`
+  the cursor unit tests; `sync/full_history_tests.rs` covers explicit repair), `projection.rs`
   (timeline/group projection accessors, the `*_for_group` component reads, the
   kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
   transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
   and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
-  per-group outcome orchestration, and classifier tests), and `audit.rs` (audit-context construction, the local/observed
+  per-group outcome orchestration, and classifier tests), `history_notices.rs` ("history may be incomplete"
+  notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
+  in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
   are widened to `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
   Steady-state sync passes must not rescan full retained state (no full `MlsGroup::load` sweeps, no full
@@ -69,6 +71,17 @@ App runtime bridge for the first real Marmot app surfaces.
   preparation, receipt/peel, app join/checkpoint, and bounded stored-group snapshots through the installed recorder;
   tests retain an in-memory probe for focused product-boundary assertions. Do not infer ACKs, recipient joins, or
   durable writes from another boundary. See `tests/audit-v5-welcome-probe.md` for historical subset measurements.
+- Keep the v5-only recovery-owner and transport-cursor audit rows in `src/client/audit_recovery.rs`
+  (`recovery_need_changed`, `recovery_attempt_started`, `recovery_attempt_finished`,
+  `recovery_obligation_reassessed`, `transport_cursor_advanced`). Record at owner seams only: loss import through
+  `synchronize_recovery_loss` (never call the storage import directly from client code), the shared execution
+  bracket (`begin_recovery_execution` / `finish_recovery_execution`, which the comparison job uses), settlement after
+  the checkpoint commits, the notice publication seam and dismissal, and cursor commits after their save succeeds.
+  Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
+  placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
+  relay plane's lag-lost EOSE repair only queues a bounded `EoseRepairReport`; the worker's
+  `publish_history_notice_changes` seam records it as `subscription_eose_repaired`. Scenario tests live in
+  `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
@@ -152,18 +165,71 @@ App runtime bridge for the first real Marmot app surfaces.
 - Incoming welcomes may auto-join MLS state, but app projections must preserve local confirmation state. Pending invites
   should stay visible until accepted, and decline should leave the group before archiving the local projection.
 - Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
-- Explicit full-history repair keeps one unfloored relay activation and its endpoint EOSE coverage across drain
-  quanta; a quantum yield is not completion or a new subscription. Keep cancellation/deadline checks cooperative
-  around completed ingest/checkpoint work, and preserve generation-checked overflow marker clearing. The account
-  worker can serve committed snapshot reads while repair waits; mutations retain FIFO order. Client continuation
-  tests live in `src/client/sync/full_history_tests.rs`; worker cancellation/read-order tests stay in
-  `src/runtime/account_worker.rs`. See the README for the automatic-recovery and send-fairness limits.
+- Every recovery cause and caller runs the one comparison job in `src/client/sync/comparison_job.rs`; there is
+  no inline executor. Runtime catch-ups (`SyncMode::Drain`) only drain the live queue and never run a job, so
+  they cross a worker-owned job (mdk#2110); `sync()` drains, then runs one job in place; nothing
+  re-subscribes to recover history, and only startup, a frozen wake or an unactivated client installs live
+  subscriptions. Explicit full-history repair runs the job in place: one comparison pass over every route of its
+  grant inside the repair budget. It never reports complete: history below the retained window is unsearched
+  (`BelowRetentionWindow` when the window certified), so never certify explicit history from a window; that
+  result closes the request (`close_explicit_history_request`, revision-checked) instead of leaving debt that parks
+  into a notice; an explicit scope whose window certified reports `RecoveryPassProgress::WindowCertified`, never
+  `Quiet`, and the checkpoint that finds every scope certified closes the request from any pass,
+  while `CoverageUnproven`, `Cancelled` and `Deadline` keep it open. Keep
+  the budget split: the network pass ends at `FullHistoryRepairControl::network_deadline` and returns its finished
+  routes for admission; only cancellation aborts the request at the poll; `stopped` ends admission at a turn
+  boundary, keeping the admitted prefix; and
+  preserve generation-checked overflow marker clearing. The account worker can serve committed snapshot reads
+  while repair waits; mutations retain FIFO order, and repair waits while a worker-owned job
+  is in flight. Client continuation tests live in `src/client/sync/full_history_tests.rs`; worker
+  cancellation/read-order tests stay in `src/runtime/account_worker.rs`. See the README for the
+  automatic-recovery and send-fairness limits.
+- A dismissed "history may be incomplete" notice is the one user-authorized ending for parked recovery debt
+  besides qualified completion. Record it only through `retire_parked_recovery_obligation` (its own outcome,
+  never coverage) and release the delivery-loss fence through `release_retired_delivery_loss`, which keeps the
+  fence while any loss obligation is pending, clears the plane only against the exact observed generation, and
+  never counts a recovery success. Notice ids are opaque and must not be logged.
+- Keep an account's delivery route open when its relay notification consumer lags: charge the lag as notification
+  loss with the REQ floor its SDK context reported at the lag, and enqueue the generation's control record. Only an
+  unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
+  notification loss before waiting for its control record.
+- A lag may also lose end-of-stored-events. Never mark EOSE complete at a lag: live cursor promotion
+  would advance the cursor while a relay was still sending history. The lag schedules the adapter's `reissue_subscriptions_awaiting_eose` for its
+  receiver's scope, marked at the lag, to run once the receiver has gone `NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`
+  without another lag. A later lag postpones it. Re-issuing earlier restarts replays still arriving. A repair that
+  leaves relays unrepaired (`EoseReissueSummary::failed_relays`) schedules itself again the same way, for the same lag
+  mark.
+- Move `checkpointed_transport_timestamp` only through `AppClient::seal_transport_cursor`, never straight to
+  `state.last_transport_timestamp`. The seal runs under the lock the router places each delivery under, so it is the
+  commit's one decision point: it returns nothing while loss or a spill hand-off is pending, caps the commit at the
+  lowest delivery a restart still fetches that is queued or taken and not yet released, and raises the restart floor
+  before the save, so the router spills a delivery that arrives during the save and falls below it; before the
+  account's first settled floor that is every older delivery. A live ingest promotes with its own save only after every
+  account subscription reported EOSE and once the account has a settled floor, and leaves the floor raised. A drain
+  checkpoint, settled loss or retired notice confirms what its seal reached with `settle_transport_cursor` once its save
+  succeeds, which ends the spilling. Every failed save undoes its seal with `abandon_transport_cursor`. Keep every
+  condition cursor safety relies on inside the seal: anything read before an `.await` or a save is stale by the time
+  that save commits. See `docs/marmot-architecture/further-context/account-recovery.md` section 6.
+- Every path that takes a delivery from the account queue calls `release_account_delivery` once its ingest returns
+  `Ok`, or when it skips the delivery as already held, and before the save that follows. Never release on an ingest
+  error: the key must keep capping the checkpoint that failure runs, because newest-first replay has usually remembered
+  a newer cursor. A new consumer of the queue that forgets to release holds the cursor back until the queue generation
+  ends; one that releases early lets a failed ingest's checkpoint pass the delivery.
 - Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; relay filtering may affect
   connections, but must not rewrite signed routing state. Relay endpoints pass through the `RelaySafetyPolicy`
   host-safety chokepoint (`src/relay_plane/safety.rs`), and agent-stream broker candidates through
   `src/runtime/agent_stream_watch.rs`, before any connect; both follow the one dial discipline in
   `docs/marmot-architecture/overview/dial-safety.md` (validate + pin, trust from config, loopback only under an explicit
   dev flag). Do not add an outbound relay/broker path that bypasses them.
+- Floor every history REQ at an anchor, less `HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE` (`history_floor`, ledger A14): the
+  post-join maintenance REQ at the Welcome that installed the copy (`Group::local_copy_welcome_created_at`, never the
+  local join time, which an offline member reaches long after the Welcome), and a retained route at the moment
+  `refresh_from_group` saw it replaced (`AppPriorNostrRoute::replaced_at`). A retained route stored before switch times
+  were kept is stamped by the first `load_state` that finds it, and the stamp is persisted at once
+  (`stamp_unrecorded_prior_route_switches`) so later launches never move its floor forward. Keep each group's current
+  route first in the routing table (`replace_group_routes` preserves the caller's order; a new lead is a change): the
+  adapter reads the lead as the route that resumes from the cursor. A locally deleted group lists its current route
+  first too, never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker
   cleanup a bounded budget. The terminal operation must outlive cancellation of its caller. `shutdown` alone does not

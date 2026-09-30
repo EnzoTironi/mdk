@@ -148,6 +148,9 @@ mod query_work_tests;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
+#[cfg(test)]
+#[path = "migrations/upgrade_v0_10_4_tests.rs"]
+mod upgrade_v0_10_4_tests;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -196,6 +199,10 @@ mod migration_0094_qualified_stall_observations;
 mod migration_0095_recovery_comparison;
 #[path = "migrations/0096_account_delivery_spill.rs"]
 mod migration_0096_account_delivery_spill;
+#[path = "migrations/0097_loss_created_at_bound.rs"]
+mod migration_0097_loss_created_at_bound;
+#[path = "migrations/0098_recovery_history_notices.rs"]
+mod migration_0098_recovery_history_notices;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -691,6 +698,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 96,
         name: "0096_account_delivery_spill",
         apply: migration_0096_account_delivery_spill::apply,
+    },
+    Migration {
+        version: 97,
+        name: "0097_loss_created_at_bound",
+        apply: migration_0097_loss_created_at_bound::apply,
+    },
+    Migration {
+        version: 98,
+        name: "0098_recovery_history_notices",
+        apply: migration_0098_recovery_history_notices::apply,
     },
 ];
 
@@ -1238,6 +1255,20 @@ mod tests {
                     row.extend([Null, Integer(0), Integer(0), Null]);
                 }
             }
+            if *table == "account_delivery_loss_evidence" {
+                // Older loss has no known created_at, so it bounds no goal,
+                // and none of it was retired.
+                for row in &mut upgraded {
+                    use rusqlite::types::Value::{Integer, Null};
+                    row.extend([Integer(2), Null, Null]);
+                }
+            }
+            if *table == "account_recovery_obligations" {
+                // No existing row has a known parking time or a dismissal.
+                for row in &mut upgraded {
+                    row.extend([rusqlite::types::Value::Null, rusqlite::types::Value::Null]);
+                }
+            }
             assert_eq!(
                 &recovery_completion_rows(&conn, table),
                 &upgraded,
@@ -1257,8 +1288,15 @@ mod tests {
         );
         assert!(conn.execute("INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms) VALUES ('explicit:second',3,1001,1001)",[]).is_err());
         assert_eq!(
-            &recovery_completion_rows(&conn, "account_recovery_obligations"),
-            &before[0]
+            recovery_completion_rows(&conn, "account_recovery_obligations"),
+            before[0]
+                .iter()
+                .cloned()
+                .map(|mut row| {
+                    row.extend([Null, Null]);
+                    row
+                })
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1457,6 +1495,91 @@ mod tests {
             )
             .unwrap(),
             42
+        );
+    }
+
+    #[test]
+    fn history_notice_migration_preserves_parked_debt_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history-notices.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..97]).unwrap();
+        // A parked queue loss and a pending epoch gap written by 0097.
+        conn.execute_batch(
+            "INSERT INTO account_state(label,updated_at) VALUES ('alice',100);
+            INSERT INTO cgka_groups(id,epoch,record) VALUES (x'aa',7,x'00');
+            INSERT INTO account_recovery_obligations
+                (demand_key,cause,account_label,marker_token,pending_since,dropped_count,
+                 created_at_ms,updated_at_ms,eligibility)
+                VALUES ('overflow:alice',0,'alice',42,124,9,124000,124000,4);
+            INSERT INTO account_recovery_obligations
+                (demand_key,cause,group_id,stalled_epoch,created_at_ms,updated_at_ms)
+                VALUES ('epoch:aa',1,x'aa',7,125000,125000);
+            INSERT INTO account_delivery_loss_evidence
+                (account_label,cause,marker_token,pending_since,dropped_count,imported_count,
+                 bound_state,bound_seconds)
+                VALUES ('alice',0,42,124,9,9,1,120);",
+        )
+        .unwrap();
+        let before = [
+            recovery_completion_rows(&conn, "account_recovery_obligations"),
+            recovery_completion_rows(&conn, "account_delivery_loss_evidence"),
+        ];
+        run_all(&mut conn).unwrap();
+        for (table, expected) in [
+            "account_recovery_obligations",
+            "account_delivery_loss_evidence",
+        ]
+        .iter()
+        .zip(before)
+        {
+            // Existing rows gain an unknown parking time, no dismissal and no
+            // retirement.
+            let added = if *table == "account_recovery_obligations" {
+                2
+            } else {
+                1
+            };
+            let upgraded: Vec<_> = expected
+                .into_iter()
+                .map(|mut row| {
+                    row.extend(std::iter::repeat_n(rusqlite::types::Value::Null, added));
+                    row
+                })
+                .collect();
+            assert_eq!(recovery_completion_rows(&conn, table), upgraded, "{table}");
+        }
+        assert!(
+            conn.execute(
+                "UPDATE account_delivery_loss_evidence SET retired_count=10",
+                []
+            )
+            .is_err(),
+            "a retirement watermark cannot exceed the imported count"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE account_recovery_obligations SET parked_at_ms=-1",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            run(&mut conn, &MIGRATIONS[..97]).is_err(),
+            "old binary must refuse the new schema"
+        );
+        drop(conn);
+        let mut conn = keyed_connection(&path);
+        assert_eq!(run_with_summary(&mut conn, MIGRATIONS).unwrap(), 0);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM account_recovery_obligations
+                 WHERE state=0 AND eligibility=4 AND parked_at_ms IS NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
         );
     }
 

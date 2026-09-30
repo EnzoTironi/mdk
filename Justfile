@@ -67,6 +67,12 @@ test-message-journeys:
 bench-startup:
     cargo test --release -p marmot-app --test startup_scaling -- --ignored --nocapture --test-threads=1
 
+# Create-DM scaling benchmark: cold-starts an account holding 300 and 1000
+# existing chats, times fresh one-peer DM creation, and prints stable
+# `MDK_BENCH ...` lines with group-create stage averages.
+bench-create-direct-message:
+    cargo test --release -p marmot-app --test create_dm_scaling -- --ignored --nocapture --test-threads=1
+
 # Founding-image critical-path benchmark (mdk#1485): reports no-image,
 # typical-image, exact byte-limit, and stalled-Blossom rows. The successful
 # rows include the prior serialized-path model and the new canonical-create
@@ -429,7 +435,7 @@ focused-convergence-regressions:
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=restarted_committer_without_source_anchor_halts_through_convergence)'
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=verified_welcome_repair_survives_the_next_convergence_drain)'
     cargo nextest run -p cgka-engine --test record_write_atomicity --locked -E 'test(=leave_persistence_failure_rolls_back_every_transactional_write)'
-    cargo nextest run -p marmot-app --lib --locked -E 'test(=tests::explicit_catch_up_gap_is_replayed_on_the_owner_tick_without_later_traffic)'
+    cargo nextest run -p marmot-app --lib --locked -E 'test(=tests::catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic)'
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork)'
 
 # Capability-level entry points used by the scheduled workflows. PR checks

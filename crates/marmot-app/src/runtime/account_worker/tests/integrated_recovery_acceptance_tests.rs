@@ -524,8 +524,8 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     );
     assert!(gate.active.load(Ordering::SeqCst) > 0);
     assert_eq!(
-        bounded_recovery::available_credits(&pool),
-        bounded_recovery::MAX_CONCURRENT_JOBS - 1,
+        recovery_credits::available_credits(&pool),
+        recovery_credits::MAX_CONCURRENT_JOBS - 1,
         "the worker task still owns its shared credit after answering status"
     );
     assert!(entered_at.elapsed() < Duration::from_secs(2));
@@ -540,8 +540,8 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
     assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
-        bounded_recovery::available_credits(&pool),
-        bounded_recovery::MAX_CONCURRENT_JOBS - 1,
+        recovery_credits::available_credits(&pool),
+        recovery_credits::MAX_CONCURRENT_JOBS - 1,
     );
     timeout(
         Duration::from_millis(300),
@@ -630,7 +630,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
                 .iter()
                 .map(|m| (m.kind, m.plaintext.clone()))
                 .collect::<Vec<_>>(),
-            bounded_recovery::available_credits(&pool),
+            recovery_credits::available_credits(&pool),
             gate.active.load(Ordering::SeqCst),
             reopened_app
                 .account_storage(&alice.label)
@@ -652,8 +652,8 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
     assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
-        bounded_recovery::available_credits(&pool),
-        bounded_recovery::MAX_CONCURRENT_JOBS - 1,
+        recovery_credits::available_credits(&pool),
+        recovery_credits::MAX_CONCURRENT_JOBS - 1,
     );
     let storage = reopened_app.account_storage(&alice.label).unwrap();
     let route_key = storage_sqlite::TransportReconciliationRoute::Group(route);
@@ -705,8 +705,8 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         .await
         .expect("startup joins after release")
         .unwrap();
-    assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 0);
-    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 0);
+    // The gap may start its own comparison straight away; the held job
+    // itself is gone.
     timeout(Duration::from_secs(45), async {
         loop {
             if reopened
@@ -730,6 +730,15 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     })
     .await
     .expect("natural worker recovery admits and decrypts genuine MLS history");
+    timeout(Duration::from_secs(20), async {
+        while activity.active_jobs.load(Ordering::SeqCst) != 0
+            || activity.active_requests.load(Ordering::SeqCst) != 0
+        {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("no comparison job outlives recovery");
     assert!(
         storage
             .retained_recovery_event(
@@ -802,7 +811,7 @@ async fn startup_comparison_waits_for_credit_before_reserving_retry() {
     let pool = runtime
         .shared_services()
         .use_private_recovery_credit_pool_for_test();
-    let held = bounded_recovery::hold_all_credits_for_test(&pool);
+    let held = recovery_credits::hold_all_credits_for_test(&pool);
     runtime.reconcile_accounts().await.unwrap();
     let commands = runtime
         .accounts()
@@ -820,7 +829,7 @@ async fn startup_comparison_waits_for_credit_before_reserving_retry() {
     let storage = app.account_storage(&account.label).unwrap();
     assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 0);
     assert!(storage.recovery_comparison().unwrap().pending());
-    assert_eq!(bounded_recovery::available_credits(&pool), 0);
+    assert_eq!(recovery_credits::available_credits(&pool), 0);
     drop(held);
     runtime.shutdown_and_close().await.unwrap();
     relay.shutdown();
@@ -874,7 +883,7 @@ async fn startup_inline_wait_releases_unused_comparison_credit() {
         .expect("ordinary startup query entered the held relay policy");
     assert!(gate.active.load(Ordering::SeqCst) > 0);
     assert_eq!(
-        bounded_recovery::available_credits(&pool),
+        recovery_credits::available_credits(&pool),
         2,
         "inline startup returned its speculative credit before the held query finishes"
     );
@@ -908,7 +917,7 @@ async fn startup_inline_wait_releases_unused_comparison_credit() {
         .await
         .expect("inline startup completes after query release")
         .unwrap();
-    assert_eq!(bounded_recovery::available_credits(&pool), 2);
+    assert_eq!(recovery_credits::available_credits(&pool), 2);
     runtime.shutdown_and_close().await.unwrap();
     relay.shutdown();
 }
@@ -1036,8 +1045,8 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 0);
     assert_eq!(activity.active_requests.load(Ordering::SeqCst), 0);
     assert_eq!(
-        bounded_recovery::available_credits(&pool),
-        bounded_recovery::MAX_CONCURRENT_JOBS,
+        recovery_credits::available_credits(&pool),
+        recovery_credits::MAX_CONCURRENT_JOBS,
     );
     drop(runtime);
     drop(app);

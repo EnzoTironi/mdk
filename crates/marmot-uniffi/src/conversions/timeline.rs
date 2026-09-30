@@ -56,6 +56,44 @@ pub struct PollProjectionFfi {
     pub open: bool,
 }
 
+/// One voter's effective (latest valid) poll selection; the list sums to the
+/// row's `PollProjectionFfi` tally.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PollVoteFfi {
+    pub voter_account_id_hex: String,
+    pub option_ids: Vec<String>,
+    /// Authenticated time of the effective response.
+    pub voted_at: u64,
+}
+
+impl From<marmot_app::PollVote> for PollVoteFfi {
+    fn from(value: marmot_app::PollVote) -> Self {
+        Self {
+            voter_account_id_hex: value.voter,
+            option_ids: value.option_ids,
+            voted_at: value.voted_at,
+        }
+    }
+}
+
+/// One page of poll votes ordered by `(voted_at, voter_account_id_hex)`.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PollVotePageFfi {
+    pub votes: Vec<PollVoteFfi>,
+    /// More votes follow; pass the last vote's `voted_at` and
+    /// `voter_account_id_hex` as the next cursor.
+    pub has_more_after: bool,
+}
+
+impl From<marmot_app::PollVotePage> for PollVotePageFfi {
+    fn from(value: marmot_app::PollVotePage) -> Self {
+        Self {
+            votes: value.votes.into_iter().map(Into::into).collect(),
+            has_more_after: value.has_more_after,
+        }
+    }
+}
+
 impl From<marmot_app::PollProjection> for PollProjectionFfi {
     fn from(value: marmot_app::PollProjection) -> Self {
         Self {
@@ -864,6 +902,23 @@ mod tests {
         assert_eq!(poll.poll_type, PollTypeFfi::SingleChoice);
         assert_eq!(poll.local_selection, ["0"]);
         assert!(poll.open);
+    }
+
+    #[test]
+    fn poll_vote_page_ffi_names_the_voter_account() {
+        let page = PollVotePageFfi::from(marmot_app::PollVotePage {
+            votes: vec![marmot_app::PollVote {
+                voter: "bob".into(),
+                option_ids: vec!["1".into()],
+                voted_at: 160,
+            }],
+            has_more_after: true,
+        });
+        assert!(page.has_more_after);
+        let vote = &page.votes[0];
+        assert_eq!(vote.voter_account_id_hex, "bob");
+        assert_eq!(vote.option_ids, ["1"]);
+        assert_eq!(vote.voted_at, 160);
     }
 
     #[test]

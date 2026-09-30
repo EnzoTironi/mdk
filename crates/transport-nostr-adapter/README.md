@@ -27,7 +27,9 @@ adds a `nostr-sdk` backed `NostrSdkRelayClient`.
 ## Recovery maintenance sessions
 
 `install_group_maintenance_recovery_subscription` accepts the account recovery owner's durable attempt serial and
-returns an opaque wire id. A replacement session must use a fresh serial, including after cancellation or reopen.
+a history floor, and returns an opaque wire id. The app floors the session at the Welcome that installed the joined
+copy, less a clock-skew allowance, so a notification lag while it is live stays bounded; `None` requests the
+group's full history. A replacement session must use a fresh serial, including after cancellation or reopen.
 Reusing a serial joins only a live session without resetting its EOSE. After failure, cancellation or removal, the adapter
 requires a strictly greater serial for that account/group, even across account activation. Its lifetime high-water map
 retains one scalar per account/group that used this API. Remove the session with
@@ -116,10 +118,17 @@ default normalized-message ceiling; larger events remain incomplete. Full-event 
 share this rule with fetched events. The first exact-ID request may temporarily retain up to 5 MiB
 per endpoint before deduplication, and the SDK can observe one rejected boundary event beyond its
 byte limit. The largest endpoint's received count/bytes conservatively charges each network
-request. Fast endpoint failures leave that endpoint incomplete while healthy IDs continue within
-the same pass budgets; a silent endpoint can still consume most of the two-second deadline. A
-byte/item/deadline exit retains partial events but leaves comparison incomplete. These are
-returned-result and SDK-received budgets, not complete wire or memory ceilings.
+request. Each exact-ID request goes only to the endpoints whose comparison claimed that ID, and
+each endpoint's comparison has its own deadline. Fast endpoint failures leave that endpoint
+incomplete while healthy IDs continue within the same pass budgets; a silent endpoint can still
+consume most of the two-second deadline for the IDs it claimed. A byte/item/deadline exit
+retains partial events but leaves incomplete every endpoint whose claimed IDs the pass did not
+return. An endpoint that claimed nothing left behind still succeeds, and
+`NostrReconciliationSummary::failed_endpoints` names the ones that failed, so a caller can
+certify a subset of a route's relays. `incomplete_endpoints` names the failed ones that still
+answered: they finished the comparison and served their exact-ID requests, but this pass did
+not return every ID they claimed. The rest timed out, errored or truncated. These are returned-result and SDK-received budgets, not
+complete wire or memory ceilings.
 
 Replay position is advisory, separate from admitted event inventory. A cancelled fetch retains its
 pre-I/O cursor advance. A completed byte-limit rejection of an otherwise eligible network ID

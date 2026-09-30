@@ -25,7 +25,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
 | [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
-| [Durable local sends](LOCAL-SENDS.md) | 0.10.4 early acceptance and exact optimistic-bubble correlation; unreleased source adds durable edits of pending local sends. |
+| [Durable local sends](LOCAL-SENDS.md) | 0.10.4 early acceptance and exact optimistic-bubble correlation; 0.11.0 adds durable edits of pending local sends. |
 | [Polls](POLLS.md) | Encrypted NIP-88 creation, replacement votes, bounded validation and deterministic timeline results. |
 | [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership. |
 
@@ -79,8 +79,8 @@ All methods, including less common management/diagnostic operations, are listed 
 | --- | --- |
 | Accounts and onboarding | Identity creation/import, setup readiness, local sign-in/out, wipe/export and external signers. Keep local removal, leaving groups, remote publication and wiping credentials distinct; inspect returned cleanup/send outcomes. Interactive onboarding is a persisted approval workflow, not a series of unconditional setters. |
 | Directory and profiles | Canonical member-reference parsing, safe names, cached identities, profile/relay refresh and user search. Cached reads and explicit network refresh are separate. Use prepared identity references on chat screens instead of per-row lookups. |
-| Groups and administration | Creation, staged/prepared images, invitations, membership/admin changes, retention, archive/leave/disband, recovery, quarantine and maintenance. Use current capabilities; a displayed roster is not authorization. Queued operations and uncertain publication require result-aware UI. |
-| Messages, edits, reactions and polls | Send/reply/edit/custom events, reaction changes, encrypted NIP-88 polls, deletion and edit history. Render effective prepared content and viewer reaction/poll state; use raw history only when the feature needs it. |
+| Groups and administration | Creation, staged/prepared images, invitations, membership/admin changes, retention, archive/leave/disband, recovery, quarantine and maintenance. Use current capabilities; a displayed roster is not authorization. Queued operations and uncertain publication require result-aware UI. "History may be incomplete" notices report parked recovery; see [History may be incomplete notices](#history-may-be-incomplete-notices). |
+| Messages, edits, reactions and polls | Send/reply/edit/custom events, reaction changes, encrypted NIP-88 polls, deletion and edit history. Render effective prepared content and viewer reaction/poll state; use raw history only when the feature needs it. Every client must render and answer polls, because peers can send them. |
 | Moderation and blocking | Typed reports, individual dismissals, deletion-masked report targets and live block lists. Reports are not deletion evidence; the host designs moderation queue UI from the provided records. |
 | Screens, read state and drafts | Prepared bounded lists/conversations, account attention, read markers, manual unread, pins, mutes and revisioned composers. MDK owns persistent projection state; the host owns viewport/layout. |
 | Media and avatars | Sending/uploading media is separate from discovery, receiving, retained-byte access and decoding. Use original source slots and current opaque references; preserve rejected attachment positions. |
@@ -150,8 +150,8 @@ They use the runtime registry's `app_runtime_host_*` OTLP series with the same
 started/completed counters, five outcomes, histogram and live gauges. Hosts report
 the actual outcome; merely leaving a scope does not establish success. These
 completed-duration reports have no live observation, so their live gauges are zero.
-Record only stages your client can observe. Nested stages overlap and must not be
-summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
+Hosts should record every stage they can observe, and only those. Nested stages overlap and
+must not be summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
 [metric catalog](../../docs/marmot-architecture/telemetry.md#registered-host-stage-metrics).
 Regenerate Swift/Kotlin bindings with the matching library to adopt the new enum
 cases; the snapshot record fields and constructors are unchanged.
@@ -287,6 +287,17 @@ requires no client-owned reaction map.
 
 ## Identity references and profile pseudonyms
 
+New generated identities publish kind `10002`, kind `10050`, and kind `0` to
+their account relays and send separate best-effort copies to the built-in public
+directory indexers. Later relay-list and profile edits through MarmotKit do the
+same. The indexers are never inserted into the advertised relay lists or used
+for KeyPackages, contact lists, or messaging. Acknowledgement from an account
+relay establishes setup success; indexer copies are scheduled after bootstrap
+confirmation, before initial KeyPackage publication, and an outage is reported
+only as an aggregate warning. Shutdown or account removal cancels pending copies.
+Existing identities are not automatically republished by this change and need a
+client-initiated backfill of their current lists and profile.
+
 `accountIdHex` / `normalizeMemberRef` now accept `nprofile` and
 `nostr:nprofile` mentions and QR scans in addition to hex, `npub`,
 `nostr:npub`, and `marmot://profile/` links. Relay hints inside an
@@ -354,13 +365,16 @@ object, subscription objects, records, enums, and error variants.
 
 ## Audit v5 recording and delivery
 
-`AuditLogSettingsFfi.enabled` remains the recording opt-in. New account sessions and the live
-runtime switch write `marmot-forensics-audit/v5` to `audit-<engine_id>-v5.jsonl`; existing v4 files
-remain on disk. To deliver v5, supply a dedicated OTLP `/v1/logs` destination and bearer token
-with `set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi)`. The configuration is held in memory and
-the returned record omits the token. Set `enabled: false` to remove delivery configuration.
+v5 replaces v4 as the audit format. `AuditLogSettingsFfi.enabled` remains the recording opt-in.
+New account sessions and the live runtime switch write only `marmot-forensics-audit/v5` to
+`audit-<engine_id>-v5.jsonl`; no new v4 files are written, and existing v4 files remain on disk.
+Hosts that record audit logs must configure v5 delivery, or new evidence never leaves the
+device. Deploy a receiver that accepts every v5 event kind first. To deliver v5, supply a dedicated OTLP `/v1/logs` destination and bearer token
+with `set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi)`. The configuration is held in memory, so
+apply it on every launch; the returned record omits the token. Set `enabled: false` to remove delivery configuration.
 An exact loopback endpoint requires `allow_loopback_dev: true`; public endpoints require HTTPS.
-The host then calls `post_audit_log_tracker_update_v5()` for an immediate pass; the existing
+The host then calls `post_audit_log_tracker_update_v5()`, in place of
+`post_audit_log_tracker_update()`, for an immediate pass; the existing
 audit tracker also uses this configuration on its activity triggers with the usual batching,
 retry, and shutdown behavior. The v5 result reports accepted batches, pending accounts, blocked
 accounts, and idle accounts separately from legacy v4 uploads. No host should infer receiver
@@ -369,7 +383,9 @@ v5 records.
 
 ## Legacy audit v4 upload
 
-Audit uploads now accept only `marmot-forensics-audit/v4`; old local files are never migrated or sent.
+The v4 whole-file route only drains v4 files written before 0.11.0; keep its configuration until
+they are gone, and do not build new v4 infrastructure. Whole-file uploads accept only
+`marmot-forensics-audit/v4`; older local files are never migrated or sent.
 App construction automatically removes recognized v1-v3 forensic files and rotated segments after acquiring the
 root lease, including files in failed account-wipe remnants, even with recording disabled. V4 files and the separate
 key-reveal log are preserved; failures are nonfatal and retried on the next open. No additional Swift/Kotlin cleanup
@@ -380,7 +396,7 @@ The versioned config type changes the setter ABI checksum so old generated bindi
 reinterpret a device label as a hardware model.
 Populate this field from system model information (e.g. `iPhone17,3` or `Pixel 9a`), never from a device name,
 hostname or serial number. Omit it if unavailable. Platform and app version are unchanged.
-Deploy a v4-compatible Goggles endpoint before expecting successful uploads from these bindings.
+Uploads of leftover v4 files still need a v4-compatible Goggles endpoint; new evidence goes to v5.
 Native metadata lift/lower checks: `./crates/marmot-uniffi/audit-v4-smoke.sh swift` and
 `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars> ./crates/marmot-uniffi/audit-v4-smoke.sh kotlin`.
 These regenerate host bindings and execute DTO round trips; platform package builds remain separate.
@@ -873,6 +889,38 @@ Pages are capped at 100 and cursors are exclusive. C callers deep-free returned
 pages with `marmot_content_report_page_free` or `marmot_report_dismissal_page_free`.
 `reported_message` uses the ordinary timeline record and its free function.
 Use existing projection subscriptions to refresh client review views.
+
+## History may be incomplete notices
+
+Automatic recovery stops retrying an obligation after a fixed budget of attempts that
+recover and certify nothing. Each such parked occurrence is a notice the user should see
+as "history may be incomplete":
+
+- `history_notices(account_ref)` returns `HistoryNoticeFfi` records, oldest first: an
+  opaque `notice_id`, a `HistoryNoticeCauseFfi` for the host's wording, `group_id_hex`
+  for a group-scoped occurrence (an epoch gap) or `None` when the account as a whole is
+  affected (delivery or notification loss, incremental or explicit history), and an
+  optional `parked_at_ms`. It reads local durable state and never touches the network.
+- `group_recovery_status` sets `history_may_be_incomplete` and lists the group's own
+  `history_notice_ids`. Show a banner in that conversation; account-wide notices belong
+  in an account-level surface instead.
+- `MarmotEventFfi::HistoryNoticesChanged` fires when a notice appears (recovery parked),
+  disappears (new evidence re-armed recovery, or it was dismissed), or is replaced. Re-read
+  the list; a group whose own notices changed also receives `GroupStateUpdated`.
+- `dismiss_history_notice(account_ref, notice_id)` records the user's decision durably,
+  as its own outcome and never as recovered history. It returns `false` for a stale id;
+  re-read and show the current notices. After a delivery-loss dismissal the transport
+  cursor can advance again once no loss recovery remains pending.
+
+Do not dismiss on the user's behalf, and do not persist `notice_id` as a group or
+account identity: it changes whenever recovery re-arms. A dismissed occurrence never
+comes back, but genuinely new evidence can raise a new notice: new loss, a higher missing
+epoch, a later startup's incremental comparison, or a new explicit repair. Explicit
+full-history repair remains available and can still complete parked history that its
+comparison of the retained window certifies. Notices carry no relay, message or key identities; keep them out of
+analytics. C callers use `marmot_history_notices` (free with
+`marmot_history_notice_list_free`), `marmot_dismiss_history_notice` and the
+`MARMOT_EVENT_HISTORY_NOTICES_CHANGED` event tag.
 
 ## Durable avatar access
 

@@ -2,11 +2,14 @@
 //!
 //! The shared router must never wait on one account's slow consumer. When an
 //! account queue is full, the router hands the delivery to that account's
-//! spill instead of dropping it. One writer task per account stores hand-offs
-//! in the account database; the account worker later admits spilled rows
-//! through its ordinary ingest path. A delivery is lost, and becomes a
-//! queue-loss generation, only when the hand-off or the durable spill is full,
-//! or the store keeps failing.
+//! spill instead of dropping it. It does the same with a delivery a restart
+//! would no longer fetch only because a transport-cursor checkpoint was saving
+//! when it arrived, or a live ingest promoted the cursor past it, which the
+//! in-memory queue must never hold. One writer task per account stores
+//! hand-offs in the account database; the account worker later admits
+//! spilled rows through its ordinary ingest path. A delivery is lost, and
+//! becomes a queue-loss generation, only when the hand-off or the durable
+//! spill is full, or the store keeps failing.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
@@ -88,10 +91,10 @@ impl AccountDeliverySpill {
         })
     }
 
-    /// Accept a delivery the full queue cannot take, without blocking the
-    /// router. Returns false when the hand-off itself is full. Until the
-    /// writer settles it, an accepted delivery fences the account's transport
-    /// cursor.
+    /// Accept a delivery the router placed in the spill, without blocking
+    /// it. Returns false when the hand-off itself is full. The placement
+    /// already counted the delivery in the account's transport-cursor fence,
+    /// and the writer releases that count when it settles the delivery.
     pub(super) fn offer(self: &Arc<Self>, delivery: TransportDelivery) -> bool {
         let size = retained_size(&delivery);
         let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
@@ -100,7 +103,6 @@ impl AccountDeliverySpill {
         {
             return false;
         }
-        self.overflow.begin_spill();
         handoff.bytes += size;
         handoff.items.push_back(delivery);
         if !handoff.writing {
@@ -125,13 +127,19 @@ impl AccountDeliverySpill {
                 batch
             };
             let count = batch.len() as u64;
+            let created_at: Vec<u64> = batch.iter().map(|d| d.message.timestamp.0).collect();
             let dispositions = self.store_with_retry(batch).await;
             let stored = count_of(&dispositions, DeliverySpillDisposition::Stored);
             let seen = count_of(&dispositions, DeliverySpillDisposition::AlreadySeen);
             // Record loss before releasing the spill fence, so the cursor
-            // stays fenced throughout.
-            for _ in stored + seen..count {
-                self.omit();
+            // stays fenced throughout. An empty result lost the whole batch.
+            for (index, created_at) in created_at.into_iter().enumerate() {
+                if dispositions
+                    .get(index)
+                    .is_none_or(|d| *d == DeliverySpillDisposition::Full)
+                {
+                    self.omit(Some(created_at));
+                }
             }
             self.overflow.finish_spill(count, stored, seen);
             if stored > 0 {
@@ -177,16 +185,16 @@ impl AccountDeliverySpill {
         })
     }
 
-    fn omit(&self) {
+    fn omit(&self, created_at: Option<u64>) {
         match self.current_route() {
-            Some(route) => omit_account_delivery(&route),
+            Some(route) => omit_account_delivery(&route, created_at),
             // The route was retired while this batch was in flight. The loss
             // still fences any replacement, which shares this overflow state,
             // and becomes durable through the retired route's marker. A
             // replacement that registers later is signalled when it reuses
             // the state; one that registered meanwhile is signalled here.
             None => {
-                self.overflow.record_retired_drop();
+                self.overflow.record_retired_drop(created_at);
                 if let Some(marker) = self.marker.clone() {
                     persist_retired_queue_loss(&self.overflow, marker);
                 }

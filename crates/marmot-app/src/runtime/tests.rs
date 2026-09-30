@@ -244,7 +244,7 @@ async fn cast_poll_vote_rejects_unknown_closed_and_invalid_selections_before_sen
 async fn poll_creation_uses_conversation_kind_and_existing_polls_remain_votable() {
     let root = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(root.path());
-    home.create_account("alice").unwrap();
+    let alice = home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
     let carol = home.create_account("carol").unwrap();
     let dave = home.create_account("dave").unwrap();
@@ -370,6 +370,16 @@ async fn poll_creation_uses_conversation_kind_and_existing_polls_remain_votable(
     assert_eq!(projected.participants, 1);
     assert_eq!(projected.options[0].votes, 0);
     assert_eq!(projected.options[1].votes, 1);
+    assert_eq!(
+        runtime
+            .poll_votes("alice", &hex::encode(group.as_slice()), &poll_id, None, 100)
+            .unwrap()
+            .votes
+            .into_iter()
+            .map(|vote| (vote.voter, vote.option_ids))
+            .collect::<Vec<_>>(),
+        [(alice.account_id_hex, vec!["1".to_owned()])]
+    );
 
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -2762,7 +2772,7 @@ async fn open_runtime_local_test_client(
     account_ref: &str,
 ) -> crate::AppClient {
     let shared = runtime.shared_services();
-    app.runtime_local_client(account_ref, shared.relay_plane(), shared.lifecycle())
+    app.runtime_local_client(account_ref, shared.relay_plane(), shared.lifecycle(), None)
         .await
         .expect("open local test client")
 }
@@ -2921,6 +2931,56 @@ async fn reconcile_failure_waits_for_sibling_and_preserves_its_session() {
         .await
         .expect("Bob remains ready");
     drop(alice_client);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_timeout_reports_the_stage_the_worker_was_blocked_in() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let (reached, proceed) = install_local_open_gate(&app, "alice");
+    let manager = runtime.accounts();
+    let reconcile = tokio::spawn(async move { manager.reconcile().await });
+    wait_for_test_signal(reached, "alice session open").await;
+
+    // Hold the open inside the session step until the ready-wait expires.
+    tokio::time::pause();
+    tokio::time::advance(APP_RUNTIME_ACCOUNT_READY_WAIT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    timeout(Duration::from_secs(5), async {
+        while runtime.app_performance_snapshot().account_open.attempts == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the expired ready-wait is recorded while the open is held");
+    proceed.send(()).expect("release alice open");
+
+    let stage = account_worker::AccountStartupStage::SessionOpen;
+    let error = reconcile
+        .await
+        .expect("reconcile task")
+        .expect_err("startup timed out");
+    assert!(
+        matches!(&error, AppError::BlockingTask(message) if message.contains(stage.as_str())),
+        "the timeout names the blocked stage: {error:?}"
+    );
+    let snapshot = runtime.app_performance_snapshot();
+    for operation in &snapshot.runtime_operations {
+        let expected = u64::from(operation.operation == stage.timeout_operation());
+        if operation.operation.as_str().starts_with("account_startup_") {
+            assert_eq!(
+                operation.timeouts,
+                expected,
+                "{} timeouts",
+                operation.operation.as_str()
+            );
+        }
+    }
     runtime.shutdown().await;
 }
 

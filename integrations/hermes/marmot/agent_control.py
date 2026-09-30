@@ -29,6 +29,7 @@ _EXPECTED_RESPONSE_TYPES = {
     "send_reaction": frozenset({"app_event_sent"}),
     "remove_reaction": frozenset({"app_event_sent"}),
     "group_info": frozenset({"group_info"}),
+    "group_profile_update": frozenset({"group_profile_updated"}),
     "diagnostic_status": frozenset({"diagnostic_status"}),
     "send_media": frozenset({"final_sent"}),
     "download_media": frozenset({"media_downloaded"}),
@@ -208,15 +209,28 @@ class MarmotAgentControlClient:
         account_id_hex: str,
         name: str,
         display_name: Optional[str] = None,
+        about: Optional[str] = None,
+        picture: Optional[str] = None,
+        nip05: Optional[str] = None,
+        lud16: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return await self.request(
-            {
-                "type": "account_publish_profile",
-                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
-                "name": str(name or ""),
-                "display_name": str(display_name) if display_name is not None else None,
-            }
-        )
+        payload: Dict[str, Any] = {
+            "type": "account_publish_profile",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "name": str(name or ""),
+            "display_name": str(display_name) if display_name is not None else None,
+        }
+        # An omitted field keeps its published value; never send an empty string
+        # in its place, which would clear it.
+        for key, value in (
+            ("about", about),
+            ("picture", picture),
+            ("nip05", nip05),
+            ("lud16", lud16),
+        ):
+            if value is not None:
+                payload[key] = str(value)
+        return await self.request(payload)
 
     async def send_final(
         self,
@@ -305,6 +319,27 @@ class MarmotAgentControlClient:
                 "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
             }
         )
+
+    async def group_profile_update(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if name is None and description is None:
+            raise ValueError("name or description required")
+        payload: Dict[str, Any] = {
+            "type": "group_profile_update",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+        }
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        return await self.request(payload)
 
     async def send_media(
         self,

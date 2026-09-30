@@ -17,7 +17,7 @@ Use the [complete C symbol reference](API-REFERENCE.md) for every function decla
 including ownership helpers, and the [shared method reference](../marmot-uniffi/API-REFERENCE.md)
 for runtime purposes and recommended alternatives to older screen paths.
 
-The [0.10.3 → 0.10.4 integration guide](../../docs/integration/0.10.4.md) explains
+The [0.10.4 → 0.11.0 integration guide](../../docs/integration/0.11.0.md) explains
 the current record, enum, error and schema changes. Every supported release has a
 companion in the [integration index](../../docs/integration/README.md).
 Read the exact version's header and docs; C record layout compatibility is not implied
@@ -32,7 +32,7 @@ acceptance), rather than relay completion. Free their results with
 `marmot_local_send_status_free`. The nullable timeline `client_token` is owned by
 its row and released by the row's existing deep-free. Rebuild against the matching
 header/library because this changes the timeline record layout.
-Unreleased source also provides `marmot_edit_local_message_with_client_token` for
+Starting with 0.11.0, `marmot_edit_local_message_with_client_token` provides
 durable revisions of pending text or replies. Each revision needs a new edit token;
 the C call returns local acceptance and uses the same status and free functions.
 
@@ -191,16 +191,19 @@ release dependencies.
 
 ## Audit v5 recording and delivery
 
-Recording remains opt-in through `MarmotAuditLogSettings`. New recordings use v5 JSONL files.
-For v5 delivery, call `marmot_set_audit_otlp_config_v5` with a dedicated OTLP `/v1/logs`
-destination and bearer token, then call `marmot_post_audit_log_tracker_update_v5` for a manual
-pass. The returned config redacts the token; free it with `marmot_audit_otlp_config_v5_free`.
+v5 replaces v4 as the audit format. Recording remains opt-in through `MarmotAuditLogSettings`,
+and new recordings write only v5 JSONL files. Hosts that record audit logs must configure v5
+delivery, or new evidence never leaves the device. Call `marmot_set_audit_otlp_config_v5` with a
+dedicated OTLP `/v1/logs` destination and bearer token on every launch, because it is held in
+memory only. Then call `marmot_post_audit_log_tracker_update_v5`, in place of the v4 tracker
+update, for a manual pass. The returned config redacts the token; free it with
+`marmot_audit_otlp_config_v5_free`.
 Free the versioned result with `marmot_audit_log_tracker_update_result_v5_free`. It reports v5
 accepted, pending, blocked, and idle counts independently of v4 whole-file uploads. The existing
 tracker activity triggers use the same in-memory v5 config with their batching and retry policy.
 Set `enabled` to false to clear the destination. Loopback requires the explicit
-`allow_loopback_dev` flag, while public destinations require HTTPS. Existing v4 files remain
-available for the legacy endpoint; v5 bytes never go there.
+`allow_loopback_dev` flag, while public destinations require HTTPS. v4 files written before
+0.11.0 remain available to drain through the legacy endpoint; v5 bytes never go there.
 
 ## Legacy audit v4 upload
 
@@ -286,6 +289,20 @@ pump: hosts drive next on their own worker and decide how to retry errors. Timeo
 Free each result with `marmot_presented_chat_list_update_free` and the handle with
 `marmot_presented_chat_list_subscription_free`. See the [shared native contract](../marmot-uniffi/README.md#selected-chat-list-presentation)
 for version ordering, localization, readiness, and account-switch behavior.
+
+## History may be incomplete notices
+
+`marmot_history_notices` blocks on the account worker, reads local durable state only, and writes an owned
+`MarmotHistoryNoticeList`; free it with `marmot_history_notice_list_free`. Each `MarmotHistoryNotice` has an
+opaque `notice_id`, a `MarmotHistoryNoticeCause`, a `group_id_hex` that is NULL for an account-wide occurrence,
+and `has_parked_at_ms`/`parked_at_ms`. `marmot_dismiss_history_notice` writes `true` when it durably retired
+that occurrence and `false` for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`. Re-read the list
+on `MARMOT_EVENT_HISTORY_NOTICES_CHANGED`; a group's own occurrences also set
+`MarmotGroupRecoveryStatus.history_may_be_incomplete` and fill its `history_notice_ids` array, released by
+`marmot_group_recovery_status_free`. The status struct gained fields and the event union gained a trailing tag,
+so rebuild consumers with the matching header and library. See the
+[shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when notices appear,
+disappear and return.
 
 ## Bounded chat screens
 

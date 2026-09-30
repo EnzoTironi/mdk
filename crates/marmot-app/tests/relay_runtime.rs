@@ -3087,6 +3087,243 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
     runtime.shutdown().await;
 }
 
+async fn wait_component_epoch(
+    runtime: &MarmotAppRuntime,
+    source: &str,
+    peer: &str,
+    group: &GroupId,
+) {
+    let epoch = runtime.group_mls_state(source, group).await.unwrap().epoch;
+    timeout(Duration::from_secs(15), async {
+        while runtime.group_mls_state(peer, group).await.unwrap().epoch < epoch {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("peer must adopt admin change");
+}
+
+async fn wait_app_component(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    expected: &[u8],
+) {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if runtime
+                .group_app_component(account, group, 0xf301)
+                .await
+                .unwrap()
+                .as_deref()
+                == Some(expected)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("component must converge");
+}
+
+#[tokio::test]
+async fn app_component_lifecycle() {
+    const COMPONENT: u16 = 0xf301;
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account
+        .account_id_hex;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account
+        .account_id_hex;
+    let carol = create_network_ready_identity(&runtime, setup)
+        .await
+        .account
+        .account_id_hex;
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(&alice, "components", std::slice::from_ref(&bob), None)
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| matches!(event,
+        MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == &bob && group_id == &group
+    )).await;
+    accept_group_invite_retrying_busy(&runtime, &bob, &group)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .group_app_component(&alice, &group, COMPONENT)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let epoch = runtime.group_mls_state(&alice, &group).await.unwrap().epoch;
+    // Protocol space: an assigned id, the draft multi-device-join id the
+    // registry already owns, and the registry's next unassigned id. All three
+    // are below the application range and none of them reaches an MLS commit.
+    for protocol_id in [0x8003, 0x800a, 0x800d] {
+        let reserved = runtime
+            .update_app_component(&alice, &group, protocol_id, vec![])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(reserved, AppError::InvalidAppComponent(_)),
+            "{protocol_id:#06x} must be refused"
+        );
+    }
+    let oversized = runtime
+        .update_app_component(
+            &alice,
+            &group,
+            COMPONENT,
+            vec![0u8; cgka_traits::app_components::APP_COMPONENT_DATA_MAX_LEN + 1],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(oversized, AppError::InvalidAppComponent(_)));
+    let forbidden = runtime
+        .update_app_component(&bob, &group, COMPONENT, vec![1, 1])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        forbidden.as_engine_error(),
+        Some(cgka_traits::EngineError::NotGroupAdmin { .. })
+    ));
+    assert_eq!(
+        runtime.group_mls_state(&alice, &group).await.unwrap().epoch,
+        epoch
+    );
+
+    runtime
+        .update_app_component(&alice, &group, COMPONENT, vec![1, 1])
+        .await
+        .unwrap();
+    wait_app_component(&runtime, &bob, &group, &[1, 1]).await;
+    // A group event lets a client invalidate its local view without chat traffic.
+    wait_for_event(&mut events, |event| matches!(event,
+        MarmotAppEvent::GroupEvent(event) if event.account_id_hex == bob && matches!(
+            &event.event, cgka_traits::engine::GroupEvent::EpochChanged { group_id, .. } if group_id == &group
+        )
+    )).await;
+
+    runtime
+        .invite_members(&alice, &group, std::slice::from_ref(&carol))
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| matches!(event,
+        MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == &carol && group_id == &group
+    )).await;
+    accept_group_invite_retrying_busy(&runtime, &carol, &group)
+        .await
+        .unwrap();
+    wait_app_component(&runtime, &carol, &group, &[1, 1]).await;
+
+    runtime.promote_admin(&alice, &group, &bob).await.unwrap();
+    wait_component_epoch(&runtime, &alice, &bob, &group).await;
+    runtime
+        .update_app_component(&bob, &group, COMPONENT, vec![1, 0])
+        .await
+        .unwrap();
+    wait_app_component(&runtime, &alice, &group, &[1, 0]).await;
+    runtime.demote_admin(&alice, &group, &bob).await.unwrap();
+    wait_component_epoch(&runtime, &alice, &bob, &group).await;
+    let forbidden = runtime
+        .update_app_component(&bob, &group, COMPONENT, vec![1, 1])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        forbidden.as_engine_error(),
+        Some(cgka_traits::EngineError::NotGroupAdmin { .. })
+    ));
+
+    runtime
+        .update_message_retention(&alice, &group, 1)
+        .await
+        .unwrap();
+    runtime
+        .send_message(&alice, &group, b"expires".to_vec())
+        .await
+        .unwrap();
+    let later = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 86_400_000;
+    // The sweep reports nothing until alice's own retention row is projected,
+    // and defers while any received row is still unread, so mark the group read
+    // and retry until it actually prunes.
+    let group_hex = hex::encode(group.as_slice());
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let newest = runtime
+                .timeline_messages_with_query(
+                    &alice,
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap()
+                .messages
+                .into_iter()
+                .max_by_key(|message| message.timeline_at);
+            if let Some(newest) = newest {
+                runtime
+                    .mark_timeline_message_read(&alice, &group_hex, &newest.message_id_hex)
+                    .unwrap();
+            }
+            let sweep = runtime
+                .sweep_expired_retention(&alice, later)
+                .await
+                .unwrap();
+            if sweep
+                .groups
+                .iter()
+                .any(|outcome| outcome.pruned_messages > 0)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("retention sweep must prune the expired message");
+    wait_app_component(&runtime, &alice, &group, &[1, 0]).await;
+    runtime
+        .update_app_component(&alice, &group, COMPONENT, vec![])
+        .await
+        .unwrap();
+    wait_app_component(&runtime, &carol, &group, &[]).await;
+
+    runtime.shutdown_and_close().await.unwrap();
+    drop(runtime);
+    drop(app);
+    let reopened = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(reopened);
+    runtime.reconcile_accounts().await.unwrap();
+    for account in [&alice, &bob, &carol] {
+        wait_app_component(&runtime, account, &group, &[]).await;
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test]
 async fn app_runtime_custom_events_roundtrip_and_filter_by_kind() {
     let dir = tempfile::tempdir().unwrap();
@@ -8044,6 +8281,93 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
 }
 
 #[tokio::test]
+async fn tagged_upload_and_text_reach_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let blossom = mock_blossom().await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..Default::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account;
+    let bob = create_network_ready_identity(&runtime, setup).await.account;
+    let a = &alice.account_id_hex;
+    let b = &bob.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(a, "tagged", std::slice::from_ref(b), None)
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == b && group_id == &group)).await;
+    accept_group_invite_retrying_busy(&runtime, b, &group)
+        .await
+        .unwrap();
+    let reply = runtime
+        .send_message(a, &group, b"reply target".to_vec())
+        .await
+        .unwrap();
+    let plaintext = b"tagged payload".to_vec();
+    let tags = vec![
+        vec!["effect".into(), "party".into()],
+        vec!["e".into(), reply.message_ids[0].clone()],
+        vec!["q".into(), reply.message_ids[0].clone()],
+    ];
+    let upload = runtime
+        .upload_media(
+            a,
+            &group,
+            MediaUploadRequest {
+                message_tags: tags.clone(),
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "sticker.png".into(),
+                    media_type: "image/png".into(),
+                    plaintext: plaintext.clone(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: true,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let id = &upload.sent.as_ref().unwrap().message_ids[0];
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == b && &m.message.message_id_hex == id)).await;
+    let received = app
+        .message_by_id(&bob.label, &hex::encode(group.as_slice()), id)
+        .unwrap()
+        .unwrap();
+    for tag in &tags {
+        assert!(received.tags.contains(tag));
+    }
+    let downloaded = runtime
+        .download_media(b, &group, upload.attachments[0].reference.clone())
+        .await
+        .unwrap();
+    assert_eq!(downloaded.plaintext, plaintext);
+    let effects = vec![vec!["effect".into(), "party".into()]];
+    let sent = runtime
+        .send_tagged_text(a, &group, "with an effect".into(), effects.clone())
+        .await
+        .unwrap();
+    let id = &sent.message_ids[0];
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == b && &m.message.message_id_hex == id)).await;
+    let received = app
+        .message_by_id(&bob.label, &hex::encode(group.as_slice()), id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.plaintext, "with an effect");
+    assert!(received.tags.contains(&effects[0]));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -8072,6 +8396,7 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
         .upload_media(
             &group_id,
             MediaUploadRequest {
+                message_tags: Vec::new(),
                 attachments: vec![
                     MediaUploadAttachmentRequest {
                         file_name: "note.txt".to_owned(),
@@ -8198,6 +8523,7 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
         .upload_media(
             &group_id,
             MediaUploadRequest {
+                message_tags: Vec::new(),
                 attachments: vec![MediaUploadAttachmentRequest {
                     file_name: "repeat.txt".to_owned(),
                     media_type: "text/plain".to_owned(),
@@ -8225,6 +8551,7 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
         .upload_media(
             &group_id,
             MediaUploadRequest {
+                message_tags: Vec::new(),
                 attachments: vec![MediaUploadAttachmentRequest {
                     file_name: "bob.txt".to_owned(),
                     media_type: "text/plain".to_owned(),
@@ -8260,6 +8587,7 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
         .upload_media(
             &group_id,
             MediaUploadRequest {
+                message_tags: Vec::new(),
                 attachments: vec![MediaUploadAttachmentRequest {
                     file_name: "third.txt".to_owned(),
                     media_type: "text/plain".to_owned(),
@@ -8315,6 +8643,7 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
         .upload_media(
             &group_id,
             MediaUploadRequest {
+                message_tags: Vec::new(),
                 attachments: vec![MediaUploadAttachmentRequest {
                     file_name: "expired.txt".to_owned(),
                     media_type: "text/plain".to_owned(),
@@ -8379,6 +8708,7 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
         .upload_media(
             &group_id,
             MediaUploadRequest {
+                message_tags: Vec::new(),
                 attachments: vec![MediaUploadAttachmentRequest {
                     file_name: "retained.txt".to_owned(),
                     media_type: "text/plain".to_owned(),
@@ -8540,6 +8870,7 @@ async fn upload_media_errors_when_policy_has_no_blossom_endpoint() {
         .upload_media(
             &group_id,
             MediaUploadRequest {
+                message_tags: Vec::new(),
                 attachments: vec![MediaUploadAttachmentRequest {
                     file_name: "note.txt".to_owned(),
                     media_type: "text/plain".to_owned(),
@@ -9263,6 +9594,136 @@ async fn relay_list_future_skew_is_configurable_at_app_instantiation() {
         fetched.default_relays,
         vec!["wss://within-skew.example".to_owned()]
     );
+}
+
+// NIP-30: upload unsent, then name the attachment by its locator url.
+#[tokio::test]
+async fn nip30_emoji_media_and_reaction_reach_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let blossom = mock_blossom().await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..Default::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account;
+    let bob = create_network_ready_identity(&runtime, setup).await.account;
+    let a = &alice.account_id_hex;
+    let b = &bob.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(a, "emoji", std::slice::from_ref(b), None)
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == b && group_id == &group)).await;
+    accept_group_invite_retrying_busy(&runtime, b, &group)
+        .await
+        .unwrap();
+
+    let emoji_png = b"emoji payload".to_vec();
+    let upload = runtime
+        .upload_media(
+            a,
+            &group,
+            MediaUploadRequest {
+                message_tags: Vec::new(),
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "party.png".into(),
+                    media_type: "image/png".into(),
+                    plaintext: emoji_png.clone(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(upload.sent.is_none());
+    let reference = upload.attachments[0].reference.clone();
+    let url = reference.locators[0].value.clone();
+    let emoji: Vec<String> = vec!["emoji".into(), "party".into(), url.clone()];
+    let sent = runtime
+        .send_tagged_media(
+            a,
+            &group,
+            vec![reference.clone()],
+            Some("hi :party:".into()),
+            vec![emoji.clone()],
+        )
+        .await
+        .unwrap();
+    let id = &sent.message_ids[0];
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == b && &m.message.message_id_hex == id)).await;
+    let received = app
+        .message_by_id(&bob.label, &hex::encode(group.as_slice()), id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.plaintext, "hi :party:");
+    assert!(received.tags.contains(&emoji));
+    let locator = format!("locator blossom-v1 {url}");
+    assert!(
+        received
+            .tags
+            .iter()
+            .any(|tag| tag[0] == "imeta" && tag.contains(&locator))
+    );
+    let downloaded = runtime.download_media(b, &group, reference).await.unwrap();
+    assert_eq!(downloaded.plaintext, emoji_png);
+
+    // The same shape on a kind-7: the reaction carries its own imeta.
+    let reaction = runtime
+        .upload_media(
+            b,
+            &group,
+            MediaUploadRequest {
+                message_tags: Vec::new(),
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "cat.png".into(),
+                    media_type: "image/png".into(),
+                    plaintext: b"cat payload".to_vec(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let cat = reaction.attachments[0].reference.clone();
+    let cat_tag: Vec<String> = vec!["emoji".into(), "cat".into(), cat.locators[0].value.clone()];
+    let reacted = runtime
+        .react_with_media(
+            b,
+            &group,
+            id,
+            ":cat:",
+            vec![cat_tag.clone()],
+            vec![cat.clone()],
+        )
+        .await
+        .unwrap();
+    let reaction_id = &reacted.message_ids[0];
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == a && &m.message.message_id_hex == reaction_id)).await;
+    let received = app
+        .message_by_id(&alice.label, &hex::encode(group.as_slice()), reaction_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.plaintext, ":cat:");
+    assert!(received.tags.contains(&cat_tag));
+    assert!(received.tags.iter().any(|tag| tag[0] == "imeta"));
+    let downloaded = runtime.download_media(a, &group, cat).await.unwrap();
+    assert_eq!(downloaded.plaintext, b"cat payload");
+    runtime.shutdown().await;
 }
 
 #[tokio::test]

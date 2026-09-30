@@ -120,8 +120,8 @@ pub struct StoredEpochBackfillIntent {
 }
 
 /// Durable evidence that the app relay plane omitted at least one delivery
-/// from a bounded per-account queue and must complete an unfloored replay
-/// before trusting the account's transport cursor again.
+/// from a bounded per-account queue and must settle that loss through
+/// recovery before trusting the account's transport cursor again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccountDeliveryRecovery {
     pub marker_token: u64,
@@ -238,6 +238,13 @@ pub struct StoredNostrRoute {
     pub nostr_group_id_hex: String,
     pub relays: Vec<String>,
     pub last_epoch: u64,
+    /// Unix seconds when the device saw this route replaced as the group's
+    /// current route, which anchors its retained history floor. `None` on a
+    /// route still current when recorded, and on routes stored before this
+    /// field existed until [`SqliteAccountStorage::stamp_unrecorded_prior_route_switches`]
+    /// stamps them. Stored inside the route JSON, so no schema change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_at: Option<u64>,
 }
 
 /// `component_data_hex` carries MLS-protected component bytes. Blossom image
@@ -637,16 +644,26 @@ impl SqliteAccountStorage {
         marker_token: u64,
         dropped_count: u64,
     ) -> StorageResult<()> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            crate::account_recovery::arm_overflow_tx(
-                &conn,
-                label,
-                i64::try_from(marker_token).unwrap_or(i64::MAX),
-                i64::try_from(dropped_count).unwrap_or(i64::MAX),
-                unix_now_seconds_i64(),
-            )
-        })
+        self.mark_account_delivery_recovery_bounded(label, marker_token, dropped_count, None)
+    }
+
+    /// Like [`Self::mark_account_delivery_recovery`], also charging the
+    /// earliest wire `created_at` among the dropped deliveries, or an unknown
+    /// time, to the generation's bound.
+    pub fn mark_account_delivery_recovery_bounded(
+        &self,
+        label: &str,
+        marker_token: u64,
+        dropped_count: u64,
+        earliest_created_at: Option<u64>,
+    ) -> StorageResult<()> {
+        self.mark_account_delivery_recovery_observed(
+            label,
+            marker_token,
+            dropped_count,
+            earliest_created_at,
+        )
+        .map(|_| ())
     }
 
     /// Low-level legacy retirement. Recovery completion must use revision-fenced
@@ -1687,6 +1704,11 @@ impl SqliteAccountStorage {
                         && existing.relays == route.relays
                 }) {
                     existing.last_epoch = existing.last_epoch.max(route.last_epoch);
+                    // Keep the earliest known switch: it reaches furthest back.
+                    existing.replaced_at = match (existing.replaced_at, route.replaced_at) {
+                        (Some(kept), Some(new)) => Some(kept.min(new)),
+                        (kept, new) => kept.or(new),
+                    };
                 } else {
                     retained.push(route.clone());
                 }
@@ -1737,6 +1759,76 @@ impl SqliteAccountStorage {
             )
             .storage()?;
             Ok(())
+        })
+    }
+
+    /// Stamp each retained route in `account_groups` that has no recorded
+    /// switch time with `now_secs`, and persist the stamp at once. Returns how
+    /// many routes were stamped.
+    ///
+    /// Routes stored before switch times were kept carry none, so the first
+    /// load that finds one anchors its relay history floor there. Writing the
+    /// stamp back immediately keeps that anchor fixed across later loads and
+    /// restarts instead of moving it forward with each launch. The
+    /// local-deletion frontier is left alone. A malformed row is skipped; the
+    /// projection loader reports it.
+    pub fn stamp_unrecorded_prior_route_switches(&self, now_secs: u64) -> StorageResult<usize> {
+        let unstamped = |conn: &rusqlite::Connection| -> StorageResult<Vec<_>> {
+            let mut statement = conn
+                .prepare_cached(
+                    "SELECT group_id_hex, prior_nostr_routes_json
+                     FROM account_groups
+                     WHERE prior_nostr_routes_json <> '[]'",
+                )
+                .storage()?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|(group_id_hex, routes_json)| {
+                    let routes =
+                        serde_json::from_str::<Vec<StoredNostrRoute>>(&routes_json).ok()?;
+                    routes
+                        .iter()
+                        .any(|route| route.replaced_at.is_none())
+                        .then_some((group_id_hex, routes))
+                })
+                .collect())
+        };
+        // Loads find nothing to stamp once the first one has, so only that
+        // one takes the write lock.
+        if unstamped(&*self.lock()?)?.is_empty() {
+            return Ok(0);
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let mut stamped = 0;
+            // Read again under the write lock: another process may have
+            // stamped these routes since.
+            for (group_id_hex, mut routes) in unstamped(&conn)? {
+                for route in routes
+                    .iter_mut()
+                    .filter(|route| route.replaced_at.is_none())
+                {
+                    route.replaced_at = Some(now_secs);
+                    stamped += 1;
+                }
+                let routes_json = serde_json::to_string(&routes)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?;
+                conn.execute_cached(
+                    "UPDATE account_groups
+                     SET prior_nostr_routes_json = ?2
+                     WHERE group_id_hex = ?1",
+                    params![group_id_hex, routes_json],
+                )
+                .storage()?;
+            }
+            Ok(stamped)
         })
     }
 

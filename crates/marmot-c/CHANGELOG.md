@@ -14,6 +14,27 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `relay_repair` pointer; regenerate and recompile with the matching header
   and library. The preview is non-publishing, and `ManualReview` has no
   approvable action.
+- `marmot_poll_votes` returns a `MarmotPollVotePage` of each voter's effective
+  poll selection, 1..=100 per page with a `(voted_at, voter)` cursor; all pages
+  sum to the `MarmotPollProjection` tally. Free it with
+  `marmot_poll_vote_page_free`; requires the matching regenerated header and
+  library. (#2091)
+- `marmot_send_tagged_text`, `marmot_send_tagged_media`, and
+  `marmot_react_with_media` add application tags such as NIP-30 `emoji` to a
+  chat, media chat, or reaction. `MarmotMediaUploadRequest` gains trailing
+  `message_tags`/`message_tags_len` (NULL/0 for none), which changes its
+  layout; requires the matching regenerated header and library.
+- `MarmotConversationReaction` gains trailing nullable
+  `reaction_message_id_hex`, the earliest active kind-7 for that emoji; a
+  NIP-30 reaction's image is listed under it by `marmot_list_media`. Kind-9
+  conversation rows also keep NIP-30 `emoji` tags. Requires the matching
+  regenerated header and library.
+
+
+## [0.11.0] - 2026-09-29
+
+### Added
+
 - `marmot_edit_local_message_with_client_token` durably queues a revision of a
   token-aware local text or reply. It returns local acceptance before delivery;
   use `marmot_local_send_status` and the matching generated header/library.
@@ -34,6 +55,23 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   to `MarmotTimelineMessageRecord`; poll creation follows canonical group-conversation classification, while an
   accepted open poll remains votable after reclassification. Regenerate and recompile with the matching header and
   library.
+
+- Add "history may be incomplete" notices: `marmot_history_notices` (free with
+  `marmot_history_notice_list_free`), `marmot_dismiss_history_notice`, `MarmotHistoryNotice`,
+  `MarmotHistoryNoticeList` and `MarmotHistoryNoticeCause`. Dismissal is durable, is recorded as
+  its own outcome rather than recovered history, and writes false for a stale id; a malformed id
+  returns `MARMOT_STATUS_INVALID_HEX`. This changes layouts: `MarmotGroupRecoveryStatus` appends
+  `history_may_be_incomplete` and the `history_notice_ids` array (released by its existing deep
+  free), and `MarmotEvent` appends the `MARMOT_EVENT_HISTORY_NOTICES_CHANGED` tag and body.
+  Existing tag values are unchanged. Recompile with the matching header and library. (#2068)
+
+### Fixed
+
+- Chat-list-window commands quoting a sequence replaced only by background
+  content changes now apply to the current viewport instead of returning
+  `MARMOT_STATUS_CHAT_WINDOW_STALE`. An older visible-anchor quote naming a row a
+  background replacement dropped still returns it. The header and library
+  signatures are unchanged.
 
 ## [0.10.4] - 2026-09-20
 
@@ -90,6 +128,19 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   optimization and Linux packaging are unchanged.
 
 ### Added
+
+- `marmot_group_app_component` and admin-only `marmot_update_app_component`
+  expose opaque optional group state for application-owned component IDs.
+  Applications allocate IDs at or above `0xf000`; every ID below that is
+  protocol space and is rejected, so a component the registry assigns later
+  can never collide with one an application already committed. Required
+  components cannot be updated through this API, and `data_len` is capped at
+  4096 bytes because the value is re-encoded into every later commit and every
+  Welcome. An absent component writes NULL to `*out` and still returns OK;
+  present empty data writes a record with zero length.
+  Release records with `marmot_group_app_component_free`. Invalid component IDs
+  return the appended `MARMOT_STATUS_INVALID_APP_COMPONENT` status (95).
+  Existing record layouts and status values are unchanged.
 
 - `MarmotClientOptions` and `marmot_client_new_with_configuration` combine relay
   policy, cursor persistence, client label and optional host secret storage.
@@ -316,6 +367,7 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.20...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...HEAD
+[0.11.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.10.4...marmotc-v0.11.0
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
 [0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16

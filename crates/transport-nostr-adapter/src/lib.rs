@@ -78,7 +78,7 @@ pub use acquisition::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
     NostrAcquisitionScope, NostrAcquisitionStats, NostrNotificationLoss,
-    NostrNotificationLossScope,
+    NostrNotificationLossFloor, NostrNotificationLossScope,
 };
 pub use key_package::{
     CLIENT_TAG, KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication, NostrKeyPackagePublisher,
@@ -92,7 +92,9 @@ pub use relay_list::{
 pub use sdk_client::{
     NostrReconciliationItem, NostrReconciliationProgress, NostrReconciliationSummary,
     NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
+    sign_transport_event_for_publish,
 };
+use telemetry::EoseRepairClaim;
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
     RelayDeliveryTelemetry, RelayExportConsent, RelayIndex, RelayIndexRegistry,
@@ -100,6 +102,10 @@ pub use telemetry::{
 };
 
 const DELIVERY_BUFFER: usize = 1024;
+
+/// A REQ a lag repair claimed, with each relay it claimed and what the repair
+/// may do there.
+type ClaimedReq = (MemberId, String, Vec<(TransportEndpoint, EoseRepairClaim)>);
 
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
@@ -165,15 +171,20 @@ pub enum NostrSubscription {
         /// Activation attempt that issued this REQ; see [`SubscriptionAttempt`].
         attempt: SubscriptionAttempt,
     },
-    /// Temporary full-history subscription used only by post-join maintenance.
+    /// Temporary history subscription used only by post-join maintenance.
     ///
     /// Its distinct id keeps it independent from the normal incremental group
     /// subscription even though both route the same authenticated MLS events.
+    /// `since` is the caller's floor for the group history the joining member
+    /// must see: the Welcome that installed its copy, less a clock-skew
+    /// allowance. `None` asks for the group's full history. Like every other
+    /// kind, the id never carries `since`.
     GroupMaintenance {
         account_id: MemberId,
         group_id: GroupId,
         transport_group_id: Vec<u8>,
         endpoints: Vec<TransportEndpoint>,
+        since: Option<Timestamp>,
     },
 }
 
@@ -218,6 +229,7 @@ impl NostrSubscription {
                 group_id,
                 transport_group_id,
                 endpoints,
+                ..
             } => {
                 let h_tag = hex::encode(transport_group_id);
                 compact_subscription_id(
@@ -287,6 +299,7 @@ impl NostrSubscription {
                 group_id,
                 transport_group_id,
                 endpoints,
+                ..
             } => NostrSubscriptionRouteKey::GroupMaintenance {
                 account_id: account_id.clone(),
                 group_id: group_id.clone(),
@@ -465,6 +478,62 @@ impl AccountSubscriptionEose {
     }
 }
 
+/// The moment of a notification lag on the adapter's subscription clock, from
+/// [`NostrTransportAdapter::notification_lag_mark`].
+///
+/// Only REQs issued at or before a lag can have lost their end-of-stored-events
+/// in it. [`NostrTransportAdapter::reissue_subscriptions_awaiting_eose`] leaves
+/// later ones alone, because their replay is still arriving. A later mark
+/// covers every earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NotificationLagMark(u64);
+
+/// Counts from one notification-lag EOSE repair, from
+/// [`NostrTransportAdapter::reissue_subscriptions_awaiting_eose`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EoseReissueSummary {
+    /// Relays, across REQs issued by the lag, that had not reported EOSE to
+    /// the adapter.
+    pub awaiting_relays: usize,
+    /// Of those, how many the relay client had already seen answer the REQ
+    /// with EOSE, whose notification a lag lost. Their EOSE is recorded with
+    /// no network traffic.
+    pub complete_relays: usize,
+    /// Of those, how many an earlier repair re-issued the REQ to and the
+    /// relay client has seen no EOSE for yet. Each is re-issued only once, so
+    /// these get nothing more; their replay may still be arriving.
+    pub reissued_earlier_relays: usize,
+    /// Of those, how many had the REQ's CLOSE and REQ queued again together.
+    pub reissued_relays: usize,
+    /// Of those, how many got nothing queued: the relay was not connected,
+    /// had no room for both frames, or the client refused. The old REQ is
+    /// still live there. Each re-issue is released so a later repair tries
+    /// again. The rest no longer hold the REQ.
+    pub failed_relays: usize,
+}
+
+/// What [`NostrRelayClient::reissue_subscription`] did on one relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayReissue {
+    /// The relay already answered the REQ's current send with EOSE. Nothing
+    /// went out.
+    Complete,
+    /// The REQ's CLOSE and the REQ again were queued together.
+    Sent,
+    /// Nothing was queued: the relay was not connected, or had no room for
+    /// both frames. The REQ is still live as it was.
+    Unsent,
+    /// The client no longer holds the REQ on this relay.
+    Gone,
+}
+
+/// What one [`NostrRelayClient::reissue_subscription`] did, per requested
+/// relay.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionReissue {
+    pub relays: Vec<(TransportEndpoint, RelayReissue)>,
+}
+
 /// Boundary between this adapter and the actual Nostr relay implementation.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
@@ -536,6 +605,47 @@ pub trait NostrRelayClient: Send + Sync {
     ) -> Result<(), TransportAdapterError> {
         Err(TransportAdapterError::Subscription(
             "scoped subscription unsupported".to_owned(),
+        ))
+    }
+
+    /// Repair a live REQ on `endpoints` whose end-of-stored-events may have
+    /// been lost. A relay the client has seen answer the REQ's current send
+    /// with EOSE is reported complete, with no network traffic. Otherwise the
+    /// REQ goes out again, unchanged and under its own id, so the relay
+    /// replays its stored events and reports EOSE again. Reports what
+    /// happened on each relay.
+    ///
+    /// The REQ must keep the filter it was issued with, so its `since` still
+    /// bounds a later lag's loss. A closed REQ must never be reopened. No
+    /// relay may see the id repeated while it is live there, since a relay
+    /// may refuse the repeat instead of replacing the subscription: its CLOSE
+    /// and the REQ are queued together, or neither is. This is called under
+    /// the adapter's subscription lifecycle lock, so it must not wait for
+    /// room. An implementation that cannot guarantee all of this refuses.
+    /// Unsupported by default.
+    async fn reissue_subscription(
+        &self,
+        _account_id: &MemberId,
+        _subscription_id: &str,
+        _endpoints: &[TransportEndpoint],
+    ) -> Result<SubscriptionReissue, TransportAdapterError> {
+        Err(TransportAdapterError::Subscription(
+            "subscription reissue unsupported".to_owned(),
+        ))
+    }
+
+    /// Whether each relay in `endpoints` answered the live REQ's current send
+    /// with end-of-stored-events, as the client recorded it where a
+    /// notification lag cannot drop it. Sends nothing. A relay the client
+    /// does not hold the REQ on is left out. Unsupported by default.
+    async fn subscription_eose_received(
+        &self,
+        _account_id: &MemberId,
+        _subscription_id: &str,
+        _endpoints: &[TransportEndpoint],
+    ) -> Result<Vec<(TransportEndpoint, bool)>, TransportAdapterError> {
+        Err(TransportAdapterError::Subscription(
+            "subscription EOSE record unsupported".to_owned(),
         ))
     }
 
@@ -987,6 +1097,139 @@ impl NostrTransportAdapter {
         self.state.read().await.activation_attempt(account_id)
     }
 
+    /// Mark a notification lag on the adapter's subscription clock. Take it
+    /// when the lag is observed, before a later activation or group sync
+    /// issues REQs that the lag cannot have affected.
+    pub fn notification_lag_mark(&self) -> NotificationLagMark {
+        NotificationLagMark(self.now_ms())
+    }
+
+    /// Repair the REQs whose end-of-stored-events a notification lag may have
+    /// lost. That is every live subscription of `account_id` issued at or
+    /// before `lag`, or of every account when the lagging receiver was shared,
+    /// on each relay that has not reported EOSE for it. It covers the inbox,
+    /// each group route and post-join maintenance. REQs that already had EOSE,
+    /// and those issued after the lag, are left alone.
+    ///
+    /// A lost EOSE cannot be inferred from the lag: it cannot tell a lost EOSE
+    /// from one still coming, so marking it at the lag would let a consumer
+    /// of complete coverage, such as live cursor promotion, act while a relay
+    /// was still sending history. The relay client can
+    /// tell: a relay it has seen answer the REQ's current send is recorded
+    /// complete with no traffic. Any other relay gets the REQ again, with its
+    /// filter, so it replays from the same `since` before a fresh EOSE, and
+    /// the notification-loss floor does not move.
+    ///
+    /// Every repair checks the client's EOSE record for each such relay,
+    /// which costs no traffic, so a re-issued replay whose fresh EOSE a later
+    /// lag lost still completes. Only the network re-issue is limited: a
+    /// relay gets the REQ again at most once, so a replay that lags again
+    /// cannot loop. A relay that got nothing has its re-issue released and
+    /// counts in [`EoseReissueSummary::failed_relays`], so the caller can
+    /// repair it again later.
+    ///
+    /// This holds the subscription lifecycle lock throughout, so no
+    /// activation, group sync or teardown can close a REQ in between.
+    pub async fn reissue_subscriptions_awaiting_eose(
+        &self,
+        account_id: Option<&MemberId>,
+        lag: NotificationLagMark,
+    ) -> EoseReissueSummary {
+        let _subscription_guard = self.subscription_lock.lock().await;
+        let awaiting = self
+            .state
+            .write()
+            .await
+            .claim_subscriptions_awaiting_eose(account_id, lag.0);
+        let mut summary = EoseReissueSummary {
+            awaiting_relays: awaiting.iter().map(|(_, _, claimed)| claimed.len()).sum(),
+            ..EoseReissueSummary::default()
+        };
+        let mut complete = Vec::new();
+        let mut unsent = Vec::new();
+        for (account_id, subscription_id, claims) in awaiting {
+            let (reissue, check): (Vec<_>, Vec<_>) = claims
+                .into_iter()
+                .partition(|(_, claim)| *claim == EoseRepairClaim::Reissue);
+            let check = check
+                .into_iter()
+                .map(|(endpoint, _)| endpoint)
+                .collect::<Vec<_>>();
+            if !check.is_empty() {
+                let received = self
+                    .relay_client
+                    .subscription_eose_received(&account_id, &subscription_id, &check)
+                    .await
+                    .unwrap_or_default();
+                for endpoint in check {
+                    if received
+                        .iter()
+                        .any(|(reported, eose)| *eose && *reported == endpoint)
+                    {
+                        complete.push((subscription_id.clone(), endpoint));
+                    } else {
+                        summary.reissued_earlier_relays += 1;
+                    }
+                }
+            }
+            let endpoints = reissue
+                .into_iter()
+                .map(|(endpoint, _)| endpoint)
+                .collect::<Vec<_>>();
+            if endpoints.is_empty() {
+                continue;
+            }
+            let outcomes = match self
+                .relay_client
+                .reissue_subscription(&account_id, &subscription_id, &endpoints)
+                .await
+            {
+                Ok(reissue) => reissue.relays,
+                Err(_) => endpoints
+                    .iter()
+                    .map(|endpoint| (endpoint.clone(), RelayReissue::Unsent))
+                    .collect(),
+            };
+            for endpoint in endpoints {
+                let outcome = outcomes
+                    .iter()
+                    .find(|(reported, _)| *reported == endpoint)
+                    .map_or(RelayReissue::Gone, |(_, outcome)| *outcome);
+                match outcome {
+                    RelayReissue::Complete => complete.push((subscription_id.clone(), endpoint)),
+                    RelayReissue::Sent => summary.reissued_relays += 1,
+                    RelayReissue::Unsent => unsent.push((subscription_id.clone(), endpoint)),
+                    RelayReissue::Gone => {}
+                }
+            }
+        }
+        if !complete.is_empty() || !unsent.is_empty() {
+            let now_ms = self.now_ms();
+            let mut state = self.state.write().await;
+            for (subscription_id, endpoint) in &complete {
+                state.record_subscription_eose(subscription_id, endpoint, now_ms);
+            }
+            for (subscription_id, endpoint) in &unsent {
+                state.release_reissue_claim(subscription_id, endpoint);
+            }
+        }
+        summary.complete_relays = complete.len();
+        summary.failed_relays = unsent.len();
+        tracing::debug!(
+            target: "transport_nostr_adapter::adapter",
+            method = "reissue_subscriptions_awaiting_eose",
+            awaiting_relays = summary.awaiting_relays,
+            complete_relays = summary.complete_relays,
+            reissued_earlier_relays = summary.reissued_earlier_relays,
+            reissued_relays = summary.reissued_relays,
+            failed_relays = summary.failed_relays,
+            "repaired subscriptions awaiting end-of-stored-events after a notification lag"
+        );
+        summary
+    }
+
+    /// Install the temporary, full-history subscription used by the post-join
+    /// maintenance gate. The caller owns its eventual removal.
     /// Install the temporary, full-history subscription used by the post-join
     /// maintenance gate. The caller owns its eventual removal.
     pub async fn install_group_maintenance_subscription(
@@ -994,20 +1237,25 @@ impl NostrTransportAdapter {
         account_id: &MemberId,
         group: &TransportGroupSubscription,
     ) -> Result<String, TransportAdapterError> {
-        self.install_maintenance_subscription(account_id, group, None)
+        self.install_maintenance_subscription(account_id, group, None, None)
             .await
     }
 
     /// Install a maintenance session fenced by the recovery owner's durable
     /// attempt. Reusing a live token joins that session. Once removed or failed,
     /// a strictly greater token is required, including across account activation.
+    ///
+    /// `since` floors the history it requests, and with it the notification
+    /// loss a lag can charge while it is live. `None` requests the group's full
+    /// history and leaves that loss unbounded.
     pub async fn install_group_maintenance_recovery_subscription(
         &self,
         account_id: &MemberId,
         group: &TransportGroupSubscription,
         attempt: u64,
+        since: Option<Timestamp>,
     ) -> Result<String, TransportAdapterError> {
-        self.install_maintenance_subscription(account_id, group, Some(attempt))
+        self.install_maintenance_subscription(account_id, group, Some(attempt), since)
             .await
     }
 
@@ -1016,6 +1264,7 @@ impl NostrTransportAdapter {
         account_id: &MemberId,
         group: &TransportGroupSubscription,
         attempt: Option<u64>,
+        since: Option<Timestamp>,
     ) -> Result<String, TransportAdapterError> {
         if attempt.is_some() && !self.relay_client.supports_scoped_subscriptions() {
             return Err(TransportAdapterError::Subscription(
@@ -1028,6 +1277,7 @@ impl NostrTransportAdapter {
             group_id: group.group_id.clone(),
             transport_group_id: group.transport_group_id.clone(),
             endpoints: group.endpoints.clone(),
+            since,
         };
         let subscription_id = match attempt {
             Some(attempt) => compact_subscription_id(
@@ -1220,11 +1470,26 @@ impl NostrTransportAdapter {
             .await
     }
 
-    async fn handle_relay_event_scoped(
+    /// Route a comparison result to one account without the delivery queue.
+    /// The caller admits each delivery itself, a few per worker turn.
+    pub async fn reconciled_deliveries(
+        &self,
+        account_id: &MemberId,
+        relay_event: NostrRelayEvent,
+    ) -> Result<Vec<TransportDelivery>, TransportAdapterError> {
+        let deliveries = self.deliveries_for(relay_event, Some(account_id)).await?;
+        self.state
+            .write()
+            .await
+            .record_inbound_event(deliveries.len());
+        Ok(deliveries)
+    }
+
+    async fn deliveries_for(
         &self,
         relay_event: NostrRelayEvent,
         account_id: Option<&MemberId>,
-    ) -> Result<usize, TransportAdapterError> {
+    ) -> Result<Vec<TransportDelivery>, TransportAdapterError> {
         let message = relay_event
             .event
             .to_transport_message()
@@ -1237,26 +1502,37 @@ impl NostrTransportAdapter {
         if let Some(account_id) = account_id {
             routes.retain(|route| &route.account_id == account_id);
         }
+        let wire = inbound_wire_metadata(&relay_event.event, &message.envelope);
+        Ok(routes
+            .into_iter()
+            .map(|route| TransportDelivery {
+                account_id: route.account_id,
+                group_id_hint: route.group_id_hint,
+                message: message.clone(),
+                received_at,
+                source: TransportDeliverySource {
+                    transport: TransportSource(NOSTR_SOURCE.into()),
+                    plane: route.plane,
+                    endpoint: Some(relay_event.endpoint.clone()),
+                    subscription_id: relay_event.subscription_id.clone(),
+                    wire: Some(wire.clone()),
+                },
+            })
+            .collect())
+    }
 
-        let mut delivered = 0;
-        for route in routes {
+    async fn handle_relay_event_scoped(
+        &self,
+        relay_event: NostrRelayEvent,
+        account_id: Option<&MemberId>,
+    ) -> Result<usize, TransportAdapterError> {
+        let deliveries = self.deliveries_for(relay_event, account_id).await?;
+        let delivered = deliveries.len();
+        for delivery in deliveries {
             self.delivery_tx
-                .send(TransportDelivery {
-                    account_id: route.account_id,
-                    group_id_hint: route.group_id_hint,
-                    message: message.clone(),
-                    received_at,
-                    source: TransportDeliverySource {
-                        transport: TransportSource(NOSTR_SOURCE.into()),
-                        plane: route.plane,
-                        endpoint: Some(relay_event.endpoint.clone()),
-                        subscription_id: relay_event.subscription_id.clone(),
-                        wire: Some(inbound_wire_metadata(&relay_event.event, &message.envelope)),
-                    },
-                })
+                .send(delivery)
                 .await
                 .map_err(|_| TransportAdapterError::Closed)?;
-            delivered += 1;
         }
 
         // Delivery only. The relay pool emits one deduplicated `Event` per
@@ -1362,12 +1638,7 @@ impl TransportAdapter for NostrTransportAdapter {
         ));
         let prior_route_keys = prior_group_route_keys(&account_id, &activation.group_subscriptions);
         for group in &activation.group_subscriptions {
-            let route_key = group_route_key(&account_id, group);
-            let since = if prior_route_keys.contains(&route_key) {
-                None
-            } else {
-                activation.since
-            };
+            let since = group_route_since(&account_id, group, &prior_route_keys, activation.since);
             issued.push(group_subscription(&account_id, group, since, attempt));
         }
         // Register routing/telemetry state BEFORE the relay REQs go out: a
@@ -1387,7 +1658,7 @@ impl TransportAdapter for NostrTransportAdapter {
             state.clear_pending_unsubscribes_for_account(&account_id);
             state.record_subscription_starts(&issued, now_ms);
             state.record_account_replay_start(&account_id, &issued);
-            state.activate(activation, replaced_count, attempt);
+            state.activate(activation, replaced_count, attempt, &issued);
         }
 
         if let Err(error) = self.subscribe_all("activate_account", &issued).await {
@@ -1463,10 +1734,10 @@ impl TransportAdapter for NostrTransportAdapter {
             // new attempt, so both sides of the diff carry the activation's own
             // attempt and the ids stay stable across it.
             let attempt = routes.attempt;
-            let current_groups = routes.groups.as_slice();
             diff_group_subscriptions(
                 &sync.account_id,
-                current_groups,
+                &routes.groups,
+                &routes.group_since,
                 &sync.group_subscriptions,
                 sync.since,
                 attempt,
@@ -1517,7 +1788,7 @@ impl TransportAdapter for NostrTransportAdapter {
             let mut state = self.state.write().await;
             state.commit_staged_subscription_starts();
             state.forget_subscription_starts(&to_remove);
-            state.sync_groups(sync, to_add.len());
+            state.sync_groups(sync, &to_add, &to_remove);
             state.queue_pending_unsubscribes(to_remove);
         };
 
@@ -1680,6 +1951,11 @@ struct AccountRoutes {
     /// arm's `by_transport_group` entries.
     inbox_endpoints: Vec<CanonicalEndpoint>,
     groups: Vec<TransportGroupSubscription>,
+    /// The `since` each live group REQ was issued with, by route. A group sync
+    /// reissues a live retained route only when that widens it: the new REQ
+    /// replaces the live one under the same id, so a narrower filter could cut
+    /// off history the live one is still returning. Ids never carry `since`.
+    group_since: HashMap<NostrSubscriptionRouteKey, Option<Timestamp>>,
     /// Attempt the live subscriptions for this account were issued under. Held
     /// here so `account_subscription_ids` can rebuild exactly the ids that went
     /// on the wire, and so a group sync reuses the activation's attempt rather
@@ -1872,6 +2148,7 @@ impl AdapterState {
                 group_id,
                 transport_group_id,
                 endpoints,
+                ..
             }) = subscription
             else {
                 continue;
@@ -1909,6 +2186,7 @@ impl AdapterState {
         activation: TransportAccountActivation,
         replaced: usize,
         attempt: SubscriptionAttempt,
+        issued: &[NostrSubscription],
     ) {
         self.metrics.subscriptions_created += 1 + activation.group_subscriptions.len();
         self.metrics.subscriptions_removed += replaced;
@@ -1927,16 +2205,26 @@ impl AdapterState {
                     .map(CanonicalEndpoint::new)
                     .collect(),
                 groups: activation.group_subscriptions,
+                group_since: issued_group_since(issued).collect(),
                 attempt,
             },
         );
         self.rebuild_transport_group_index();
     }
 
-    fn sync_groups(&mut self, sync: TransportGroupSync, created: usize) {
+    fn sync_groups(
+        &mut self,
+        sync: TransportGroupSync,
+        added: &[NostrSubscription],
+        removed: &[NostrSubscription],
+    ) {
         if let Some(account) = self.accounts.get_mut(&sync.account_id) {
             account.groups = sync.group_subscriptions;
-            self.metrics.subscriptions_created += created;
+            for subscription in removed {
+                account.group_since.remove(&subscription.route_key());
+            }
+            account.group_since.extend(issued_group_since(added));
+            self.metrics.subscriptions_created += added.len();
             self.rebuild_transport_group_index();
         }
     }
@@ -2194,6 +2482,77 @@ impl AdapterState {
             .unwrap_or_default()
     }
 
+    /// Claim, for one notification-lag repair, each relay that has not
+    /// reported EOSE for a live REQ started by `started_by_ms`. A live REQ is
+    /// an account's inbox, one of its group routes, or post-join maintenance;
+    /// `None` covers every account. Returns each REQ with the endpoints
+    /// claimed for it and what the repair may do there: a relay is claimed
+    /// for a re-issue at most once, and only checked after that.
+    fn claim_subscriptions_awaiting_eose(
+        &mut self,
+        account_id: Option<&MemberId>,
+        started_by_ms: u64,
+    ) -> Vec<ClaimedReq> {
+        let in_scope = |account: &MemberId| account_id.is_none_or(|wanted| wanted == account);
+        let mut live = Vec::new();
+        for (account, routes) in self.accounts.iter().filter(|(id, _)| in_scope(id)) {
+            let inbox = account_inbox_subscription(
+                account,
+                routes
+                    .inbox_endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.verbatim.clone())
+                    .collect(),
+                None,
+                routes.attempt,
+            );
+            live.push((account.clone(), inbox.subscription_id(), inbox));
+            for group in &routes.groups {
+                let subscription = group_subscription(account, group, None, routes.attempt);
+                live.push((
+                    account.clone(),
+                    subscription.subscription_id(),
+                    subscription,
+                ));
+            }
+        }
+        for (id, subscription) in &self.maintenance_routes {
+            if in_scope(subscription.account_id()) {
+                live.push((
+                    subscription.account_id().clone(),
+                    id.clone(),
+                    subscription.clone(),
+                ));
+            }
+        }
+        live.into_iter()
+            .filter_map(|(account, id, subscription)| {
+                let mut claimed = HashSet::new();
+                let claims = subscription
+                    .endpoints()
+                    .iter()
+                    .filter_map(|endpoint| {
+                        let relay = self.relay_index.existing_index_for(endpoint)?;
+                        // Two spellings of one relay are one claim.
+                        if !claimed.insert(relay) {
+                            return None;
+                        }
+                        let claim = self.sync.claim_eose_repair(&id, relay, started_by_ms)?;
+                        Some((endpoint.clone(), claim))
+                    })
+                    .collect::<Vec<_>>();
+                (!claims.is_empty()).then_some((account, id, claims))
+            })
+            .collect()
+    }
+
+    /// Release a lag repair's claim for a later repair.
+    fn release_reissue_claim(&mut self, subscription_id: &str, endpoint: &TransportEndpoint) {
+        if let Some(relay) = self.relay_index.existing_index_for(endpoint) {
+            self.sync.release_eose_reissue(subscription_id, relay);
+        }
+    }
+
     fn record_subscription_first_event(
         &mut self,
         subscription_id: &str,
@@ -2333,9 +2692,67 @@ fn group_route_key(
     }
 }
 
+/// The `since` a group route's REQ is issued with.
+///
+/// A group's current route resumes from the account's `since`. A retained
+/// route resumes from its own floor, and never from later than the account's
+/// `since`: members that have not applied the route change still send to the
+/// old address, with timestamps the account cursor, which the current route
+/// drives, may already have passed. A retained route without a floor is
+/// backfilled in full.
+fn group_route_since(
+    account_id: &MemberId,
+    group: &TransportGroupSubscription,
+    prior_route_keys: &HashSet<NostrSubscriptionRouteKey>,
+    since: Option<Timestamp>,
+) -> Option<Timestamp> {
+    if !is_retained_route(account_id, group, prior_route_keys) {
+        return since;
+    }
+    group
+        .retained_since
+        .zip(since)
+        .map(|(floor, since)| floor.min(since))
+}
+
+/// A route that carries a retained floor is retained wherever it sits, so it
+/// never takes the current route's place, even where the relay-safety filter
+/// dropped that route. A floorless route after its group's first is a
+/// retained route whose switch time the caller does not know.
+fn is_retained_route(
+    account_id: &MemberId,
+    group: &TransportGroupSubscription,
+    prior_route_keys: &HashSet<NostrSubscriptionRouteKey>,
+) -> bool {
+    group.retained_since.is_some() || prior_route_keys.contains(&group_route_key(account_id, group))
+}
+
+/// Whether a REQ issued with `desired` reaches further back than one issued
+/// with `issued`. `None` is unfloored, the widest of all.
+fn floor_widens(desired: Option<Timestamp>, issued: Option<Timestamp>) -> bool {
+    match (desired, issued) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(desired), Some(issued)) => desired < issued,
+    }
+}
+
+/// The `since` of each group REQ in `subscriptions`, by route.
+fn issued_group_since(
+    subscriptions: &[NostrSubscription],
+) -> impl Iterator<Item = (NostrSubscriptionRouteKey, Option<Timestamp>)> + '_ {
+    subscriptions
+        .iter()
+        .filter_map(|subscription| match subscription {
+            NostrSubscription::Group { since, .. } => Some((subscription.route_key(), *since)),
+            _ => None,
+        })
+}
+
 fn diff_group_subscriptions(
     account_id: &MemberId,
     current: &[TransportGroupSubscription],
+    current_since: &HashMap<NostrSubscriptionRouteKey, Option<Timestamp>>,
     desired: &[TransportGroupSubscription],
     since: Option<Timestamp>,
     attempt: SubscriptionAttempt,
@@ -2344,18 +2761,17 @@ fn diff_group_subscriptions(
         .iter()
         .map(|group| group_subscription(account_id, group, None, attempt))
         .collect::<Vec<_>>();
-    let current_prior_keys = prior_group_route_keys(account_id, current);
     let desired_prior_keys = prior_group_route_keys(account_id, desired);
     let desired_subscriptions = desired
         .iter()
         .map(|group| {
-            let route_key = group_route_key(account_id, group);
-            let since = if desired_prior_keys.contains(&route_key) {
-                None
-            } else {
-                since
-            };
-            group_subscription(account_id, group, since, attempt)
+            let retained = is_retained_route(account_id, group, &desired_prior_keys);
+            let since = group_route_since(account_id, group, &desired_prior_keys, since);
+            (
+                retained,
+                since,
+                group_subscription(account_id, group, since, attempt),
+            )
         })
         .collect::<Vec<_>>();
     let current_keys = current_subscriptions
@@ -2364,17 +2780,24 @@ fn diff_group_subscriptions(
         .collect::<HashSet<_>>();
     let desired_keys = desired_subscriptions
         .iter()
-        .map(NostrSubscription::route_key)
+        .map(|(_, _, subscription)| subscription.route_key())
         .collect::<HashSet<_>>();
 
     let to_add = desired_subscriptions
         .into_iter()
-        .filter(|subscription| {
+        .filter(|(retained, since, subscription)| {
             let route_key = subscription.route_key();
+            // A live REQ is reissued only to widen a retained route, such as
+            // the current route a route change just displaced. The reissue
+            // replaces the live REQ under the same id, so a narrower filter
+            // could cut off history the live one is still returning.
             !current_keys.contains(&route_key)
-                || (desired_prior_keys.contains(&route_key)
-                    && !current_prior_keys.contains(&route_key))
+                || (*retained
+                    && current_since
+                        .get(&route_key)
+                        .is_some_and(|issued| floor_widens(*since, *issued)))
         })
+        .map(|(_, _, subscription)| subscription)
         .collect();
     let to_remove = current_subscriptions
         .into_iter()
@@ -2384,19 +2807,26 @@ fn diff_group_subscriptions(
     (to_add, to_remove)
 }
 
-/// Return route keys for retained prior addresses. App routing orders each
-/// group's current signed route first and its retained historical routes
-/// immediately afterward. Only those historical routes need an unbounded
-/// backfill; the current route keeps the account cursor.
+/// Return route keys for retained prior addresses that carry no floor. App
+/// routing orders each group's current signed route first and its retained
+/// historical routes immediately afterward. A floored retained route is
+/// recognized by its floor (see [`is_retained_route`]), so position decides
+/// only among floorless routes: the first is the current route, which keeps
+/// the account cursor, and a later distinct one is a retained route whose
+/// switch time the caller does not know.
 fn prior_group_route_keys(
     account_id: &MemberId,
     groups: &[TransportGroupSubscription],
 ) -> HashSet<NostrSubscriptionRouteKey> {
-    let mut seen_groups = HashSet::new();
+    let mut current_routes = HashMap::new();
     let mut prior_route_keys = HashSet::new();
-    for group in groups {
-        if !seen_groups.insert(group.group_id.clone()) {
-            prior_route_keys.insert(group_route_key(account_id, group));
+    for group in groups.iter().filter(|group| group.retained_since.is_none()) {
+        let route_key = group_route_key(account_id, group);
+        let current = current_routes
+            .entry(group.group_id.clone())
+            .or_insert_with(|| route_key.clone());
+        if *current != route_key {
+            prior_route_keys.insert(route_key);
         }
     }
     prior_route_keys

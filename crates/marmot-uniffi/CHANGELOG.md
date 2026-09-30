@@ -2,7 +2,47 @@
 
 ## Unreleased
 
+### Added
+
+- `Marmot::poll_votes` pages each voter's effective poll selection
+  (`PollVoteFfi`: voter account id, option ids, vote time) for a "View votes"
+  sheet, 1..=100 per `PollVotePageFfi` with a `(voted_at, voter)` cursor. It
+  uses the same rules as the `PollProjectionFfi` tally, so all pages sum to
+  `options[].votes` and `participants`. Blocked voters stay listed; hidden or
+  deleted polls return an empty page. (#2091)
+- `Marmot::send_tagged_text`, `send_tagged_media`, and `react_with_media` send
+  NIP-30 custom emoji: upload the image with `upload_media(send = false)`, then
+  name its first locator in an `["emoji", shortcode, url]` tag on a chat or a
+  `:shortcode:` reaction. `MediaUploadRequestFfi.message_tags` (default empty)
+  tags a sent upload. At most 64 tags and 16 KiB of values; `imeta` rows are
+  rejected.
+- Conversation window kind-9 rows now keep NIP-30 `["emoji", shortcode, url]`
+  tags in `timeline.tags`, and `ConversationReactionFfi.reaction_message_id_hex`
+  names the earliest active kind-7 for that emoji, whose custom image
+  `list_media` returns under the same message id.
+
+
+## 0.11.0 - 2026-09-29
+
+### Changed
+
+- Explicit catch-up ingests live input, then runs the account's recovery comparison in
+  place. It no longer re-subscribes relays once the session is active; a route change
+  still refreshes them.
+- Generated identities and later relay-list or profile edits schedule
+  best-effort copies of kind 10002, kind 10050, and kind 0 to the built-in
+  public directory indexers. Development accounts using loopback relays skip
+  these writes while retaining public indexer reads for existing identities.
+
 ### Fixed
+
+- Keep native conversation-window paging usable during content-only refreshes.
+  An older visible-anchor quote whose row has left the retained window now
+  reports a stale window so hosts can reassess the visible row. (#2052)
+
+- Keep native chat-list-window paging usable while account activity refreshes
+  the window. An older visible-anchor quote whose row has left the retained
+  window reports a stale window so hosts can reassess the visible row.
 
 - Fetched kind:0 `about` text keeps normalized line breaks. Other known profile strings
   stay single-line, and unsafe controls are still removed. (#1973)
@@ -15,6 +55,10 @@
   Regenerate Swift/Kotlin bindings with the matching native library and update
   exhaustive operation switches. `AppPerformanceSnapshotFfi` keeps its existing
   record fields; read every new stage through `runtime_operations`.
+- `MarmotEventFfi` gains `HistoryNoticesChanged { account_id_hex, account_label }`; update
+  exhaustive event switches. `GroupRecoveryStatusFfi` gains `history_may_be_incomplete` and
+  `history_notice_ids`, with binding defaults for host-constructed records. Regenerate
+  Swift/Kotlin bindings with the matching native library.
 
 ### Added
 
@@ -22,6 +66,11 @@
   counts, participants, local selection and deadline state. Poll creation follows canonical group-conversation
   classification; an accepted open poll remains votable after reclassification. Regenerate Swift/Kotlin
   bindings with the matching library.
+- Add `history_notices` and `dismiss_history_notice` with `HistoryNoticeFfi` and
+  `HistoryNoticeCauseFfi`. Each notice is one parked recovery occurrence to show as "history may
+  be incomplete"; dismissal is durable, is recorded as its own outcome rather than recovered
+  history, and returns false for a stale id. Group-scoped occurrences also appear in
+  `group_recovery_status`. See the README section "History may be incomplete notices". (#2068)
 
 ## 0.10.4 - 2026-09-20
 

@@ -4,6 +4,80 @@
 
 ### Added
 
+- `SqliteAccountStorage::poll_votes` pages each voter's effective selection for
+  one visible poll (1..=100 per page, `(voted_at, voter)` cursor). The timeline
+  tally and this read share one resolver, so the per-voter pages always sum to
+  `PollProjection`'s counts and `participants`. (#2091)
+
+### Changed
+
+- Kind-7 reactions with encrypted-media `imeta` (NIP-30 custom emoji images)
+  now reference their media epoch secret like kind-9 chats, so the image stays
+  decryptable after the group advances.
+
+
+## 0.11.0 - 2026-09-29
+
+### Changed
+
+- A recovery scope may admit relays it does not require. Completion checks only the
+  required relays, each of which must be admitted and covered. Checkpoints may name any
+  required or admitted relay, and joining comparison debt replaces its required relays
+  instead of accumulating them. (#2068)
+- `StoredNostrRoute` gains `replaced_at`, when the device saw the route replaced as its
+  group's current route, which anchors the retained route's relay history floor. It is an
+  optional field inside the existing route JSON (`account_groups` and the local-deletion
+  frontier), so there is no migration; routes stored before it read as `None` until
+  `stamp_unrecorded_prior_route_switches` stamps them. Retaining a frontier route keeps its
+  earliest known switch. (#2070)
+
+### Added
+
+- Report recovery demand transitions for the owner's audit rows.
+  `synchronize_account_delivery_loss` now returns one `RecoveryLossImport` per loss cause it
+  changed (its obligation, a `RecoveryDemandTransition`, the newly charged count and the
+  goal floor read in the same transaction) instead
+  of `()`; callers that ignored the unit result compile unchanged.
+  `request_recovery_observed` and `mark_account_delivery_recovery_observed` report the same
+  transition for a request and for the worker's overflow observation, and
+  `recovery_obligation_status` reads one obligation's revision, cause, state and
+  eligibility, and `recovery_parking_streak` the shortest quiet streak among the scopes that
+  still decide parking. None of these changes demand.
+
+- Add `stamp_unrecorded_prior_route_switches(now_secs)`, which stamps each retained route in
+  `account_groups` that has no `replaced_at` with `now_secs` and persists the stamp in one
+  transaction, so a route stored before switch times were kept gets one fixed floor
+  anchor. It returns how many routes it stamped, and leaves the local-deletion frontier
+  alone. (#2070)
+
+- Add `checkpoint_recovery_comparison`, which takes each compared scope's
+  `RecoveryPassProgress` and keeps that scope's quiet streak in its checkpoint payload for its
+  goal: progress restarts it and an unserved comparison leaves it alone. A retryable obligation
+  parks, in the same transaction, once every scope it still cannot certify has
+  `RECOVERY_PARK_AFTER_QUIET_PASSES` quiet comparisons in a row, so a pass that compares a slice
+  of routes cannot park the rest. `StoredRecoveryScope::quiet_passes` reports the streak. (#2068)
+
+- Add schema 0098 for "history may be incomplete" notices. `parked_recovery_obligations` and
+  `parked_group_recovery_obligations` list each pending obligation parked for deep repair as a
+  `ParkedRecoveryObligation` (ticket, cause, optional group and new `parked_at_ms`, which parking
+  now records). `retire_parked_recovery_obligation(id, revision, now_ms)` is the explicit,
+  user-authorized ending: in one transaction, and only for that exact parked revision, it records
+  `state = 2` with a documented `incomplete_reason`, never coverage. For queue or notification loss
+  it retires every evidence generation of that cause at its imported count (new `retired_count`)
+  and refuses while newer evidence is unimported; for incremental history it settles the comparison
+  slot that served only that debt, and records the routes and required relays it could not
+  certify (new `dismissed_scopes`); parking again on none but those retires it again silently.
+  Retired watermarks no longer bound loss goals or legacy
+  restoration, and a delayed duplicate observation cannot reopen them. New loss above a watermark,
+  a new generation, a higher epoch, a comparison join or a new known-event, incremental or explicit
+  request reopens the row as fresh pending debt. (#2068)
+
+- Add schema 0097 `bound_state` and `bound_seconds` on `account_delivery_loss_evidence`: a
+  running minimum of the wire `created_at` charged to each loss generation, which becomes
+  unknown for good after any charge without one. Rows written before 0097 are unknown.
+  `record_account_recovery_loss_bounded` and the other `*_bounded` writers maintain it, and
+  `recovery_loss_goal_floor` reads it. (#2068)
+
 - Add schema 0096 `account_delivery_spill`, the durable overflow tail of the in-memory account
   delivery queue, with `spill_account_deliveries`, `spilled_account_deliveries` and
   `remove_spilled_account_delivery`. Spilling skips deliveries already recorded in

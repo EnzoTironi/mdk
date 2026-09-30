@@ -97,6 +97,8 @@ pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod error;
 mod external_signer;
 mod groups;
+mod history_notices;
+pub use history_notices::{HistoryNotice, HistoryNoticeCause};
 mod ids;
 mod key_package_records;
 #[cfg(test)]
@@ -129,6 +131,7 @@ pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
 pub use marmot_account::MaintenanceTiming;
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
+use runtime::account_worker::{AccountStartupProgress, AccountStartupStage};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -189,17 +192,15 @@ pub use audit_log::{
 };
 pub use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,
-    PollProjection, PollType,
+    PollProjection, PollType, PollVote, PollVotePage,
 };
 pub use client::AppClient;
-pub(crate) use client::{
-    ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
-};
+pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
     AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
-    RecoveryExecutorMode, RelayTelemetryExportConfig, RelayTelemetryResource,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings,
 };
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
@@ -374,59 +375,12 @@ const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
-/// Maximum wall-clock quantum one epoch-gap backfill drain owns the serial
-/// account worker before it checkpoints its prefix and yields incomplete.
+/// How long a recovery attempt waits before the automatic seams may start
+/// another, doubling per attempt up to [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`].
 ///
-/// The bound is observed between deliveries, where no engine snapshot guard or
-/// account-state transaction is live. One already-claimed delivery and the
-/// final prefix checkpoint may therefore extend wall-clock time past the
-/// quantum, but the relay receive loop itself cannot monopolize the worker.
-/// Five seconds leaves headroom inside [`APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT`]
-/// for that boundary work while still amortizing relay subscription setup over
-/// useful replay progress.
-pub(crate) const EPOCH_BACKFILL_EXECUTION_QUANTUM: Duration = Duration::from_secs(5);
-/// How long the epoch-gap backfill drain waits through *silence* for
-/// end-of-stored-events before it gives up and reports an incomplete replay.
-///
-/// Ordinary sync treats a quiet relay as a finished drain, which is right for a
-/// floored subscription that asks for a little and gets it. The backfill's
-/// subscription is unfloored, so silence there is ambiguous: it is equally the
-/// relay having nothing more to send and the relay still resolving a
-/// whole-account history query. Only EOSE separates them, and this is the
-/// budget for waiting on it.
-///
-/// This bounds consecutive silence inside one
-/// [`EPOCH_BACKFILL_EXECUTION_QUANTUM`]. Every delivery resets it. Long working
-/// replays therefore continue across multiple checkpointed quanta instead of
-/// being discarded or holding the worker for their entire wall-clock span.
-///
-/// Because this budget is only consulted when the receive wait times out, a
-/// relay delivering faster than [`SDK_DRAIN_WAIT`] never reaches it; skipped
-/// deliveries therefore poll the end-of-stored-events gate directly. The
-/// execution quantum independently ends duplicate-only traffic when that gate
-/// never arrives.
-///
-/// 30 s remains the conservative consecutive-silence ceiling, but an open
-/// automatic recovery stream never spends it in one attempt: the 5 s execution quantum
-/// yields first and a later seam resubscribes. Explicit full-history repair instead
-/// continues the same activation across quanta under its own overall budget.
-/// Automatic EOSE completion
-/// therefore requires the gate to report within that quantum (or before an
-/// adapter-closed result). A worker-quantum yield is only a scheduling event:
-/// it paces a later resubscription but does not spend the EOSE-failure ordinal.
-/// An unavailable required relay leaves the durable intent pending; bounded
-/// worker quanta and paced retries preserve availability without weakening the
-/// proof that stored history was served.
-pub(crate) const EPOCH_BACKFILL_EOSE_WAIT: Duration = Duration::from_secs(30);
-/// How long an epoch-gap backfill whose replay went unconfirmed waits before
-/// the automatic seams may try it again, doubling per attempt up to
-/// [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`].
-///
-/// Without pacing, the receive seam runs a pending intent after *every* inbound
-/// ingest, so a permanently unconfirmable replay would spend one
-/// [`EPOCH_BACKFILL_EXECUTION_QUANTUM`] per delivery. Productive quantum yields
-/// are exempt; only an unproductive account-wide replay earns this floor,
-/// which matches the maintenance tick cadence.
+/// Without pacing, the receive seam would start a recovery job after *every*
+/// inbound ingest. Progress (new coverage or admitted history) resets it to
+/// this floor, which matches the maintenance tick cadence.
 pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 /// Ceiling on the doubling in [`EPOCH_BACKFILL_RETRY_BACKOFF`]. A relay outage
 /// that outlasts this is not going to be resolved by trying harder, and the
@@ -457,6 +411,30 @@ const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 /// `since` filter, preventing an account from silently halting message
 /// reception (mdk#182). The margin tolerates benign sender clock skew.
 const TRANSPORT_CURSOR_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+/// Clock-skew allowance below an anchor time from which a REQ requests group
+/// history: the Welcome that installed a joined copy, for its post-join
+/// maintenance REQ, or the moment a route was replaced, for that retained
+/// route's REQ. See [`history_floor`].
+///
+/// Events carry their sender's clock in `created_at`, while the anchor carries
+/// the inviter's clock (the Welcome) or this device's (the switch). The
+/// allowance absorbs the disagreement, and the seconds between an Add commit's
+/// wrap and its Welcome's. The directions cost differently. A floor too high
+/// can miss a commit made after the Welcome, and the joining member's first
+/// self-update then forks from the group until the epoch gap is acquired. A
+/// floor too low only re-requests history the member cannot open or already
+/// holds: once per join, and on every activation for a retained route.
+///
+/// So the allowance leans wide. Fifteen minutes is the future-dated-event
+/// limit relays commonly enforce, so an inviter whose Add commit a relay
+/// accepted cannot run fast enough to put the floor after the commits that
+/// followed it. It also tolerates committers three times further behind than
+/// the stack's five-minute sender-clock tolerance
+/// ([`TRANSPORT_CURSOR_MAX_FUTURE_SKEW`]). The cost is at most fifteen minutes
+/// of history before each anchor. Anything a floor still misses inside the
+/// retained-inventory window stays within reach of the comparison, which
+/// covers current and retained routes alike.
+const HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(15 * 60);
 const ACCOUNT_WORKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 const ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS: u64 = 500;
@@ -544,6 +522,7 @@ pub struct MarmotApp {
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
+    public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -616,6 +595,46 @@ pub(crate) struct GeneratedAccountBootstrapPublication {
     pub status: AccountRelayListStatus,
     pub relay_and_follow_duration: Duration,
     pub default_profile_duration: Duration,
+    pub indexer_copy: Option<PublicIndexerCopy>,
+}
+
+pub(crate) struct PublicIndexerCopy {
+    relay_client: Arc<dyn NostrRelayClient>,
+    account_id: MemberId,
+    events: Vec<NostrTransportEvent>,
+    indexers: Vec<TransportEndpoint>,
+}
+
+#[derive(Default)]
+struct PublicIndexerCopyTasks {
+    stopped: bool,
+    by_account: HashMap<String, Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl PublicIndexerCopy {
+    fn new(
+        relay_client: Arc<dyn NostrRelayClient>,
+        account_id: MemberId,
+        events: Vec<NostrTransportEvent>,
+        indexers: Vec<TransportEndpoint>,
+    ) -> Option<Self> {
+        (!events.is_empty() && !indexers.is_empty()).then_some(Self {
+            relay_client,
+            account_id,
+            events,
+            indexers,
+        })
+    }
+
+    pub(crate) async fn run(self) {
+        publish_public_indexer_copies(
+            self.relay_client.as_ref(),
+            &self.account_id,
+            &self.events,
+            &self.indexers,
+        )
+        .await;
+    }
 }
 
 /// A relay list the account is missing. Typed so FFI clients can localize
@@ -680,6 +699,9 @@ fn is_zero_u64(value: &u64) -> bool {
 pub struct AccountRelayListBootstrap {
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
+    /// Publication-only copies of public directory records. Never advertised
+    /// as NIP-65 write relays or used for KeyPackage publication.
+    pub indexer_relays: Vec<TransportEndpoint>,
 }
 
 impl AccountRelayListBootstrap {
@@ -695,7 +717,13 @@ impl AccountRelayListBootstrap {
         Self {
             default_relays,
             bootstrap_relays,
+            indexer_relays: Vec::new(),
         }
+    }
+
+    pub fn with_indexer_relays(mut self, indexer_relays: Vec<TransportEndpoint>) -> Self {
+        self.indexer_relays = indexer_relays;
+        self
     }
 }
 
@@ -1281,6 +1309,8 @@ struct OpenAppAccount {
     state: AccountState,
     delivery_overflow_recovery_pending: bool,
     delivery_overflow_recovery_marker_token: Option<u64>,
+    /// Loss the open imported, recorded once the client exists.
+    recovery_loss_imports: Vec<storage_sqlite::RecoveryLossImport>,
     signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
 }
 
@@ -1484,6 +1514,7 @@ impl MarmotApp {
             product_analytics,
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
         }
     }
 
@@ -1572,6 +1603,7 @@ impl MarmotApp {
             product_analytics,
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
         }
     }
 
@@ -1653,12 +1685,19 @@ impl MarmotApp {
         label: &str,
         relay_plane: &MarmotRelayPlane,
         lifecycle: runtime::RuntimeLifecycle,
+        startup_progress: Option<&AccountStartupProgress>,
     ) -> Result<AppClient, AppError> {
         // Deferred hydration (mdk#1161): the account worker drives the
         // background per-group hydration pipeline after signalling local
         // readiness, so runtime opens stay flat in stored-group count.
-        self.local_client_with_relay_plane_and_hydration(label, relay_plane, Some(lifecycle), true)
-            .await
+        self.local_client_with_relay_plane_and_hydration(
+            label,
+            relay_plane,
+            Some(lifecycle),
+            true,
+            startup_progress,
+        )
+        .await
     }
 
     async fn client_with_relay_plane(
@@ -1685,7 +1724,7 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: Option<runtime::RuntimeLifecycle>,
     ) -> Result<AppClient, AppError> {
-        self.local_client_with_relay_plane_and_hydration(label, relay_plane, lifecycle, false)
+        self.local_client_with_relay_plane_and_hydration(label, relay_plane, lifecycle, false, None)
             .await
     }
 
@@ -1695,7 +1734,11 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: Option<runtime::RuntimeLifecycle>,
         defer_group_hydration: bool,
+        startup_progress: Option<&AccountStartupProgress>,
     ) -> Result<AppClient, AppError> {
+        // Only a starting worker's ready-waiter reads the stage; other opens
+        // advance a cell nobody observes.
+        let startup_progress = startup_progress.cloned().unwrap_or_default();
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
@@ -1705,15 +1748,20 @@ impl MarmotApp {
             .as_ref()
             .map(runtime::RuntimeLifecycle::begin_account_open)
             .transpose()?;
+        startup_progress.enter(AccountStartupStage::OpenQueued);
+        let blocking_progress = startup_progress.clone();
         let open = blocking_app_task(move || {
             let _permit = permit;
+            blocking_progress.enter(AccountStartupStage::AccountState);
             app.ensure_account_state(&label)?;
+            blocking_progress.enter(AccountStartupStage::SessionOpen);
             let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
             #[cfg(test)]
             app.local_open_gates.wait(&label);
             open
         })
         .await?;
+        startup_progress.enter(AccountStartupStage::ClientRestore);
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
@@ -1744,28 +1792,32 @@ impl MarmotApp {
                 cap: EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
             }
         };
-        let mut recovery_owner = client::recovery::AccountRecoveryOwner::open(
+        let recovery_owner = client::recovery::AccountRecoveryOwner::open(
             &self.account_storage(&open.state.label)?,
             client::recovery::wall_now_ms()?,
             Instant::now(),
             recovery_policy,
         )?;
-        recovery_owner.select_executor_mode(self.config.recovery_executor_mode);
-        if relay_plane
+        let incremental_request = if relay_plane
             .subscription_rebuild_since(open.state.last_transport_timestamp)
             .is_none()
         {
-            self.account_storage(&open.state.label)?.request_recovery(
-                storage_sqlite::RecoveryRequest::IncrementalHistory,
-                client::recovery::wall_now_ms()?,
-            )?;
-        }
+            Some(
+                self.account_storage(&open.state.label)?
+                    .request_recovery_observed(
+                        storage_sqlite::RecoveryRequest::IncrementalHistory,
+                        client::recovery::wall_now_ms()?,
+                    )?,
+            )
+        } else {
+            None
+        };
+        let cursor_audit_placements = open.adapter.delivery_placement_counts();
+        let recovery_loss_imports = open.recovery_loss_imports;
         let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
         let mut client = AppClient {
             #[cfg(test)]
             test_recovery_selection_witness: None,
-            #[cfg(test)]
-            test_recovery_phase_witness: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
             audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
             #[cfg(test)]
@@ -1774,7 +1826,16 @@ impl MarmotApp {
             test_comparison_results: None,
             #[cfg(test)]
             test_comparison_delay: None,
+            #[cfg(test)]
+            test_comparison_saved_cursor: None,
             recovery_owner,
+            // Unit tests run many directly owned clients in one process; each
+            // gets its own pool so one test's held job cannot stall another.
+            #[cfg(not(test))]
+            recovery_credits:
+                crate::runtime::account_worker::recovery_credits::shared_recovery_credit_pool(),
+            #[cfg(test)]
+            recovery_credits: crate::runtime::account_worker::recovery_credits::private_recovery_credit_pool_for_test(),
             comparison_startup_requested: false,
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
@@ -1795,9 +1856,14 @@ impl MarmotApp {
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_recovery_status_updates: std::collections::HashSet::new(),
+            history_notice_baseline: None,
+            cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_failed_sync_summary: SyncSummary::default(),
+            explicit_history_window_certified: false,
+            recovery_job_network_cut: false,
+            recovery_job_admission_expired: false,
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
@@ -1809,6 +1875,10 @@ impl MarmotApp {
                 .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
             checkpointed_transport_timestamp,
+            #[cfg(test)]
+            cursor_seal_probe: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_ingest_of: None,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
             delivery_spill: Default::default(),
@@ -1831,6 +1901,16 @@ impl MarmotApp {
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
         };
+        // Loss the open imported, and the startup history request, become
+        // audit rows once the client that records them exists.
+        client.record_recovery_loss_imports(recovery_loss_imports);
+        if let Some((ticket, transition)) = incremental_request {
+            client.record_recovery_request(
+                storage_sqlite::RecoveryCause::IncrementalHistory,
+                ticket,
+                transition,
+            );
+        }
         // Initial access also restores durable backfill work, with or without
         // new releases, so open does not read the intent table twice.
         client.transport_receipts()?;
@@ -1854,6 +1934,8 @@ impl MarmotApp {
             client.reconcile_hydrated_account_state()?;
             client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
         }
+        // Hosts read the notice list after open; later changes raise an event.
+        client.take_history_notice_changes();
         Ok(client)
     }
 
@@ -1976,9 +2058,8 @@ impl MarmotApp {
     }
 
     /// Publish every generated-identity bootstrap record through one scoped
-    /// relay batch. The SDK connects the endpoint union once for the two relay
-    /// lists, empty follow list, and default profile, then returns one ordered
-    /// acknowledgement result per replaceable event.
+    /// operational relay batch. Once those records are acknowledged and cached,
+    /// copy the public relay lists and profile to indexers in a second batch.
     pub(crate) async fn publish_generated_account_bootstrap(
         &self,
         label: &str,
@@ -1992,15 +2073,20 @@ impl MarmotApp {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
-        // Relay-list records are discoverability maps and therefore go to the
-        // bootstrap route. Profiles and contact lists are outbox content: keep
-        // them on the declared write relays even though the mixed batch retains
-        // the union of both endpoint sets once.
+        // Relay lists and profile metadata are public directory records. Copy
+        // those to indexers without advertising indexers as write relays or
+        // routing the contact list and KeyPackage through them.
         let content_endpoints =
             self.outbox_endpoints(&account.account_id_hex, bootstrap.default_relays.clone());
         let endpoints = self.publish_route_including_requested(
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
+        );
+        let indexer_endpoints = self.public_indexer_publish_endpoints(
+            &bootstrap.indexer_relays,
+            &endpoints,
+            &endpoints,
+            &bootstrap.default_relays,
         );
 
         let mut requests = Vec::with_capacity(4);
@@ -2040,9 +2126,17 @@ impl MarmotApp {
             ),
             required_acks: 1,
         });
-
-        let relay_client =
-            self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer());
+        let nostr_signer = signer.as_nostr_signer();
+        if !indexer_endpoints.is_empty() {
+            for request in requests
+                .iter_mut()
+                .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
+            {
+                request.event =
+                    sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
+            }
+        }
+        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let record_kinds = [
             "NIP-65 relay list",
             "inbox relay list",
@@ -2053,18 +2147,18 @@ impl MarmotApp {
             .publish_events_for_account_with_timings(&account_id, &requests)
             .await;
         let outcomes = batch.outcomes;
-        if outcomes.len() != record_kinds.len() {
+        if outcomes.len() != requests.len() {
             return Err(AppError::Publish(format!(
                 "account bootstrap returned {} outcomes for {} records",
                 outcomes.len(),
-                record_kinds.len()
+                requests.len()
             )));
         }
-        if batch.request_durations.len() != record_kinds.len() {
+        if batch.request_durations.len() != requests.len() {
             return Err(AppError::Publish(format!(
                 "account bootstrap returned {} timings for {} records",
                 batch.request_durations.len(),
-                record_kinds.len()
+                requests.len()
             )));
         }
         let relay_and_follow_duration = batch.request_durations[..3]
@@ -2073,14 +2167,15 @@ impl MarmotApp {
             .max()
             .unwrap_or_default();
         let default_profile_duration = batch.request_durations[3];
-        for (record_kind, outcome) in record_kinds.into_iter().zip(outcomes) {
+        let mut outcomes = outcomes.into_iter();
+        for record_kind in record_kinds {
+            let outcome = outcomes.next().expect("checked bootstrap outcome count");
             if outcome?.accepted.is_empty() {
                 return Err(AppError::Publish(format!(
                     "relay acknowledged zero events for bootstrap record {record_kind}"
                 )));
             }
         }
-
         let relays = bootstrap
             .default_relays
             .iter()
@@ -2122,11 +2217,99 @@ impl MarmotApp {
             },
         )?;
         self.remember_directory_profile(&account.account_id_hex, profile)?;
+        let indexer_events = requests
+            .into_iter()
+            .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
+            .map(|request| request.event)
+            .collect();
         Ok(GeneratedAccountBootstrapPublication {
             status,
             relay_and_follow_duration,
             default_profile_duration,
+            indexer_copy: PublicIndexerCopy::new(
+                relay_client,
+                account_id,
+                indexer_events,
+                indexer_endpoints,
+            ),
         })
+    }
+
+    /// Rebuild replaceable public directory records after a confirmed setup
+    /// phase is resumed. This does not republish the operational bootstrap.
+    pub(crate) async fn prepare_generated_account_indexer_copy(
+        &self,
+        label: &str,
+        status: &AccountRelayListStatus,
+        profile: &UserProfileMetadata,
+        indexer_relays: &[TransportEndpoint],
+    ) -> Result<Option<PublicIndexerCopy>, AppError> {
+        let operational = status
+            .bootstrap_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let declared = status
+            .nip65
+            .relays
+            .iter()
+            .chain(&status.nip65.read_relays)
+            .chain(&status.nip65.write_relays)
+            .chain(&status.inbox.relays)
+            .chain(&status.default_relays)
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let indexers = self.public_indexer_publish_endpoints(
+            indexer_relays,
+            &operational,
+            &operational,
+            &declared,
+        );
+        if indexers.is_empty() {
+            return Ok(None);
+        }
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let nostr_signer = signer.as_nostr_signer();
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let mut events = Vec::with_capacity(3);
+        let nip65_event = NostrNip65RelayListPublication {
+            account_id: account_id.clone(),
+            relays: nip65_relay_set_from_state(&status.nip65),
+            publish_endpoints: operational.clone(),
+        }
+        .to_event()?;
+        events.push(sign_account_publication_event(nostr_signer.clone(), &nip65_event).await?);
+        let inbox_event = NostrAccountRelayListPublication {
+            account_id: account_id.clone(),
+            list_kind: NostrAccountRelayListKind::Inbox,
+            relays: status
+                .inbox
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            publish_endpoints: operational,
+        }
+        .to_event()?;
+        events.push(sign_account_publication_event(nostr_signer.clone(), &inbox_event).await?);
+        let profile_event = NostrTransportEvent::new_unsigned(
+            account.account_id_hex.clone(),
+            KIND_NOSTR_METADATA,
+            Vec::new(),
+            serde_json::to_string(&directory::records::profile_content_json(profile))?,
+        );
+        events.push(sign_account_publication_event(nostr_signer.clone(), &profile_event).await?);
+        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
+        Ok(PublicIndexerCopy::new(
+            relay_client,
+            account_id,
+            events,
+            indexers,
+        ))
     }
 
     pub async fn publish_missing_account_relay_lists(
@@ -2245,13 +2428,25 @@ impl MarmotApp {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_nip65_relays_with_indexers(label, relays, bootstrap_relays, Vec::new())
+            .await
+    }
+
+    pub async fn set_account_nip65_relays_with_indexers(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let current = self.account_relay_list_status(label)?.nip65;
         let relay_set = nip65_relay_set_preserving_roles(&current, relays);
-        self.publish_account_nip65_relay_set(
+        self.publish_account_nip65_relay_set_with_indexers(
             label,
             relay_set.read_relays,
             relay_set.write_relays,
             bootstrap_relays,
+            indexer_relays,
         )
         .await
     }
@@ -2265,13 +2460,32 @@ impl MarmotApp {
         write_relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.publish_account_nip65_relay_set_with_indexers(
+            label,
+            read_relays,
+            write_relays,
+            bootstrap_relays,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn publish_account_nip65_relay_set_with_indexers(
+        &self,
+        label: &str,
+        read_relays: Vec<TransportEndpoint>,
+        write_relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         let relay_set = NostrNip65RelaySet {
             read_relays: unique_transport_endpoints(read_relays),
             write_relays: unique_transport_endpoints(write_relays),
         };
         self.publish_selected_account_relay_lists_with_nip65(
             label,
-            AccountRelayListBootstrap::new(relay_set.write_relays.clone(), bootstrap_relays),
+            AccountRelayListBootstrap::new(relay_set.write_relays.clone(), bootstrap_relays)
+                .with_indexer_relays(indexer_relays),
             &[NostrAccountRelayListKind::Nip65],
             Some(&relay_set),
         )
@@ -2284,11 +2498,23 @@ impl MarmotApp {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_inbox_relays_with_indexers(label, relays, bootstrap_relays, Vec::new())
+            .await
+    }
+
+    pub async fn set_account_inbox_relays_with_indexers(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         self.set_account_relay_list_kind(
             label,
             NostrAccountRelayListKind::Inbox,
             relays,
             bootstrap_relays,
+            indexer_relays,
         )
         .await
     }
@@ -2299,10 +2525,12 @@ impl MarmotApp {
         list_kind: NostrAccountRelayListKind,
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
         self.publish_selected_account_relay_lists(
             label,
-            AccountRelayListBootstrap::new(relays, bootstrap_relays),
+            AccountRelayListBootstrap::new(relays, bootstrap_relays)
+                .with_indexer_relays(indexer_relays),
             &[list_kind],
         )
         .await
@@ -2349,12 +2577,28 @@ impl MarmotApp {
         // ever lands on the relays you were already on. Unioning means an
         // explicit republish reaches both your old relays (so they update) and
         // the newly-declared ones (so they learn about you for the first time).
-        let endpoints = self.publish_route_including_requested(
-            &account_id_hex,
-            publish_endpoints_from_bootstrap(&bootstrap),
+        let requested_endpoints = publish_endpoints_from_bootstrap(&bootstrap);
+        let endpoints =
+            self.publish_route_including_requested(&account_id_hex, requested_endpoints.clone());
+        let declared_relays = if let Some(relays) = nip65_relay_set {
+            bootstrap
+                .default_relays
+                .iter()
+                .chain(&relays.read_relays)
+                .chain(&relays.write_relays)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            bootstrap.default_relays.clone()
+        };
+        let indexer_endpoints = self.public_indexer_publish_endpoints(
+            &bootstrap.indexer_relays,
+            &endpoints,
+            &requested_endpoints,
+            &declared_relays,
         );
-        let relay_client =
-            self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
+        let nostr_signer = signer.as_nostr_signer();
+        let relay_client = self.relay_client_for_account_id(&account_id_hex, nostr_signer.clone());
         let mut requests = Vec::with_capacity(list_kinds.len());
         for list_kind in list_kinds {
             let event = if *list_kind == NostrAccountRelayListKind::Nip65
@@ -2381,10 +2625,23 @@ impl MarmotApp {
                 required_acks: 1,
             });
         }
-        for outcome in relay_client
+        if !indexer_endpoints.is_empty() {
+            for request in &mut requests {
+                request.event =
+                    sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
+            }
+        }
+        let outcomes = relay_client
             .publish_events_for_account(&account_id, &requests)
-            .await
-        {
+            .await;
+        if outcomes.len() != requests.len() {
+            return Err(AppError::Publish(
+                "relay-list publication returned incomplete outcomes".into(),
+            ));
+        }
+        let mut outcomes = outcomes.into_iter();
+        for _ in list_kinds {
+            let outcome = outcomes.next().expect("checked relay-list outcome count");
             if outcome?.accepted.is_empty() {
                 return Err(AppError::Publish(
                     "relay acknowledged zero account relay-list events".to_owned(),
@@ -2453,6 +2710,15 @@ impl MarmotApp {
         );
         status.refresh();
         self.remember_directory_relay_lists(&account_id_hex, &status)?;
+        let indexer_events = requests
+            .iter()
+            .map(|request| request.event.clone())
+            .collect::<Vec<_>>();
+        if let Some(copy) =
+            PublicIndexerCopy::new(relay_client, account_id, indexer_events, indexer_endpoints)
+        {
+            self.spawn_public_indexer_copy(copy);
+        }
         Ok(status)
     }
 
@@ -2535,6 +2801,95 @@ impl MarmotApp {
             }
         }
         endpoints
+    }
+
+    fn public_indexer_publish_endpoints(
+        &self,
+        indexer_relays: &[TransportEndpoint],
+        operational_relays: &[TransportEndpoint],
+        publication_relays: &[TransportEndpoint],
+        declared_relays: &[TransportEndpoint],
+    ) -> Vec<TransportEndpoint> {
+        // Development identities may intentionally use loopback relays. Keep
+        // their public discovery reads, but never export their records. A
+        // previous outbox can remain on the delivery route during a relay-list
+        // edit; only this publication's requested route and declaration decide
+        // whether the replacement record is public.
+        if publication_relays
+            .iter()
+            .chain(declared_relays)
+            .any(|endpoint| {
+                url::Url::parse(endpoint.as_str()).ok().is_some_and(|url| {
+                    url.host()
+                        .is_some_and(cgka_traits::app_components::is_loopback_host)
+                })
+            })
+        {
+            return Vec::new();
+        }
+        let operational = self.retain_safe_discovered_endpoints(
+            operational_relays.to_vec(),
+            "public directory operational route",
+        );
+        let mut indexers = self.retain_safe_discovered_endpoints(
+            indexer_relays.to_vec(),
+            "public directory publication",
+        );
+        indexers.retain(|endpoint| !operational.contains(endpoint));
+        indexers
+    }
+
+    pub(crate) fn spawn_public_indexer_copy(&self, copy: PublicIndexerCopy) {
+        let account_id_hex = hex::encode(copy.account_id.as_slice());
+        let mut tasks = self
+            .public_indexer_copy_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tasks.stopped
+            || self.storage_closed.load(Ordering::Acquire)
+            || self.account_home().account(&account_id_hex).is_err()
+        {
+            return;
+        }
+        let handles = tasks.by_account.entry(account_id_hex).or_default();
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(tokio::spawn(copy.run()));
+    }
+
+    pub(crate) fn abort_public_indexer_copies_for_account(
+        &self,
+        account_id_hex: &str,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let handles = self
+            .public_indexer_copy_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .by_account
+            .remove(account_id_hex)
+            .unwrap_or_default();
+        for handle in &handles {
+            handle.abort();
+        }
+        handles
+    }
+
+    pub(crate) fn abort_all_public_indexer_copies(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let handles = {
+            let mut tasks = self
+                .public_indexer_copy_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tasks.stopped = true;
+            tasks
+                .by_account
+                .drain()
+                .flat_map(|(_, handles)| handles)
+                .collect::<Vec<_>>()
+        };
+        for handle in &handles {
+            handle.abort();
+        }
+        handles
     }
 
     pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
@@ -2634,6 +2989,20 @@ impl MarmotApp {
         Ok(self
             .account_storage(label)?
             .message_edit_history(group, target, before, limit)?)
+    }
+
+    pub fn poll_votes(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        poll_event_id: &str,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<PollVotePage, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .poll_votes(group_id_hex, poll_event_id, after, limit)?)
     }
 
     pub fn timeline_message(
@@ -3731,7 +4100,7 @@ impl MarmotApp {
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;
         recovery_storage.restore_unacknowledged_recovery_loss()?;
-        recovery_storage.synchronize_account_delivery_loss(label)?;
+        let recovery_loss_imports = recovery_storage.synchronize_account_delivery_loss(label)?;
         let delivery_overflow_recovery = recovery_storage.account_delivery_recovery(label)?;
         let notification_loss = recovery_storage
             .pending_recovery_demands()?
@@ -3835,13 +4204,14 @@ impl MarmotApp {
         let recovery_storage = self.account_storage(label)?;
         let recovery_label = label.to_owned();
         let recovery_marker: relay_plane::AccountDeliveryRecoveryMarker =
-            Arc::new(move |marker_token, dropped| {
+            Arc::new(move |marker_token, dropped, earliest_created_at| {
                 recovery_storage
-                    .record_account_delivery_loss(
+                    .record_account_delivery_loss_bounded(
                         &recovery_label,
                         marker_token,
                         dropped,
                         unix_now_seconds(),
+                        earliest_created_at,
                     )
                     .map_err(|error| {
                         if error.is_closed() {
@@ -3873,6 +4243,9 @@ impl MarmotApp {
             Some(recovery_marker),
             Some(spill_store),
         );
+        // The router spills what a raised cursor alone stopped a restart from
+        // fetching again, measured from this persisted floor.
+        adapter.open_transport_cursor(state.last_transport_timestamp);
 
         let key_packages = AppKeyPackagePublisher {
             app: self.clone(),
@@ -3894,6 +4267,7 @@ impl MarmotApp {
             state,
             delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token,
+            recovery_loss_imports,
             signer: nostr_signer,
         })
     }
@@ -5087,10 +5461,22 @@ impl MarmotApp {
 
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
         self.ensure_account_state(label)?;
-        account_state_from_stored(
-            self.account_storage(label)?
-                .load_account_projection_state(label, MAX_SEEN_EVENT_IDS)?,
-        )
+        let storage = self.account_storage(label)?;
+        // A retained route stored before switch times were kept is anchored
+        // at the first load that finds it, persisted at once so the anchor
+        // stays fixed across later loads. Sessions before the upgrade already
+        // fetched its older traffic, and the comparison covers the rest of the
+        // retained window. A failed stamp leaves the route backfilled in full
+        // and is retried on the next load.
+        if let Err(error) = storage.stamp_unrecorded_prior_route_switches(unix_now_seconds()) {
+            tracing::warn!(
+                target: "marmot_app",
+                method = "load_state",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not record switch times for retained routes"
+            );
+        }
+        account_state_from_stored(storage.load_account_projection_state(label, MAX_SEEN_EVENT_IDS)?)
     }
 
     /// Persist the account snapshot. Concurrent runtimes (the main app and a
@@ -5436,6 +5822,7 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
+        let _ = self.abort_all_public_indexer_copies();
         self.presentation_signals.catalog_changed();
         let mut first_error = None;
         let mut closed = 0usize;
@@ -6186,6 +6573,7 @@ impl MarmotApp {
             .account_resets
             .send(label.to_owned());
         if let Ok(account) = self.account_home().account(label) {
+            let _ = self.abort_public_indexer_copies_for_account(&account.account_id_hex);
             self.account_publish_clients
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6540,22 +6928,33 @@ impl AppTransportRouting {
     }
 
     /// Atomically replace every current/prior subscription for one group.
-    /// Returns whether the desired route set differs from the installed set.
+    /// Returns whether the desired route set, or the route leading it,
+    /// differs from the installed one.
+    ///
+    /// The caller's order is kept: the current route leads and the retained
+    /// routes follow, which is how the transport adapter tells them apart, so
+    /// the current route resumes from the account cursor and each retained
+    /// route from its own floor.
     fn replace_group_routes(
         &self,
         group_id: &GroupId,
-        mut routes: Vec<TransportGroupSubscription>,
+        routes: Vec<TransportGroupSubscription>,
     ) -> bool {
         let mut state = self.write();
-        let mut existing = state
-            .group_routes
-            .iter()
-            .filter(|route| route.group_id == *group_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        normalize_group_subscriptions(&mut existing);
-        normalize_group_subscriptions(&mut routes);
-        if existing == routes {
+        let installed = ordered_group_subscriptions(
+            state
+                .group_routes
+                .iter()
+                .filter(|route| route.group_id == *group_id)
+                .cloned()
+                .collect(),
+        );
+        let routes = ordered_group_subscriptions(routes);
+        let mut installed_set = installed.clone();
+        let mut desired_set = routes.clone();
+        normalize_group_subscriptions(&mut installed_set);
+        normalize_group_subscriptions(&mut desired_set);
+        if installed_set == desired_set && installed.first() == routes.first() {
             return false;
         }
         state
@@ -6597,6 +6996,21 @@ fn normalize_group_subscriptions(routes: &mut Vec<TransportGroupSubscription>) {
             .then_with(|| left.endpoints.cmp(&right.endpoints))
     });
     routes.dedup();
+}
+
+/// Canonical endpoints per route and no repeated route, in the caller's order.
+fn ordered_group_subscriptions(
+    routes: Vec<TransportGroupSubscription>,
+) -> Vec<TransportGroupSubscription> {
+    let mut ordered = Vec::<TransportGroupSubscription>::with_capacity(routes.len());
+    for mut route in routes {
+        route.endpoints.sort();
+        route.endpoints.dedup();
+        if !ordered.contains(&route) {
+            ordered.push(route);
+        }
+    }
+    ordered
 }
 
 impl TransportRoutingPolicy for AppTransportRouting {
@@ -6846,6 +7260,15 @@ fn unix_now_seconds() -> u64 {
         .as_secs()
 }
 
+/// The relay `since` for group history anchored at `anchor_secs`, a Welcome's
+/// creation or a route switch: the anchor less
+/// [`HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`].
+pub(crate) fn history_floor(anchor_secs: u64) -> cgka_traits::transport::Timestamp {
+    cgka_traits::transport::Timestamp(
+        anchor_secs.saturating_sub(HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs()),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DirectoryFreshness {
     max_created_at: u64,
@@ -7004,6 +7427,77 @@ fn unique_transport_endpoints(
         }
     }
     unique
+}
+
+async fn sign_account_publication_event(
+    signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+    event: &NostrTransportEvent,
+) -> Result<NostrTransportEvent, AppError> {
+    transport_nostr_adapter::sign_transport_event_for_publish(signer, event)
+        .await
+        .map_err(|_| AppError::Publish("could not sign public directory event".into()))
+}
+
+async fn publish_public_indexer_copies(
+    relay_client: &dyn NostrRelayClient,
+    account_id: &MemberId,
+    events: &[NostrTransportEvent],
+    indexers: &[TransportEndpoint],
+) {
+    let mut requests = Vec::with_capacity(events.len() * indexers.len());
+    for indexer in indexers {
+        for event in events {
+            requests.push(NostrEventPublishRequest {
+                endpoints: vec![indexer.clone()],
+                event: event.clone(),
+                required_acks: 1,
+            });
+        }
+    }
+    if requests.is_empty() {
+        return;
+    }
+    let outcomes = relay_client
+        .publish_events_for_account(account_id, &requests)
+        .await;
+    if outcomes.len() != requests.len() {
+        tracing::warn!(
+            target: "marmot_app::directory",
+            method = "publish_public_indexer_copies",
+            expected = requests.len(),
+            actual = outcomes.len(),
+            "public directory indexer publication returned incomplete outcomes"
+        );
+    }
+    observe_public_indexer_outcomes(outcomes);
+}
+
+fn observe_public_indexer_outcomes(
+    outcomes: impl IntoIterator<
+        Item = Result<
+            transport_nostr_adapter::NostrPublishOutcome,
+            cgka_traits::TransportAdapterError,
+        >,
+    >,
+) {
+    let mut accepted = 0_usize;
+    let mut failed = 0_usize;
+    for outcome in outcomes {
+        if outcome.is_ok_and(|result| !result.accepted.is_empty()) {
+            accepted += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    if failed != 0 {
+        tracing::warn!(
+            target: "marmot_app::directory",
+            method = "observe_public_indexer_outcomes",
+            accepted,
+            failed,
+            "public directory indexer publication was incomplete"
+        );
+    }
 }
 
 fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterator<Item = String>) {

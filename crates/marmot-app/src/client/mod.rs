@@ -67,10 +67,12 @@ use crate::{
 };
 
 mod audit;
+mod audit_recovery;
 mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 mod delivery_spill;
 pub(crate) mod epoch_stall;
+pub(crate) mod history_notices;
 mod invite_recovery;
 mod projection;
 mod push;
@@ -82,17 +84,14 @@ mod sync;
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 #[cfg(test)]
-pub(crate) use sync::TestComparisonActivityWitness;
-#[cfg(all(test, feature = "test-policy-overrides"))]
-pub(crate) use sync::TestRecoveryPhase;
+pub(crate) use sync::ScriptedComparisons;
 #[cfg(test)]
-pub(crate) use sync::TestRecoveryPhaseWitness;
+pub(crate) use sync::TestComparisonActivityWitness;
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
-    ComparisonNetworkJob, ComparisonNetworkResult, ConvergenceScheduleState,
-    DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome, EpochGapQueueJob,
-    OnlineEpochGapRecovery, PendingRecoverySelection, RouteSubmission,
+    ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob, ConvergenceScheduleState,
+    EpochBackfillRunOutcome, PendingRecoverySelection, SyncMode,
 };
 
 #[cfg(test)]
@@ -180,6 +179,7 @@ pub(crate) struct EncryptedMediaUploadFinish {
     media_secret: SecretBytes,
     should_send: bool,
     caption: Option<String>,
+    message_tags: Vec<Vec<String>>,
 }
 
 pub(crate) struct EncryptedMediaDownloadHttp {
@@ -340,12 +340,21 @@ pub(crate) struct GroupRouteRefresh {
     pub(crate) state_pruned: bool,
 }
 
+/// Where [`AppClient::cursor_seal_probe`] runs relative to a seal.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorSeal {
+    Before,
+    After,
+}
+
+#[cfg(test)]
+pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
+
 pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
         Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
-    #[cfg(test)]
-    pub(crate) test_recovery_phase_witness: Option<TestRecoveryPhaseWitness>,
     pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
     pub(crate) audit_v5_peel_slot:
         Option<std::sync::Arc<std::sync::Mutex<audit_v5_probe::PeelSlot>>>,
@@ -354,11 +363,18 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_evidence: Option<recovery::TestRecoveryEvidence>,
     #[cfg(test)]
-    pub(super) test_comparison_results:
-        Option<std::collections::VecDeque<sync::TestComparisonResult>>,
+    pub(crate) test_comparison_results: Option<sync::ScriptedComparisons>,
     #[cfg(test)]
-    pub(super) test_comparison_delay: Option<std::time::Duration>,
+    pub(crate) test_comparison_delay: Option<std::time::Duration>,
+    /// A cursor a scripted comparison saves before its delay, as the adapter
+    /// does before each exact-ID fetch.
+    #[cfg(test)]
+    pub(crate) test_comparison_saved_cursor: Option<[u8; 32]>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
+    /// The process credits recovery jobs share. A managed worker installs
+    /// its runtime's pool; a directly owned client uses the process pool.
+    pub(crate) recovery_credits:
+        Arc<crate::runtime::account_worker::recovery_credits::RecoveryCreditPool>,
     pub(super) comparison_startup_requested: bool,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,
@@ -396,6 +412,14 @@ pub struct AppClient {
     pub(crate) pending_group_projection_updates: HashSet<String>,
     /// Recovery status has its own notification queue; saving a projection must not consume it.
     pub(crate) pending_recovery_status_updates: HashSet<GroupId>,
+    /// The parked recovery set as last announced to hosts ("history may be
+    /// incomplete"): one small entry per parked occurrence, compared at each
+    /// publication seam so a change raises `HistoryNoticesChanged`.
+    pub(crate) history_notice_baseline: Option<history_notices::HistoryNoticeBaseline>,
+    /// Account-queue placement counts at this client's previous
+    /// `transport_cursor_advanced` row (or its open), so each row reports
+    /// what changed since.
+    pub(crate) cursor_audit_placements: crate::relay_plane::AccountDeliveryPlacementCounts,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
@@ -414,6 +438,15 @@ pub struct AppClient {
     /// successful checkpoint. A reopened client recovers the same outputs from
     /// the durable engine outbox instead.
     pub(crate) pending_failed_sync_summary: crate::SyncSummary,
+    /// Whether the last settled job certified the retained window of every
+    /// explicit-history scope it compared. Explicit history reaches below
+    /// that window, so this never completes it; it names why it stays open.
+    pub(crate) explicit_history_window_certified: bool,
+    /// Whether the last in-place job's network cutoff skipped or timed out a
+    /// route. A pass that finished early and was admitted late was not cut.
+    pub(crate) recovery_job_network_cut: bool,
+    /// Whether the last in-place job's admission stopped at the whole budget.
+    pub(crate) recovery_job_admission_expired: bool,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
     ///
@@ -443,14 +476,27 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
-    /// Last transport cursor promoted by a completed drain checkpoint. Live
-    /// one-at-a-time worker ingests may advance `state` for diagnostics, but
-    /// they persist this older safe floor until a drain has observed any
-    /// process-local overflow fence/control record.
+    /// The transport cursor every save persists. `state` holds the ingested
+    /// maximum; this moves only through a seal under the router's placement
+    /// lock: at a drain checkpoint or settled loss, or with a live ingest's
+    /// own save once every subscription finished replaying stored history
+    /// and the account has a settled cursor floor.
+    /// The seal never passes a delivery that is queued, or taken and not yet
+    /// durably ingested, when a restart would then no longer fetch it, and
+    /// the router spills an arrival that falls below the floor it raised:
+    /// during the commit's save, and after a live one.
     pub(crate) checkpointed_transport_timestamp: Option<u64>,
+    /// Runs at every transport-cursor seal, before and after, so a test can
+    /// land a delivery on either side of the decision.
+    #[cfg(test)]
+    pub(crate) cursor_seal_probe: std::sync::Mutex<Option<CursorSealProbe>>,
+    /// Fail the next ingest of this event before the engine sees it, as a
+    /// storage or engine error would.
+    #[cfg(test)]
+    pub(crate) fail_ingest_of: Option<cgka_traits::MessageId>,
     /// Durable account-wide marker set when the bounded relay-plane queue
-    /// omits a delivery. While true, every subscription rebuild is unfloored
-    /// and EOSE-gated recovery must complete before the cursor is trusted.
+    /// omits a delivery. While true, the comparison job must settle that loss
+    /// before the cursor is trusted.
     pub(crate) delivery_overflow_recovery_pending: bool,
     pub(crate) delivery_overflow_recovery_marker_token: Option<u64>,
     /// Durable overflow rows awaiting admission through the live ingest path.
@@ -492,8 +538,8 @@ pub struct AppClient {
     /// retirement, for the retry path its callers depend on.
     #[cfg(test)]
     pub(crate) fail_next_terminal_recovery_retire: bool,
-    /// Temporary full-history subscriptions installed only while a post-join
-    /// maintenance obligation is waiting for its first relay EOSE.
+    /// Temporary history subscriptions, floored at each copy's Welcome, installed
+    /// only while a post-join maintenance obligation waits for its first relay EOSE.
     pub(crate) post_join_maintenance_subscriptions:
         HashMap<GroupId, (String, cgka_traits::TransportGroupSubscription)>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
@@ -743,6 +789,32 @@ fn record_app_performance(
     }
 }
 
+/// Admit only ids in the application range, and only payloads small enough
+/// to ride in every later commit and Welcome.
+///
+/// The range test is deliberately not "any private-use id the registry has
+/// not taken yet": the registry allocates upward from 0x8001, so such an id
+/// can be assigned later, which would both break the app's own writes and
+/// start applying protocol format validation to bytes already committed in
+/// live groups.
+fn validate_app_component(component_id: u16, data: &[u8]) -> Result<(), AppError> {
+    use cgka_traits::app_components::{
+        APP_COMPONENT_DATA_MAX_LEN, APP_OWNED_APP_COMPONENT_ID_START,
+    };
+    if component_id < APP_OWNED_APP_COMPONENT_ID_START {
+        return Err(AppError::InvalidAppComponent(format!(
+            "component id {component_id:#06x} is protocol space; applications allocate at or above {APP_OWNED_APP_COMPONENT_ID_START:#06x}"
+        )));
+    }
+    if data.len() > APP_COMPONENT_DATA_MAX_LEN {
+        return Err(AppError::InvalidAppComponent(format!(
+            "component data is {} bytes, over the {APP_COMPONENT_DATA_MAX_LEN}-byte maximum",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
 impl AppClient {
     /// Persist the exact first KeyPackage and signed publication artifact
     /// without activating transport or contacting a relay.
@@ -775,7 +847,10 @@ impl AppClient {
             .ensure_local_account_relay_lists(&self.state.label)
             .await?;
         self.refresh_routing()?;
-        self.runtime.activate_transport(None).await?;
+        // Floored at the rebuild cursor like every other activation, and reused
+        // when it matches the live one. An unfloored activation would replay
+        // every held event on every route and leave a lag's loss unbounded.
+        self.prepare_transport().await?;
         self.publish_key_package_from_lifecycle().await
     }
 
@@ -1074,9 +1149,11 @@ impl AppClient {
                 .unwrap_or(false)
     }
 
-    /// Install, poll, and retire temporary post-join full-history
-    /// subscriptions. A restart reconstructs this ephemeral map from durable
-    /// CatchUp obligations; the EOSE deadline itself remains persisted.
+    /// Request, poll, and retire temporary post-join full-history
+    /// subscriptions. The recovery job installs a requested one under its
+    /// grant; this pass observes its first boundary. A restart reconstructs
+    /// this ephemeral map from durable CatchUp obligations; the EOSE deadline
+    /// itself remains persisted.
     pub(crate) async fn advance_post_join_maintenance_subscriptions(
         &mut self,
     ) -> Result<(), AppError> {
@@ -1133,7 +1210,6 @@ impl AppClient {
             })
             .collect::<Result<Vec<_>, _>>()?;
         storage.retain_recovery_maintenance_jobs(&active_jobs)?;
-        let mut requested = false;
         let mut waiting = HashSet::new();
 
         for group in self.state.groups.clone() {
@@ -1149,8 +1225,15 @@ impl AppClient {
                     continue;
                 }
             };
-            let status = match self.runtime.maintenance_status(&group_id) {
-                Ok(status) => status,
+            // Only the group's obligations: the full status also decodes every
+            // transport fanout in the account, which made this loop quadratic
+            // in the number of groups (mdk#2110).
+            let obligations = match self
+                .runtime
+                .session()
+                .maintenance_obligations_for_group(&group_id)
+            {
+                Ok(obligations) => obligations,
                 Err(_error) => {
                     tracing::warn!(
                         target: "marmot_app::maintenance",
@@ -1161,7 +1244,7 @@ impl AppClient {
                     continue;
                 }
             };
-            let prerequisite = status.obligations.iter().find(|obligation| {
+            let prerequisite = obligations.iter().find(|obligation| {
                 obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
                     && matches!(
                         obligation.phase,
@@ -1208,7 +1291,6 @@ impl AppClient {
                     unix_now_seconds().saturating_mul(1000),
                 )?;
                 storage.restore_recovery_maintenance_session(ticket)?;
-                requested = true;
             }
             self.observe_post_join_recovery_boundary(&group_id).await?;
         }
@@ -1242,21 +1324,6 @@ impl AppClient {
                 .maintenance_observations
                 .remove(&group_id);
         }
-        if requested
-            && let Some(grant) = self.authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )?
-        {
-            match self.execute_recovery_grant(grant, None, None).await {
-                Ok(summary) => self.pending_applied_sync_summary.merge(summary),
-                Err(failure) => {
-                    self.pending_applied_sync_summary
-                        .merge(failure.partial_summary);
-                    return Err(failure.source);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -1282,7 +1349,8 @@ impl AppClient {
             .ensure_local_account_relay_lists(&self.state.label)
             .await?;
         self.refresh_routing()?;
-        self.runtime.activate_transport(None).await?;
+        // Floored like publish_key_package's activation; never a full replay.
+        self.prepare_transport().await?;
         // SQLCipher lifecycle state is authoritative. On first rollout the
         // publisher imports only the legacy JSON `d` slot, then performs the
         // recorded upgrade replacement under that same slot.
@@ -3430,6 +3498,69 @@ impl AppClient {
         Ok(send_summary_from_effects(&effects))
     }
 
+    /// Read opaque application-owned group state. Absent and empty differ.
+    pub fn group_app_component(
+        &self,
+        group_id: &GroupId,
+        component_id: u16,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        validate_app_component(component_id, &[])?;
+        self.ensure_group(group_id)?;
+        Ok(self.runtime.app_component(group_id, component_id)?)
+    }
+
+    /// Replace optional application-owned state through an admin MLS commit.
+    pub async fn update_app_component(
+        &mut self,
+        group_id: &GroupId,
+        component_id: u16,
+        data: Vec<u8>,
+    ) -> Result<SendSummary, AppError> {
+        validate_app_component(component_id, &data)?;
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        // `required_capabilities` is read out of the MLS GroupContext, not
+        // from local config, so any admin in the group can mark an
+        // application component required — including a peer on another
+        // implementation. No MDK binding produces that state, which is why
+        // the sync above matters: the requirement can arrive from the network
+        // between two local calls.
+        if self
+            .runtime
+            .group_record(group_id)?
+            .required_capabilities
+            .app_components
+            .contains(component_id)
+        {
+            return Err(AppError::InvalidAppComponent(
+                "component is required by the group".into(),
+            ));
+        }
+        let audit_context = Self::local_human_action_context(
+            "update_app_component",
+            vec!["app_component"],
+            vec![component_id],
+            None,
+        );
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![AppComponentData { component_id, data }],
+                },
+                audit_context.clone(),
+            )
+            .await?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.queue_own_group_system_projection_updates(&effects);
+        Ok(send_summary_from_effects(&effects))
+    }
+
     pub async fn update_message_retention(
         &mut self,
         group_id: &GroupId,
@@ -3692,7 +3823,9 @@ impl AppClient {
             AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
                 (Family::MessageAction, "custom")
             }
-            AppMessageIntent::Chat { .. } => (Family::MessageAction, "text"),
+            AppMessageIntent::Chat { .. } | AppMessageIntent::TaggedChat { .. } => {
+                (Family::MessageAction, "text")
+            }
             AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
             AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
             AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
@@ -4349,8 +4482,15 @@ impl AppClient {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
-        self.react_to_message_with_local_projection(group_id, target_message_id, emoji, |_| {})
-            .await
+        self.react_to_message_with_local_projection(
+            group_id,
+            target_message_id,
+            emoji,
+            Vec::new(),
+            Vec::new(),
+            |_| {},
+        )
+        .await
     }
 
     pub(crate) async fn react_to_message_with_local_projection<F>(
@@ -4358,6 +4498,8 @@ impl AppClient {
         group_id: &GroupId,
         target_message_id: &str,
         emoji: &str,
+        tags: Vec<Vec<String>>,
+        attachments: Vec<MediaAttachmentReference>,
         on_local_projection: F,
     ) -> Result<SendSummary, AppError>
     where
@@ -4365,6 +4507,10 @@ impl AppClient {
     {
         self.ensure_group_application_messages_allowed(group_id)?;
         crate::messages::validate_reaction_content(emoji)?;
+        if !attachments.is_empty() {
+            self.sync_runtime_groups().await?;
+            self.validate_draft_media_references(group_id, &attachments)?;
+        }
         let sender = self
             .app
             .account_home()
@@ -4377,6 +4523,8 @@ impl AppClient {
                     Self::message_human_action_context(&AppMessageIntent::Reaction {
                         target_message_id: target_message_id.to_owned(),
                         emoji: emoji.to_owned(),
+                        tags: Vec::new(),
+                        attachments: Vec::new(),
                     })
                 {
                     self.record_human_action_noop_succeeded(
@@ -4405,6 +4553,8 @@ impl AppClient {
                 AppMessageIntent::Reaction {
                     target_message_id: target_message_id.to_owned(),
                     emoji: emoji.to_owned(),
+                    tags,
+                    attachments,
                 },
                 on_local_projection,
             )
@@ -4588,6 +4738,7 @@ impl AppClient {
             self.validate_draft_media_references(group, &attachments)?;
             (
                 AppMessageIntent::Media {
+                    message_tags: Vec::new(),
                     attachments,
                     caption: Some(draft.content),
                 },
@@ -4649,6 +4800,19 @@ impl AppClient {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
+        self.send_tagged_media(group_id, attachments, caption, Vec::new())
+            .await
+    }
+
+    /// Send already-uploaded attachments as one kind-9 chat that also carries
+    /// application tags, such as NIP-30 `emoji` tags naming those attachments.
+    pub async fn send_tagged_media(
+        &mut self,
+        group_id: &GroupId,
+        attachments: Vec<MediaAttachmentReference>,
+        caption: Option<String>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         self.validate_draft_media_references(group_id, &attachments)?;
@@ -4656,6 +4820,7 @@ impl AppClient {
             .send_app_event(
                 group_id,
                 AppMessageIntent::Media {
+                    message_tags,
                     attachments,
                     caption,
                 },
@@ -4751,6 +4916,8 @@ impl AppClient {
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
+        crate::messages::validate_message_tags(&request.message_tags)?;
+        let message_tags = request.message_tags.clone();
         let should_send = request.send;
         let caption = request.caption.clone();
         Ok((
@@ -4771,6 +4938,7 @@ impl AppClient {
                 media_secret,
                 should_send,
                 caption,
+                message_tags,
             },
         ))
     }
@@ -4789,7 +4957,12 @@ impl AppClient {
             .map(|attachment| attachment.reference.clone())
             .collect();
         let summary = self
-            .send_media_attachments(&finish.group_id, attachments, finish.caption)
+            .send_tagged_media(
+                &finish.group_id,
+                attachments,
+                finish.caption,
+                finish.message_tags,
+            )
             .await?;
         // The post-publish projection now durably references this source
         // epoch. Persist again so a prior final-reference retirement cannot
@@ -6673,6 +6846,54 @@ mod post_canonical_create_tests {
         });
 
         assert_eq!(collect_bounded_ordered(work, 2).await, Err("first"));
+    }
+}
+
+#[cfg(test)]
+mod app_component_gate_tests {
+    use super::validate_app_component;
+    use crate::AppError;
+    use cgka_traits::app_components::{
+        APP_COMPONENT_DATA_MAX_LEN, APP_OWNED_APP_COMPONENT_ID_START,
+        MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID, PROTOCOL_OWNED_APP_COMPONENT_IDS,
+    };
+
+    fn rejected(component_id: u16, data: &[u8]) -> bool {
+        matches!(
+            validate_app_component(component_id, data),
+            Err(AppError::InvalidAppComponent(_))
+        )
+    }
+
+    #[test]
+    fn only_the_application_range_is_writable() {
+        for id in PROTOCOL_OWNED_APP_COMPONENT_IDS
+            .iter()
+            .copied()
+            .chain([0, 1, 2, 0x7fff, 0x8000])
+        {
+            assert!(rejected(id, &[]), "{id:#06x} must be refused");
+        }
+        for id in [APP_OWNED_APP_COMPONENT_ID_START, 0xf301, 0xffff] {
+            assert!(validate_app_component(id, &[1, 2, 3]).is_ok());
+        }
+    }
+
+    #[test]
+    fn registry_draft_and_unassigned_protocol_ids_are_refused() {
+        // 0x800a is assigned to marmot.authorization.multi-device-join.v1 and
+        // 0x800d is the registry's next id. Both were writable while the gate
+        // admitted "private-use minus today's protocol list".
+        assert!(rejected(MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID, &[]));
+        assert!(rejected(0x800a, &[]));
+        assert!(rejected(0x800d, &[]));
+    }
+
+    #[test]
+    fn payload_length_is_bounded() {
+        let id = APP_OWNED_APP_COMPONENT_ID_START;
+        assert!(validate_app_component(id, &vec![0u8; APP_COMPONENT_DATA_MAX_LEN]).is_ok());
+        assert!(rejected(id, &vec![0u8; APP_COMPONENT_DATA_MAX_LEN + 1]));
     }
 }
 

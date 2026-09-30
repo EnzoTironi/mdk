@@ -46,11 +46,18 @@ impl std::fmt::Display for AccountCatchUpFailure {
 }
 
 /// Why an explicit repair stopped without qualified history completion.
-/// These bounded codes contain no relay, account or event identities.
+/// These bounded codes contain no relay, account or event identities. The
+/// comparison job reports `CoverageUnproven`, `BelowRetentionWindow`,
+/// `Cancelled` and `Deadline`; the drain-era codes remain so existing matches
+/// keep compiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FullHistoryRepairIncompleteReason {
     #[error("full_history_coverage_unproven")]
     CoverageUnproven,
+    /// Every route's retained-inventory window certified, but the repair's
+    /// goal reaches below that window, which no comparison searched.
+    #[error("full_history_below_retention_window")]
+    BelowRetentionWindow,
     #[error("full_history_repair_cancelled")]
     Cancelled,
     #[error("full_history_repair_deadline")]
@@ -73,6 +80,7 @@ impl FullHistoryRepairIncompleteReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CoverageUnproven => "full_history_coverage_unproven",
+            Self::BelowRetentionWindow => "full_history_below_retention_window",
             Self::Cancelled => "full_history_repair_cancelled",
             Self::Deadline => "full_history_repair_deadline",
             Self::DeliveryLoss => "account_delivery_queue_overflow",
@@ -224,6 +232,8 @@ pub enum AppError {
     InvalidDirectorySearch(String),
     #[error("invalid group profile: {0}")]
     InvalidGroupProfile(String),
+    #[error("invalid app component: {0}")]
+    InvalidAppComponent(String),
     #[error("invalid Nostr routing component: {0}")]
     InvalidNostrRouting(String),
     #[error("invalid group avatar URL: {0}")]
@@ -456,6 +466,7 @@ impl AppError {
             Self::MissingDirectoryEntry(_) => "missing_directory_entry",
             Self::InvalidDirectorySearch(_) => "invalid_directory_search",
             Self::InvalidGroupProfile(_) => "invalid_group_profile",
+            Self::InvalidAppComponent(_) => "invalid_app_component",
             Self::InvalidNostrRouting(_) => "invalid_nostr_routing",
             Self::InvalidGroupAvatarUrl(_) => "invalid_group_avatar_url",
             Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
@@ -540,6 +551,7 @@ impl AppError {
             Self::Json(_)
             | Self::Hex(_)
             | Self::InvalidAppMessagePayload(_)
+            | Self::InvalidAppComponent(_)
             | Self::InvalidNostrRouting(_)
             | Self::InvalidKeyPackageEvent(_) => SyncErrorClass::Protocol,
             _ => SyncErrorClass::Unknown,
@@ -753,6 +765,7 @@ mod tests {
             (Reason::NoRelayEose, SyncErrorClass::Timeout),
             (Reason::EoseTimeout, SyncErrorClass::Timeout),
             (Reason::CoverageUnproven, SyncErrorClass::Unknown),
+            (Reason::BelowRetentionWindow, SyncErrorClass::Unknown),
         ] {
             for delivery_loss_pending in [false, true] {
                 let error = AppError::FullHistoryRepairIncomplete {
@@ -778,6 +791,7 @@ mod tests {
         use super::FullHistoryRepairIncompleteReason as Reason;
         for reason in [
             Reason::CoverageUnproven,
+            Reason::BelowRetentionWindow,
             Reason::Cancelled,
             Reason::Deadline,
             Reason::DeliveryLoss,

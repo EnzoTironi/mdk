@@ -13,6 +13,12 @@ const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
 pub(crate) const DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT: &str =
     "https://ranking.vertexlab.io/search/pubkeys";
 pub(crate) const DEFAULT_OPEN_RANKING_PROFILE_RELAY: &str = "wss://relay.vertexlab.io";
+/// The relays White Noise operates. Recovery requires only these to certify
+/// a route's history; any other relay on the route is best effort.
+pub const DEFAULT_RECOVERY_OPERATED_RELAYS: &[&str] = &[
+    "wss://relay.eu.whitenoise.chat",
+    "wss://relay.us.whitenoise.chat",
+];
 
 /// Policy for advancing the account's durable transport cursor
 /// (`last_transport_timestamp`) from ingested deliveries.
@@ -78,20 +84,8 @@ impl Default for AttachmentAcquisitionPolicy {
     }
 }
 
-/// Same-schema recovery rollback. Both modes share the durable owner, retry
-/// reservation and completion rules. Changing mode requires a new account client.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RecoveryExecutorMode {
-    #[default]
-    Normal,
-    /// Select one obligation per broad acquisition grant. The executor,
-    /// comparison, account pacing and qualified completion rules are unchanged.
-    Conservative,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
-    pub recovery_executor_mode: RecoveryExecutorMode,
     /// Optional public client label for newly prepared KeyPackage events.
     /// None leaves publications untagged; signed retries retain their original tags.
     pub key_package_client_name: Option<String>,
@@ -112,6 +106,11 @@ pub struct MarmotAppConfig {
     /// delivery. Empty preserves the historical behavior of falling back to
     /// the operational relay set.
     pub directory_relay_urls: Vec<String>,
+    /// Relays this deployment operates. A route's history certifies once its
+    /// operated relays finish an untruncated comparison; every other relay on
+    /// the route is best effort and never blocks completion. A route with no
+    /// operated relay requires all of its relays.
+    pub recovery_operated_relays: Vec<String>,
     pub service_endpoints: MarmotServiceEndpoints,
     /// Durable transport-cursor persistence policy. Defaults to
     /// [`CursorPersistence::Advance`]; wake-collection runtimes (NSE,
@@ -178,19 +177,8 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this proves a canonical
     /// invite still returns success and attempts Welcome fanout.
     pub dev_fail_invite_local_refresh: bool,
-    /// Dev/test-only override for how long the epoch-gap backfill drain waits
-    /// in silence for end-of-stored-events before reporting an incomplete
-    /// replay ([`crate::EPOCH_BACKFILL_EOSE_WAIT`]). Honored only with
-    /// `test-policy-overrides`; this keeps the give-up path testable without
-    /// spending the production budget in wall-clock.
-    pub dev_epoch_backfill_eose_wait_ms: Option<u64>,
-    /// Dev/test-only override for the maximum wall-clock quantum spent in one
-    /// epoch-gap backfill drain. Honored only with `test-policy-overrides`;
-    /// this keeps worker-yield behavior testable without spending the
-    /// production quantum in wall-clock.
-    pub dev_epoch_backfill_execution_quantum_ms: Option<u64>,
-    /// Dev/test-only override for the base interval an unconfirmed epoch-gap
-    /// backfill waits before an automatic seam may retry it
+    /// Dev/test-only override for the base interval a recovery attempt waits
+    /// before an automatic seam may start another
     /// ([`crate::EPOCH_BACKFILL_RETRY_BACKOFF`]). Honored only with
     /// `test-policy-overrides`; this lets a test exercise both sides of the
     /// cooldown without spending it in wall-clock.
@@ -276,13 +264,16 @@ pub struct MarmotServiceEndpoints {
 impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
-            recovery_executor_mode: RecoveryExecutorMode::Normal,
             key_package_client_name: None,
             attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
             attachment_acquisition_mode: AttachmentAcquisitionMode::default(),
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             directory_relay_urls: Vec::new(),
+            recovery_operated_relays: DEFAULT_RECOVERY_OPERATED_RELAYS
+                .iter()
+                .map(|relay| (*relay).to_owned())
+                .collect(),
             service_endpoints: MarmotServiceEndpoints::compiled(),
             cursor_persistence: CursorPersistence::Advance,
             allow_loopback_blob_endpoints: false,
@@ -295,8 +286,6 @@ impl Default for MarmotAppConfig {
             dev_fail_invite_welcome_intent: false,
             dev_fail_create_local_projection: false,
             dev_fail_invite_local_refresh: false,
-            dev_epoch_backfill_eose_wait_ms: None,
-            dev_epoch_backfill_execution_quantum_ms: None,
             dev_epoch_backfill_retry_backoff_ms: None,
             dev_epoch_stall_wedge_rearm_interval_ms: None,
             dev_fail_sync_before_delivery: None,
@@ -329,6 +318,11 @@ impl MarmotAppConfig {
     /// Configure relays used only for Nostr directory and KeyPackage reads.
     pub fn with_directory_relay_urls(mut self, relay_urls: Vec<String>) -> Self {
         self.directory_relay_urls = relay_urls;
+        self
+    }
+
+    pub fn with_recovery_operated_relays(mut self, relay_urls: Vec<String>) -> Self {
+        self.recovery_operated_relays = relay_urls;
         self
     }
 
@@ -439,21 +433,6 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_fail_invite_local_refresh(mut self, enabled: bool) -> Self {
         self.dev_fail_invite_local_refresh = enabled;
-        self
-    }
-
-    /// Give the epoch-gap backfill drain `ms` of silence to reach
-    /// end-of-stored-events in test-policy builds. Normal builds ignore this
-    /// field.
-    pub fn with_dev_epoch_backfill_eose_wait_ms(mut self, ms: u64) -> Self {
-        self.dev_epoch_backfill_eose_wait_ms = Some(ms);
-        self
-    }
-
-    /// Limit one epoch-gap backfill drain to `ms` in test-policy builds.
-    /// Normal builds ignore this field.
-    pub fn with_dev_epoch_backfill_execution_quantum_ms(mut self, ms: u64) -> Self {
-        self.dev_epoch_backfill_execution_quantum_ms = Some(ms);
         self
     }
 

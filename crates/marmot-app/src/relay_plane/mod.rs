@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{
-    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,9 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use cgka_traits::transport::Timestamp;
 use cgka_traits::{
-    MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportEndpoint, TransportGroupSubscription, TransportGroupSync,
-    TransportPublishReport, TransportPublishRequest,
+    MemberId, MessageId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
+    TransportDelivery, TransportDeliveryPlane, TransportEndpoint, TransportGroupSubscription,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
 use futures::{Stream, StreamExt};
 use nostr_sdk::NotificationUpdate;
@@ -26,10 +26,11 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrAcquisitionCancellation, NostrAcquisitionError,
-    NostrAcquisitionRequest, NostrAcquisitionResult, NostrPublishOutcome, NostrReconciliationItem,
-    NostrReconciliationSummary, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
-    RelayRegistrationOutcome, SubscriptionAttempt,
+    NostrAcquisitionRequest, NostrAcquisitionResult, NostrNotificationLossFloor,
+    NostrPublishOutcome, NostrReconciliationItem, NostrReconciliationSummary, NostrRelayClient,
+    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter,
+    NotificationLagMark, RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome,
+    SubscriptionAttempt,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -55,7 +56,7 @@ pub(crate) use directory::{
     DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
     DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
 };
-pub(crate) use safety::RelaySafetyPolicy;
+pub(crate) use safety::{RelaySafetyPolicy, recovery_required_endpoints, same_relay};
 pub(crate) use telemetry::rollup_from_snapshots;
 
 // Re-exported so the in-tree `tests` module (which uses `super::*`) keeps
@@ -80,27 +81,24 @@ const RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME: Duration = Duration::from_secs
 /// backlog counts as receiver loss. A catch-up rebuild replays every stored
 /// event inside the lookback window as a raw relay copy, plus a deduplicated
 /// delivery for events the SDK client has not seen, so ordinary catch-ups
-/// queue far more than a few hundred. Loss closes the account delivery route
-/// and sends the account worker through reconnect, so match the pinned SDK
+/// queue far more than a few hundred. Loss keeps the account route open but
+/// costs a comparison recovery pass, because the SDK client has already marked
+/// the lost events seen and will not deliver them again. Match the pinned SDK
 /// client's per-receiver notification buffer, which bounded the inline
 /// consumer this queue replaced.
 const RELAY_NOTIFICATION_EVENT_QUEUE_CAPACITY: usize = 4096;
+/// How long a relay notification receiver must run without another lag
+/// before the REQs whose end-of-stored-events a lag may have lost are
+/// re-issued. A re-issue restarts the relay's replay of that REQ, so it waits
+/// out the burst that caused the lag. Under sustained overload lags recur
+/// within seconds, and re-issuing at each one would keep restarting replays
+/// that are still arriving. Waiting costs little: until the repair, the next
+/// activation re-subscribes, as it did before the repair existed.
+const NOTIFICATION_LAG_EOSE_REPAIR_SETTLE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct MarmotRelayPlane {
     inner: Arc<MarmotRelayPlaneInner>,
-}
-
-#[cfg(test)]
-/// Holds only this plane's router; drop always resumes it, including on a
-/// fixture panic. Production routing has no pause path.
-pub(crate) struct RouterPauseForTest(MarmotRelayPlane);
-
-#[cfg(test)]
-impl Drop for RouterPauseForTest {
-    fn drop(&mut self) {
-        self.0.spawn_router();
-    }
 }
 
 struct MarmotRelayPlaneInner {
@@ -127,7 +125,62 @@ struct RelayPlaneTransport {
     account_notification_forwarders: Mutex<HashMap<MemberId, JoinHandle<()>>>,
     directory_notification_forwarder: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder_health: Arc<RelayNotificationForwarderHealth>,
+    /// Lag-lost EOSE repairs waiting for their receiver to settle, one per
+    /// receiver scope: an account, or `None` for a receiver shared across
+    /// accounts. A later lag in the same scope postpones the repair.
+    eose_repairs: std::sync::Mutex<HashMap<Option<MemberId>, EoseRepairSchedule>>,
+    /// [`NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`] in milliseconds; tests shorten
+    /// it.
+    eose_repair_settle_ms: AtomicU64,
+    /// Finished lag-lost EOSE repairs waiting for an account worker to record
+    /// them, oldest first, bounded by [`EOSE_REPAIR_REPORTS_MAX`]. The
+    /// repair only pushes; recording happens on the worker, so it never
+    /// waits on audit.
+    eose_repair_reports: std::sync::Mutex<EoseRepairReports>,
     shutting_down: AtomicBool,
+}
+
+/// At most this many unrecorded repair reports are kept; older ones are
+/// dropped and counted.
+const EOSE_REPAIR_REPORTS_MAX: usize = 64;
+
+#[derive(Default)]
+struct EoseRepairReports {
+    pending: std::collections::VecDeque<EoseRepairReport>,
+    /// Evicted reports whose receiver had no later pending report to carry
+    /// the count. A scalar, so the accounting stays bounded with the queue.
+    dropped_unattributed: u64,
+}
+
+/// One finished lag-lost EOSE repair pass, for its audit row.
+#[derive(Clone, Debug)]
+pub(crate) struct EoseRepairReport {
+    /// The lagging receiver's account, or `None` for a receiver shared
+    /// across accounts.
+    pub(crate) scope: Option<MemberId>,
+    /// Whether this pass followed an earlier one that left relays
+    /// unrepaired, rather than a lag directly.
+    pub(crate) follow_up: bool,
+    /// Lags folded into this pass while its receiver settled.
+    pub(crate) lags: u64,
+    pub(crate) summary: transport_nostr_adapter::EoseReissueSummary,
+    /// Whether a follow-up repair was scheduled for the failed relays.
+    pub(crate) follow_up_scheduled: bool,
+    /// Earlier reports for this scope dropped at the queue bound, carried
+    /// forward onto this one when they were evicted.
+    pub(crate) dropped_before: u64,
+}
+
+/// A lag-lost EOSE repair waiting for its receiver to settle.
+struct EoseRepairSchedule {
+    /// When the repair may run, unless a later lag postpones it.
+    due: tokio::time::Instant,
+    /// The latest lag: only REQs issued by then are re-issued.
+    lag: NotificationLagMark,
+    /// Audit only: lags folded into this schedule, and whether it retries an
+    /// earlier pass's unrepaired relays.
+    lags: u64,
+    follow_up: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +222,8 @@ pub struct MarmotRelayPlaneAccountAdapter {
     publish_client: Arc<dyn NostrRelayClient>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<AccountDeliveryEvent>>>,
     delivery_overflow: Arc<AccountDeliveryOverflowState>,
+    /// The queue generation `delivery_rx` belongs to.
+    delivery_epoch: u64,
     incremental_activation: Arc<Mutex<Option<IncrementalActivation>>>,
 }
 
@@ -176,12 +231,21 @@ pub struct MarmotRelayPlaneAccountAdapter {
 struct AccountDeliveryRoute {
     sender: mpsc::Sender<AccountDeliveryEvent>,
     overflow: Arc<AccountDeliveryOverflowState>,
+    /// The queue generation `sender` feeds.
+    epoch: u64,
     recovery_marker: Option<AccountDeliveryRecoveryMarker>,
     spill: Option<Arc<delivery_spill::AccountDeliverySpill>>,
 }
 
-pub(crate) type AccountDeliveryRecoveryMarker =
-    Arc<dyn Fn(u64, u64) -> Result<(), AccountDeliveryRecoveryMarkerError> + Send + Sync + 'static>;
+/// Persists a queue-loss generation: its marker token, dropped count and the
+/// earliest wire `created_at` among the dropped deliveries (`None` if any is
+/// unknown).
+pub(crate) type AccountDeliveryRecoveryMarker = Arc<
+    dyn Fn(u64, u64, Option<u64>) -> Result<(), AccountDeliveryRecoveryMarkerError>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountDeliveryRecoveryMarkerError {
@@ -203,10 +267,25 @@ pub(crate) struct AccountDeliveryOverflow {
     pub(crate) generation: u64,
     pub(crate) marker_token: u64,
     pub(crate) dropped: u64,
+    /// Earliest wire `created_at` among this generation's dropped
+    /// deliveries, or `None` when any of them is unknown.
+    pub(crate) earliest_dropped: Option<u64>,
     pub(crate) notification_losses: u64,
     pub(crate) notification_token: u64,
+    /// Lowest REQ `since` floor among this generation's notification lags, or
+    /// `None` when any lag's floor is unknown.
+    pub(crate) notification_floor: Option<u64>,
     pub(crate) queue_depth: usize,
     pub(crate) elapsed_ms: u64,
+}
+
+/// Cumulative placements one account queue made, as counts only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccountDeliveryPlacementCounts {
+    pub(crate) spilled_below_floor: u64,
+    pub(crate) spilled_queue_full: u64,
+    pub(crate) spill_already_seen: u64,
+    pub(crate) queue_dropped: u64,
 }
 
 #[derive(Debug)]
@@ -257,6 +336,99 @@ struct AccountDeliveryOverflowInner {
     /// A spill writer recorded loss after its route was retired, so no queue
     /// has carried its signal yet.
     retired_loss_unsignalled: bool,
+    /// Running minimum of the dropped deliveries' wire `created_at`, and
+    /// whether any dropped delivery's time was unknown.
+    earliest_dropped: Option<u64>,
+    earliest_dropped_unknown: bool,
+    /// Running minimum of the notification lags' REQ floors, and whether any
+    /// lag's floor was unknown.
+    notification_floor: Option<u64>,
+    notification_floor_unknown: bool,
+    /// What the account queue holds, and the restart floors a cursor commit
+    /// must keep over it.
+    admission: AccountDeliveryAdmission,
+}
+
+/// The account queue as a restart would see it, and the restart floors a
+/// transport-cursor commit guards. It sits under the overflow lock, which the
+/// router holds while it places each delivery, so every commit's decision is
+/// ordered against every placement: a delivery queued first caps the commit,
+/// and one placed later sees the floor the commit raised.
+///
+/// Every value is a restart `since`: the group-route `since` a restart builds
+/// from a cursor, which is the cursor minus the rebuild lookback. A delivery's
+/// key is the lowest such `since` that still fetches it again: its
+/// `created_at`, or for the inbox its `created_at` plus the NIP-59 widening
+/// the inbox REQ adds.
+#[derive(Debug, Default)]
+struct AccountDeliveryAdmission {
+    /// The queue generation `queued` describes. A replaced route's queue
+    /// dies with its receiver.
+    epoch: u64,
+    /// Keys of the deliveries in the account queue, and of those its
+    /// consumer took but has not yet ingested durably, with their counts.
+    queued: BTreeMap<u64, u32>,
+    /// The key in `queued` each taken delivery holds until its consumer
+    /// releases it, by event. A delivery whose ingest failed is never
+    /// released, so its key keeps capping commits for the rest of the queue
+    /// generation, unless a redelivery of the same event is released.
+    taken: HashMap<MessageId, u64>,
+    /// The persisted cursor's restart `since`. Every seal raises it before
+    /// its commit saves, so it covers a cursor still being written too.
+    durable_since: Option<u64>,
+    /// The part of `durable_since` that drain checkpoints, settled loss and
+    /// the cursor the account opened with made durable, which is where a
+    /// design without live promotion would have it. A delivery keyed between
+    /// the two is one that only a live promotion, or a commit still saving,
+    /// stopped a restart from fetching, so the router spills it instead of
+    /// queueing it. `None` until the account's first settled cursor: before
+    /// any cursor a restart relied on its comparison, not the cursor, for
+    /// everything, so while this is `None` every delivery below
+    /// `durable_since` is spilled.
+    settled_since: Option<u64>,
+}
+
+impl AccountDeliveryAdmission {
+    /// One delivery keyed `key` no longer caps a commit.
+    fn remove_queued(&mut self, key: u64) {
+        if let std::collections::btree_map::Entry::Occupied(mut count) = self.queued.entry(key) {
+            if *count.get() > 1 {
+                *count.get_mut() -= 1;
+            } else {
+                count.remove();
+            }
+        }
+    }
+}
+
+/// Where the router puts one delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountDeliveryPlacement {
+    Queue,
+    /// The durable spill. The cursor fence already counts it.
+    Spill,
+    /// Queue loss, because no spill can take it.
+    Omit,
+}
+
+/// The lowest restart `since` that fetches `delivery` again.
+fn account_delivery_restart_key(delivery: &TransportDelivery) -> u64 {
+    let created_at = delivery.message.timestamp.0;
+    if delivery.source.plane == TransportDeliveryPlane::AccountInbox {
+        created_at.saturating_add(transport_nostr_adapter::NIP59_TIMESTAMP_TWEAK_SECS)
+    } else {
+        created_at
+    }
+}
+
+/// What one omission charges to the current loss generation.
+#[derive(Clone, Copy, Debug)]
+enum AccountDeliveryLossCharge {
+    /// A delivery the queue omitted, with its wire `created_at` if known.
+    Drop { created_at: Option<u64> },
+    /// A consumer lag, bounded by the REQ floors that could have delivered
+    /// the lost notifications.
+    Notification { floor: NostrNotificationLossFloor },
 }
 
 #[derive(Default)]
@@ -265,6 +437,11 @@ struct AccountDeliveryMetrics {
     dropped: AtomicU64,
     spilled: AtomicU64,
     spill_already_seen: AtomicU64,
+    /// Deliveries `place` sent to the spill because a cursor commit had
+    /// raised the restart floor past them, and because the queue was full.
+    /// Counted at placement; `spilled` counts what the writer stored.
+    spill_diverted_below_floor: AtomicU64,
+    spill_diverted_queue_full: AtomicU64,
     recovery_attempts: AtomicU64,
     recovery_successes: AtomicU64,
     recovery_failures: AtomicU64,
@@ -320,9 +497,181 @@ impl AccountDeliveryOverflowState {
             .fetch_max(depth, Ordering::Relaxed);
     }
 
-    fn begin_spill(&self) {
+    /// Decide where one delivery goes, under the lock every cursor commit
+    /// decides under. A full queue, or a key below the durable floor and not
+    /// below the settled one, sends it to the spill, or to loss when there is
+    /// none. Before the first settled cursor every key below the durable
+    /// floor goes there. A spilled delivery is counted in the cursor fence
+    /// here, before the hand-off holds it, so no commit can pass it while it
+    /// is in neither place.
+    fn place(
+        &self,
+        epoch: u64,
+        key: u64,
+        queue_full: bool,
+        spill: bool,
+    ) -> AccountDeliveryPlacement {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        state.spill_in_flight = state.spill_in_flight.saturating_add(1);
+        let admission = &mut state.admission;
+        let below_durable_floor = admission.durable_since.is_some_and(|durable| {
+            key < durable && admission.settled_since.is_none_or(|settled| settled <= key)
+        });
+        if !queue_full && !below_durable_floor {
+            if admission.epoch == epoch {
+                *admission.queued.entry(key).or_default() += 1;
+            }
+            return AccountDeliveryPlacement::Queue;
+        }
+        if spill {
+            state.spill_in_flight = state.spill_in_flight.saturating_add(1);
+            RelayNotificationForwarderHealth::increment(
+                if queue_full {
+                    &self.metrics.spill_diverted_queue_full
+                } else {
+                    &self.metrics.spill_diverted_below_floor
+                },
+                1,
+            );
+            AccountDeliveryPlacement::Spill
+        } else {
+            AccountDeliveryPlacement::Omit
+        }
+    }
+
+    /// A delivery `place` queued never reached the queue: its send failed.
+    fn unqueue(&self, epoch: u64, key: u64) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        if admission.epoch == epoch {
+            admission.remove_queued(key);
+        }
+    }
+
+    /// The consumer took a queued delivery. It keeps its key, so it caps
+    /// every commit until the consumer releases it: until then its ingest may
+    /// still fail, and a restart must fetch it again. An event holds one key
+    /// at a time, so a redelivery of one whose ingest failed takes over the
+    /// pin that failure left.
+    fn take(&self, epoch: u64, key: u64, id: &MessageId) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        if admission.epoch != epoch {
+            return;
+        }
+        let spare = match admission.taken.get_mut(id) {
+            Some(held) => {
+                let spare = (*held).max(key);
+                *held = (*held).min(key);
+                spare
+            }
+            None => {
+                admission.taken.insert(id.clone(), key);
+                return;
+            }
+        };
+        admission.remove_queued(spare);
+    }
+
+    /// A taken delivery's ingest is durable, or its consumer dropped it on
+    /// purpose, so it no longer caps a commit.
+    fn release(&self, epoch: u64, id: &MessageId) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        if admission.epoch != epoch {
+            return;
+        }
+        if let Some(key) = admission.taken.remove(id) {
+            admission.remove_queued(key);
+        }
+    }
+
+    /// Start the generation of a new route's queue. The previous queue died
+    /// with its receiver, and nothing in it can be taken any more. Its
+    /// deliveries, and those its consumer took and never released, went with
+    /// it: the new route's subscriptions start from a cursor no commit moved
+    /// past them, so they fetch them again.
+    fn open_queue(&self) -> u64 {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        admission.epoch = admission.epoch.wrapping_add(1);
+        admission.queued.clear();
+        admission.taken.clear();
+        admission.epoch
+    }
+
+    /// How far a commit may promote the cursor, decided under the placement
+    /// lock: `candidate`, capped at the lowest key the persisted cursor still
+    /// covers of a delivery queued or taken and not yet released, plus the
+    /// lookback. `None` while loss or a spill hand-off is pending, and for a
+    /// replaced adapter, whose queue is not the one tracked here. The restart
+    /// floor rises here, before the commit's save starts, so any delivery
+    /// placed while that save runs and falls below it goes to the spill. A
+    /// settled commit moves the settled floor up once its save succeeds; a
+    /// live one leaves it, so its spilling continues.
+    fn seal_cursor(
+        &self,
+        epoch: u64,
+        lookback: Option<u64>,
+        candidate: Option<u64>,
+    ) -> Option<u64> {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if state.pending || state.spill_in_flight > 0 || state.admission.epoch != epoch {
+            return None;
+        }
+        let candidate = candidate?;
+        let Some(lookback) = lookback else {
+            // A full-history plane rebuilds unfloored, so no cursor can hide
+            // a delivery from a restart.
+            return Some(candidate);
+        };
+        let admission = &mut state.admission;
+        let covered = admission.durable_since.unwrap_or(0);
+        let cap = admission
+            .queued
+            .range(covered..)
+            .next()
+            .map(|(key, _)| key.saturating_add(lookback));
+        let reached = cap.map_or(candidate, |cap| candidate.min(cap));
+        let since = reached.saturating_sub(lookback);
+        admission.durable_since = Some(admission.durable_since.map_or(since, |d| d.max(since)));
+        Some(reached)
+    }
+
+    /// A commit's save failed, so `restored` is still the persisted cursor:
+    /// lower the restart floor its seal raised back to it. The router queues
+    /// what that floor covers again, and the next seal is capped by it.
+    /// Deliveries spilled meanwhile stay in the spill.
+    fn unseal_cursor(&self, lookback: Option<u64>, restored: Option<u64>) {
+        let Some(lookback) = lookback else {
+            return;
+        };
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        admission.durable_since = restored
+            .map(|restored| restored.saturating_sub(lookback))
+            .max(admission.settled_since);
+    }
+
+    /// Record a cursor that is durable without live promotion: one a settled
+    /// commit reached on its own, never one an earlier live promotion left
+    /// persisted, so the settled floor stays at or below where a design
+    /// without live promotion would have it. `opened` is the cursor the
+    /// account opened with: it seeds the settled floor only when this process
+    /// has none, because a reopened client inherits whatever live promotion an
+    /// earlier one made.
+    fn settle_cursor(&self, lookback: Option<u64>, reached: Option<u64>, opened: bool) {
+        let (Some(lookback), Some(reached)) = (lookback, reached) else {
+            return;
+        };
+        let since = reached.saturating_sub(lookback);
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let admission = &mut state.admission;
+        admission.durable_since = Some(admission.durable_since.map_or(since, |d| d.max(since)));
+        admission.settled_since = match admission.settled_since {
+            Some(settled) if opened => Some(settled),
+            Some(settled) => Some(settled.max(since)),
+            None => Some(since),
+        };
     }
 
     fn finish_spill(&self, settled: u64, stored: u64, already_seen: u64) {
@@ -334,15 +683,17 @@ impl AccountDeliveryOverflowState {
 
     /// Record an omitted delivery and return the generation only when this
     /// caller must enqueue the generation's control record.
-    fn record_drop(&self, queue_depth: usize) -> Option<u64> {
-        self.record_loss(queue_depth, false)
+    fn record_drop(&self, queue_depth: usize, created_at: Option<u64>) -> Option<u64> {
+        self.record_loss(queue_depth, AccountDeliveryLossCharge::Drop { created_at })
     }
 
-    fn record_notification_loss(&self) -> Option<u64> {
-        self.record_loss(0, true)
+    /// Record a consumer lag with the REQ floor read at the lag, returning the
+    /// generation only when this caller must enqueue its control record.
+    fn record_notification_loss(&self, floor: NostrNotificationLossFloor) -> Option<u64> {
+        self.record_loss(0, AccountDeliveryLossCharge::Notification { floor })
     }
 
-    fn record_loss(&self, queue_depth: usize, notification: bool) -> Option<u64> {
+    fn record_loss(&self, queue_depth: usize, charge: AccountDeliveryLossCharge) -> Option<u64> {
         let mut state = self
             .inner
             .lock()
@@ -351,22 +702,41 @@ impl AccountDeliveryOverflowState {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
             state.dropped = 0;
-            state.notification_losses = 0;
-            state.notification_token = 0;
-            state.notification_imported = 0;
+            state.earliest_dropped = None;
+            state.earliest_dropped_unknown = false;
+            Self::reset_notification_loss(&mut state);
             state.started_at = Some(Instant::now());
             state.marker_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
             state.marker_in_progress = false;
             state.marker_durable = false;
             state.marker_closed = false;
         }
-        if notification {
-            state.notification_losses = state.notification_losses.saturating_add(1);
-            state.notification_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
-        } else {
-            state.dropped = state.dropped.saturating_add(1);
-            state.marker_durable = false;
-            RelayNotificationForwarderHealth::increment(&self.metrics.dropped, 1);
+        match charge {
+            AccountDeliveryLossCharge::Notification { floor } => {
+                state.notification_losses = state.notification_losses.saturating_add(1);
+                // Each lag mints a token, so a changed floor always imports as
+                // new loss and bumps the obligation's revision.
+                state.notification_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
+                match floor.since_seconds() {
+                    Some(since) => {
+                        state.notification_floor =
+                            Some(state.notification_floor.map_or(since, |f| f.min(since)))
+                    }
+                    None => state.notification_floor_unknown = true,
+                }
+            }
+            AccountDeliveryLossCharge::Drop { created_at } => {
+                state.dropped = state.dropped.saturating_add(1);
+                match created_at {
+                    Some(at) => {
+                        state.earliest_dropped =
+                            Some(state.earliest_dropped.map_or(at, |e| e.min(at)))
+                    }
+                    None => state.earliest_dropped_unknown = true,
+                }
+                state.marker_durable = false;
+                RelayNotificationForwarderHealth::increment(&self.metrics.dropped, 1);
+            }
         }
         state.queue_depth = state.queue_depth.max(queue_depth);
         self.observe_queue_depth(queue_depth);
@@ -378,16 +748,46 @@ impl AccountDeliveryOverflowState {
         }
     }
 
-    fn record_retired_drop(&self) {
-        self.record_drop(0);
+    /// A new generation starts with no notification loss.
+    fn reset_notification_loss(state: &mut AccountDeliveryOverflowInner) {
+        state.notification_losses = 0;
+        state.notification_token = 0;
+        state.notification_imported = 0;
+        state.notification_floor = None;
+        state.notification_floor_unknown = false;
+    }
+
+    fn record_retired_drop(&self, created_at: Option<u64>) {
+        self.record_drop(0, created_at);
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retired_loss_unsignalled = true;
     }
 
+    /// A control record queued on a route whose receiver is gone died with
+    /// that queue, yet `signal_queued` still claims it, so `finish_recovery`
+    /// could never clear the generation. Mark the signal unsent, as for loss a
+    /// retired writer recorded while no route existed, so that the next route
+    /// carries it. A deferred signal counts too: its marker writer holds the
+    /// dead queue's sender. This assumes one live adapter per account, as the
+    /// worker drops its client before it reopens.
+    fn release_signal_of_closed_route(&self, sender: &mpsc::Sender<AccountDeliveryEvent>) {
+        if !sender.is_closed() {
+            return;
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.pending && state.signal_queued {
+            state.retired_loss_unsignalled = true;
+        }
+    }
+
     /// Claim the signal for loss a retired writer recorded while no route
-    /// existed. Any other pending loss already had its route.
+    /// existed, or whose control record died with a replaced route's queue.
+    /// Any other pending loss already had its route.
     fn claim_retired_loss_signal(&self) -> Option<u64> {
         let mut state = self
             .inner
@@ -474,15 +874,22 @@ impl AccountDeliveryOverflowState {
             state.generation
         };
         loop {
-            let (marker_token, dropped) = {
+            let (marker_token, dropped, earliest) = {
                 let state = self
                     .inner
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                (state.marker_token, state.dropped)
+                (
+                    state.marker_token,
+                    state.dropped,
+                    state
+                        .earliest_dropped
+                        .filter(|_| !state.earliest_dropped_unknown),
+                )
             };
             let marker = marker.clone();
-            match tokio::task::spawn_blocking(move || marker(marker_token, dropped)).await {
+            match tokio::task::spawn_blocking(move || marker(marker_token, dropped, earliest)).await
+            {
                 Ok(Ok(())) => {
                     let mut state = self
                         .inner
@@ -577,6 +984,10 @@ impl AccountDeliveryOverflowState {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
             state.dropped = 0;
+            state.earliest_dropped = None;
+            state.earliest_dropped_unknown = false;
+            // The resolved generation's lags must not charge this one's floor.
+            Self::reset_notification_loss(&mut state);
             state.queue_depth = 0;
             state.started_at = Some(Instant::now());
             // This path exists only because the durable database marker was
@@ -601,9 +1012,9 @@ impl AccountDeliveryOverflowState {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
             state.dropped = 0;
-            state.notification_losses = 0;
-            state.notification_token = 0;
-            state.notification_imported = 0;
+            state.earliest_dropped = None;
+            state.earliest_dropped_unknown = false;
+            Self::reset_notification_loss(&mut state);
             state.queue_depth = 0;
             state.started_at = Some(Instant::now());
             state.marker_token = durable_marker_token;
@@ -613,21 +1024,28 @@ impl AccountDeliveryOverflowState {
         }
     }
 
+    /// Whether `observed` is still exactly the pending generation, with every
+    /// omission it counts durable and imported and no control record queued,
+    /// so the account owner may settle it.
+    fn settles(state: &AccountDeliveryOverflowInner, observed: &AccountDeliveryOverflow) -> bool {
+        state.pending
+            && state.generation == observed.generation
+            && state.marker_token == observed.marker_token
+            && state.dropped == observed.dropped
+            && state.notification_losses == observed.notification_losses
+            && state.notification_imported == state.notification_losses
+            && (state.dropped == 0 || state.marker_durable)
+            && !state.marker_in_progress
+            && !state.marker_closed
+            && !state.signal_queued
+    }
+
     fn finish_recovery(&self, attempt: AccountDeliveryOverflow) -> Option<u64> {
         let mut state = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let resolved = state.pending
-            && state.generation == attempt.generation
-            && state.marker_token == attempt.marker_token
-            && state.dropped == attempt.dropped
-            && state.notification_losses == attempt.notification_losses
-            && state.notification_imported == state.notification_losses
-            && (state.dropped == 0 || state.marker_durable)
-            && !state.marker_in_progress
-            && !state.marker_closed
-            && !state.signal_queued;
+        let resolved = Self::settles(&state, &attempt);
         if resolved {
             state.pending = false;
             state.recovery_in_progress = false;
@@ -643,6 +1061,37 @@ impl AccountDeliveryOverflowState {
             return Some(elapsed_ms);
         }
         None
+    }
+
+    /// Clear the generation the account owner retired as "history may be
+    /// incomplete", under the same exact-generation guard as `finish_recovery`.
+    /// It is not a recovery success: no success is counted, and an attempt
+    /// still in flight records its own failure when it ends. Returns true when
+    /// no generation is pending any more.
+    fn retire_recovery(&self, observed: Option<AccountDeliveryOverflow>) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.pending {
+            return true;
+        }
+        if !observed.is_some_and(|observed| Self::settles(&state, &observed)) {
+            return false;
+        }
+        state.pending = false;
+        state.marker_durable = false;
+        state.marker_closed = false;
+        state.started_at = None;
+        true
+    }
+
+    fn pending_generation(&self) -> Option<AccountDeliveryOverflow> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending.then(|| Self::snapshot(&state))
     }
 
     fn record_recovery_success(&self, elapsed_ms: u64) {
@@ -678,8 +1127,14 @@ impl AccountDeliveryOverflowState {
             generation: state.generation,
             marker_token: state.marker_token,
             dropped: state.dropped,
+            earliest_dropped: state
+                .earliest_dropped
+                .filter(|_| !state.earliest_dropped_unknown),
             notification_losses: state.notification_losses,
             notification_token: state.notification_token,
+            notification_floor: state
+                .notification_floor
+                .filter(|_| !state.notification_floor_unknown),
             queue_depth: state.queue_depth,
             elapsed_ms: state
                 .started_at
@@ -704,8 +1159,16 @@ pub struct RelayPlaneHealth {
     pub connection_attempts: usize,
     pub connection_successes: usize,
     pub notification_forwarder_running: bool,
+    /// Relay notification consumers restarted after a lag or an unexpected
+    /// exit. A lag resumes the same SDK receiver and leaves account delivery
+    /// open; an unexpected exit replaces the receiver and closes account
+    /// delivery, so the account worker reconnects.
     pub notification_forwarder_restarts: u64,
+    /// Consumer lags, each recorded as notification loss on the affected
+    /// accounts and recovered by comparison.
     pub notification_forwarder_lag_incidents: u64,
+    /// Notifications those lags skipped or abandoned. A count of
+    /// notifications, including raw relay copies, not of lost events.
     pub notification_forwarder_lagged_notifications: u64,
     pub notification_forwarder_panics: u64,
     pub notification_forwarder_unexpected_exits: u64,
@@ -715,12 +1178,14 @@ pub struct RelayPlaneHealth {
     /// High-water queue depth for any account since this plane started.
     #[serde(default)]
     pub account_delivery_max_queue_depth: u64,
-    /// Deliveries omitted from full per-account queues and covered by an
-    /// explicit recovery generation.
+    /// Deliveries neither queued nor spilled, and covered by an explicit
+    /// recovery generation instead.
     #[serde(default)]
     pub account_delivery_dropped: u64,
-    /// Deliveries a full queue stored in the durable account spill instead of
-    /// omitting.
+    /// Deliveries stored in the durable account spill instead of the queue:
+    /// because it was full, or because a transport-cursor checkpoint still
+    /// saving, or a live promotion alone, had put them below the floor a
+    /// restart fetches from.
     #[serde(default)]
     pub account_delivery_spilled: u64,
     /// Spill candidates discarded because the account had already seen them.
@@ -852,6 +1317,11 @@ impl MarmotRelayPlane {
             account_notification_forwarders: Mutex::new(HashMap::new()),
             directory_notification_forwarder: Mutex::new(None),
             notification_forwarder_health: Arc::new(RelayNotificationForwarderHealth::default()),
+            eose_repairs: std::sync::Mutex::new(HashMap::new()),
+            eose_repair_settle_ms: AtomicU64::new(
+                NOTIFICATION_LAG_EOSE_REPAIR_SETTLE.as_millis() as u64
+            ),
+            eose_repair_reports: std::sync::Mutex::new(EoseRepairReports::default()),
             shutting_down: AtomicBool::new(false),
         });
         let this = Self {
@@ -910,11 +1380,15 @@ impl MarmotRelayPlane {
                 })
             })
             .clone();
-        routes.insert(
+        // The route lock orders the new generation against the router, which
+        // reads a route's generation with the route itself.
+        let delivery_epoch = delivery_overflow.open_queue();
+        let replaced = routes.insert(
             account_id.clone(),
             AccountDeliveryRoute {
                 sender: delivery_tx,
                 overflow: delivery_overflow.clone(),
+                epoch: delivery_epoch,
                 spill: spill_store.map(|store| {
                     delivery_spill::AccountDeliverySpill::new(
                         store,
@@ -927,8 +1401,12 @@ impl MarmotRelayPlane {
                 recovery_marker,
             },
         );
+        if let Some(replaced) = replaced {
+            delivery_overflow.release_signal_of_closed_route(&replaced.sender);
+        }
         // Loss a retired writer recorded while no route existed has not been
-        // signalled to any consumer. The route lock orders this against that
+        // signalled to any consumer, nor has a record that died with the
+        // replaced route's queue. The route lock orders this against that
         // writer's own check for a route.
         if let Some(generation) = delivery_overflow.claim_retired_loss_signal() {
             enqueue_account_delivery_overflow_signal(&signal_tx, &delivery_overflow, generation);
@@ -940,23 +1418,16 @@ impl MarmotRelayPlane {
             publish_client,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             delivery_overflow,
+            delivery_epoch,
             incremental_activation: Arc::new(Mutex::new(None)),
         }
     }
 
-    #[cfg(all(test, feature = "test-policy-overrides"))]
-    pub(crate) async fn inject_delivery_for_test(&self, delivery: TransportDelivery) -> bool {
-        let sender = account_deliveries_read(&self.inner.transport.account_deliveries)
-            .get(&delivery.account_id)
-            .cloned();
-        match sender {
-            Some(route) => route
-                .sender
-                .send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
-                .await
-                .is_ok(),
-            None => false,
-        }
+    /// Place one delivery exactly as the router does, synchronously, so a
+    /// test can land it at a chosen point inside a cursor commit.
+    #[cfg(test)]
+    pub(crate) fn route_account_delivery_for_test(&self, delivery: TransportDelivery) {
+        route_account_delivery(&self.inner.transport, delivery);
     }
 
     pub(crate) fn sanitize_relay_endpoints(
@@ -1044,6 +1515,39 @@ impl MarmotRelayPlane {
             .map(|lookback| lookback.as_secs())
     }
 
+    /// Take the finished lag-lost EOSE repair reports this account records:
+    /// its own receiver's, and, when `shared` is set, those of a receiver
+    /// shared across accounts, which the first account to take them records
+    /// once. An account with no v5 recorder takes only its own, so it never
+    /// consumes a shared report another account could record.
+    pub(crate) fn take_eose_repair_reports(
+        &self,
+        account: &MemberId,
+        shared: bool,
+    ) -> Vec<EoseRepairReport> {
+        let mut reports = self
+            .inner
+            .transport
+            .eose_repair_reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reports.pending.is_empty() {
+            return Vec::new();
+        }
+        let mut taken = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+        for report in std::mem::take(&mut reports.pending) {
+            let own = report.scope.as_ref() == Some(account);
+            if own || (shared && report.scope.is_none()) {
+                taken.push(report);
+            } else {
+                kept.push_back(report);
+            }
+        }
+        reports.pending = kept;
+        taken
+    }
+
     /// Drain the per-relay subscription-registration outcomes `account`
     /// accumulated since its previous drain, for its `subscription_rebuild`
     /// forensic audit row.
@@ -1095,6 +1599,7 @@ impl MarmotRelayPlane {
                     recover_relay_notification_forwarder_scoped(
                         &self.inner.transport,
                         RelayNotificationConsumerExit::Closed,
+                        NostrNotificationLossFloor::Unbounded,
                         Some(account_id),
                     );
                 }
@@ -1144,7 +1649,15 @@ impl MarmotRelayPlane {
         &self,
         account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
-        account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
+        let removed =
+            account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
+        if let Some(removed) = removed {
+            // Once the worker has stopped, its queue is gone, and so is any
+            // control record in it.
+            removed
+                .overflow
+                .release_signal_of_closed_route(&removed.sender);
+        }
         self.inner
             .transport
             .adapter
@@ -1568,16 +2081,6 @@ impl MarmotRelayPlane {
             .store(0, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
-    pub(crate) async fn pause_router_for_test(&self) -> RouterPauseForTest {
-        let handle = self.inner.transport.router.lock().await.take();
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await;
-        }
-        RouterPauseForTest(self.clone())
-    }
-
     fn spawn_router(&self) {
         if self.inner.transport.shutting_down.load(Ordering::SeqCst) {
             return;
@@ -1647,59 +2150,7 @@ impl MarmotRelayPlane {
         let adapter = transport.adapter.clone();
         let handle = handle.spawn(async move {
             while let Ok(Some(delivery)) = adapter.receive().await {
-                let sender = account_deliveries_read(&transport.account_deliveries)
-                    .get(&delivery.account_id)
-                    .cloned();
-                if let Some(route) = sender {
-                    // Fan out without awaiting the per-account queue: a single
-                    // account whose receiver has stalled (full buffer) must not
-                    // block this shared router and back-pressure delivery for
-                    // every other account (and, upstream, the relay notification
-                    // pipeline). A full queue hands the delivery to the account's
-                    // durable spill. Only when that is full too does the delivery
-                    // join an explicit loss generation, using the one channel slot
-                    // reserved for its control record.
-                    let queue_depth = route
-                        .sender
-                        .max_capacity()
-                        .saturating_sub(route.sender.capacity());
-                    route.overflow.observe_queue_depth(queue_depth);
-                    if route.sender.capacity() <= 1 {
-                        let spilled = route
-                            .spill
-                            .as_ref()
-                            .is_some_and(|spill| spill.offer(delivery));
-                        if !spilled {
-                            omit_account_delivery(&route);
-                        }
-                        continue;
-                    }
-                    match route
-                        .sender
-                        .try_send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
-                    {
-                        Ok(()) => {
-                            let queue_depth = route
-                                .sender
-                                .max_capacity()
-                                .saturating_sub(route.sender.capacity());
-                            route.overflow.observe_queue_depth(queue_depth);
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // Only this router writes the route, and it reserves
-                            // one control slot above, so reaching Full here
-                            // indicates a violated queue invariant rather than
-                            // ordinary backpressure.
-                            tracing::warn!(
-                                target: "marmot_app::relay_plane",
-                                method = "spawn_router",
-                                error_kind = "reserved_overflow_slot_unavailable",
-                                "account delivery queue invariant failed",
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {}
-                    }
-                }
+                route_account_delivery(&transport, delivery);
             }
         });
         *router = Some(handle);
@@ -1744,7 +2195,7 @@ impl MarmotRelayPlane {
     /// Report end-of-stored-events for one subscription on one endpoint, the
     /// way [`handle_relay_notification`] does for an SDK-backed plane. An
     /// injected relay client produces no relay messages of its own, so tests
-    /// that need an EOSE-gated drain to complete drive this seam instead.
+    /// that need a subscription's end of stored events drive this seam.
     #[cfg(test)]
     pub(crate) async fn handle_relay_eose_for_test(
         &self,
@@ -1758,14 +2209,42 @@ impl MarmotRelayPlane {
             .await;
     }
 
-    /// Drive the managed account worker through its receive-error reconnect path
-    /// by closing inbound delivery, matching relay-notification recovery.
+    /// Drive every managed account worker through its receive-error reconnect
+    /// path: an unexpected notification consumer exit closes inbound delivery.
     #[cfg(test)]
-    pub(crate) fn simulate_notification_recovery_for_test(&self, skipped_notifications: u64) {
+    pub(crate) fn simulate_notification_consumer_exit_for_test(&self) {
         recover_relay_notification_forwarder(
             &self.inner.transport,
-            RelayNotificationConsumerExit::Lagged(skipped_notifications),
+            RelayNotificationConsumerExit::Closed,
         );
+    }
+
+    /// Record a lag on one account's notification consumer, as its scoped
+    /// forwarder does with the floor its SDK context read at the lag. Inbound
+    /// delivery stays open.
+    #[cfg(test)]
+    pub(crate) fn simulate_notification_lag_for_test(
+        &self,
+        account_id: &MemberId,
+        skipped_notifications: u64,
+        floor: NostrNotificationLossFloor,
+    ) {
+        recover_relay_notification_forwarder_scoped(
+            &self.inner.transport,
+            RelayNotificationConsumerExit::Lagged(skipped_notifications),
+            floor,
+            Some(account_id),
+        );
+    }
+
+    /// Shorten how long a receiver must go without another lag before its
+    /// lag-lost EOSE repair runs.
+    #[cfg(test)]
+    pub(crate) fn set_eose_repair_settle_for_test(&self, settle: Duration) {
+        self.inner
+            .transport
+            .eose_repair_settle_ms
+            .store(settle.as_millis() as u64, Ordering::Relaxed);
     }
 }
 
@@ -1876,6 +2355,33 @@ type RelayNotificationStream =
 struct RelayNotificationConsumerOutcome {
     receiver: RelayNotificationStream,
     exit: RelayNotificationConsumerExit,
+    /// The source's REQ floor, read where a lag was recorded. Unbounded for
+    /// every other exit.
+    lag_floor: NostrNotificationLossFloor,
+}
+
+impl RelayNotificationConsumerOutcome {
+    fn new(receiver: RelayNotificationStream, exit: RelayNotificationConsumerExit) -> Self {
+        Self {
+            receiver,
+            exit,
+            lag_floor: NostrNotificationLossFloor::Unbounded,
+        }
+    }
+
+    /// Record `abandoned` notifications as receiver loss, reading the floor
+    /// at that point.
+    fn lagged(
+        receiver: RelayNotificationStream,
+        source: &dyn RelayNotificationSource,
+        abandoned: u64,
+    ) -> Self {
+        Self {
+            receiver,
+            exit: RelayNotificationConsumerExit::Lagged(abandoned),
+            lag_floor: source.record_loss(abandoned),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1908,7 +2414,12 @@ impl RelayNotificationRestartBackoff {
 trait RelayNotificationSource: Send + Sync {
     fn notifications(&self) -> RelayNotificationStream;
     fn is_shutdown(&self) -> bool;
-    fn record_loss(&self, _skipped: u64) {}
+    /// Record receiver loss and return the lowest REQ `since` that could have
+    /// delivered the lost notifications. A source without that evidence
+    /// reports it unbounded.
+    fn record_loss(&self, _skipped: u64) -> NostrNotificationLossFloor {
+        NostrNotificationLossFloor::Unbounded
+    }
     fn receiver_replaced(&self) {}
     #[cfg(test)]
     fn worker_failure_hook(&self) -> Option<Arc<NotificationWorkerFailureHook>> {
@@ -1942,10 +2453,14 @@ impl RelayNotificationSource for SdkRelayNotificationSource {
         self.client.is_shutdown()
     }
 
-    fn record_loss(&self, skipped: u64) {
-        if let Some(loss) = &self.loss {
-            loss.record_notification_gap(skipped);
-        }
+    fn record_loss(&self, skipped: u64) -> NostrNotificationLossFloor {
+        let Some(loss) = &self.loss else {
+            return NostrNotificationLossFloor::Unbounded;
+        };
+        loss.record_notification_gap(skipped);
+        // Read at the lag: a later subscription change could raise it past
+        // an event this gap lost.
+        loss.notification_loss_floor()
     }
 
     fn receiver_replaced(&self) {
@@ -2099,14 +2614,18 @@ fn spawn_relay_notification_supervisor_scoped(
                             recover_relay_notification_forwarder_scoped(
                                 &transport,
                                 outcome.exit,
+                                outcome.lag_floor,
                                 account_id.as_ref(),
                             );
                         }
                         break;
                     }
+                    // A lag resumes the retained receiver at once; only an
+                    // unexpected exit replaces it after a backoff.
                     recover_relay_notification_forwarder_scoped(
                         &transport,
                         outcome.exit,
+                        outcome.lag_floor,
                         account_id.as_ref(),
                     );
                     if outcome.exit == RelayNotificationConsumerExit::Closed {
@@ -2130,6 +2649,7 @@ fn spawn_relay_notification_supervisor_scoped(
                     recover_relay_notification_forwarder_scoped(
                         &transport,
                         RelayNotificationConsumerExit::Closed,
+                        NostrNotificationLossFloor::Unbounded,
                         account_id.as_ref(),
                     );
                     tokio::time::sleep(
@@ -2181,23 +2701,23 @@ async fn run_relay_notification_consumer(
             Some(NotificationUpdate::Notification(notification)) => {
                 let should_shutdown = handle_relay_notification(notification, &adapter, None).await;
                 if should_shutdown {
-                    return RelayNotificationConsumerOutcome {
+                    return RelayNotificationConsumerOutcome::new(
                         receiver,
-                        exit: RelayNotificationConsumerExit::Shutdown,
-                    };
+                        RelayNotificationConsumerExit::Shutdown,
+                    );
                 }
             }
             Some(NotificationUpdate::Lagged { skipped }) => {
-                return RelayNotificationConsumerOutcome {
+                return RelayNotificationConsumerOutcome::new(
                     receiver,
-                    exit: RelayNotificationConsumerExit::Lagged(skipped),
-                };
+                    RelayNotificationConsumerExit::Lagged(skipped),
+                );
             }
             None => {
-                return RelayNotificationConsumerOutcome {
+                return RelayNotificationConsumerOutcome::new(
                     receiver,
-                    exit: RelayNotificationConsumerExit::Closed,
-                };
+                    RelayNotificationConsumerExit::Closed,
+                );
             }
         }
     }
@@ -2207,15 +2727,15 @@ async fn run_relay_notification_consumer(
 /// The bounded queue is an event lane; a full queue becomes a typed gap before
 /// the reader can block, and the watch control lane advances independently.
 fn abandoned_notification_lane(
+    receiver: RelayNotificationStream,
     pending: &AtomicU64,
     source: &dyn RelayNotificationSource,
-) -> RelayNotificationConsumerExit {
+) -> RelayNotificationConsumerOutcome {
     let abandoned = pending.load(Ordering::SeqCst);
     if abandoned > 0 {
-        source.record_loss(abandoned);
-        RelayNotificationConsumerExit::Lagged(abandoned)
+        RelayNotificationConsumerOutcome::lagged(receiver, source, abandoned)
     } else {
-        RelayNotificationConsumerExit::Closed
+        RelayNotificationConsumerOutcome::new(receiver, RelayNotificationConsumerExit::Closed)
     }
 }
 
@@ -2259,30 +2779,29 @@ async fn run_relay_notification_consumer_scoped(
         tokio::select! {
             worker_result = &mut worker => {
                 drop(abort_on_drop);
-                let exit = abandoned_notification_lane(&pending, source.as_ref());
-                return RelayNotificationConsumerOutcome {
-                    receiver,
-                    exit: if exit == RelayNotificationConsumerExit::Closed && matches!(worker_result, Ok(true)) {
-                        RelayNotificationConsumerExit::Shutdown
-                    } else {
-                        exit
-                    },
-                };
+                let mut outcome = abandoned_notification_lane(receiver, &pending, source.as_ref());
+                if outcome.exit == RelayNotificationConsumerExit::Closed
+                    && matches!(worker_result, Ok(true))
+                {
+                    outcome.exit = RelayNotificationConsumerExit::Shutdown;
+                }
+                return outcome;
             }
             update = receiver.next() => match update {
                 Some(NotificationUpdate::Notification(notification)) => {
                     if matches!(notification, ClientNotification::Shutdown) {
                         let abandoned = pending.load(Ordering::SeqCst);
-                        if abandoned > 0 {
-                            source.record_loss(abandoned);
-                        }
-                        return RelayNotificationConsumerOutcome {
-                            receiver,
-                            exit: if abandoned > 0 {
-                                RelayNotificationConsumerExit::Lagged(abandoned)
-                            } else {
-                                RelayNotificationConsumerExit::Shutdown
-                            },
+                        return if abandoned > 0 {
+                            RelayNotificationConsumerOutcome::lagged(
+                                receiver,
+                                source.as_ref(),
+                                abandoned,
+                            )
+                        } else {
+                            RelayNotificationConsumerOutcome::new(
+                                receiver,
+                                RelayNotificationConsumerExit::Shutdown,
+                            )
                         };
                     }
                     pending.fetch_add(1, Ordering::SeqCst);
@@ -2294,11 +2813,11 @@ async fn run_relay_notification_consumer_scoped(
                             }
                             mpsc::error::TrySendError::Closed(_) => 1,
                         };
-                        source.record_loss(skipped);
-                        return RelayNotificationConsumerOutcome {
+                        return RelayNotificationConsumerOutcome::lagged(
                             receiver,
-                            exit: RelayNotificationConsumerExit::Lagged(skipped),
-                        };
+                            source.as_ref(),
+                            skipped,
+                        );
                     }
                     #[cfg(test)]
                     source.notification_queued();
@@ -2306,24 +2825,25 @@ async fn run_relay_notification_consumer_scoped(
                 Some(NotificationUpdate::Lagged { skipped }) => {
                     let abandoned = skipped
                         .saturating_add(pending.load(Ordering::SeqCst));
-                    source.record_loss(abandoned);
-                    return RelayNotificationConsumerOutcome {
+                    return RelayNotificationConsumerOutcome::lagged(
                         receiver,
-                        exit: RelayNotificationConsumerExit::Lagged(abandoned),
-                    };
+                        source.as_ref(),
+                        abandoned,
+                    );
                 }
                 None => {
                     let abandoned = pending.load(Ordering::SeqCst);
-                    if abandoned > 0 {
-                        source.record_loss(abandoned);
-                    }
-                    return RelayNotificationConsumerOutcome {
-                        receiver,
-                        exit: if abandoned > 0 {
-                            RelayNotificationConsumerExit::Lagged(abandoned)
-                        } else {
-                            RelayNotificationConsumerExit::Closed
-                        },
+                    return if abandoned > 0 {
+                        RelayNotificationConsumerOutcome::lagged(
+                            receiver,
+                            source.as_ref(),
+                            abandoned,
+                        )
+                    } else {
+                        RelayNotificationConsumerOutcome::new(
+                            receiver,
+                            RelayNotificationConsumerExit::Closed,
+                        )
                     };
                 }
             }
@@ -2409,15 +2929,23 @@ async fn handle_relay_notification(
 }
 
 fn recover_relay_notification_forwarder(
-    transport: &RelayPlaneTransport,
+    transport: &Arc<RelayPlaneTransport>,
     exit: RelayNotificationConsumerExit,
 ) {
-    recover_relay_notification_forwarder_scoped(transport, exit, None);
+    recover_relay_notification_forwarder_scoped(
+        transport,
+        exit,
+        NostrNotificationLossFloor::Unbounded,
+        None,
+    );
 }
 
+/// Record a consumer lag, or close account delivery after an unexpected
+/// consumer exit. `lag_floor` is the source's REQ floor read at the lag.
 fn recover_relay_notification_forwarder_scoped(
-    transport: &RelayPlaneTransport,
+    transport: &Arc<RelayPlaneTransport>,
     exit: RelayNotificationConsumerExit,
+    lag_floor: NostrNotificationLossFloor,
     account_id: Option<&MemberId>,
 ) {
     let account_count = match account_id {
@@ -2426,59 +2954,81 @@ fn recover_relay_notification_forwarder_scoped(
         ),
         None => account_deliveries_read(&transport.account_deliveries).len(),
     };
-    // Latch account-local evidence before closing receivers. Keep each loss
-    // handle in the existing account registry so replacement adapters inherit
-    // the fence; the shared router never awaits account database I/O.
-    if !matches!(exit, RelayNotificationConsumerExit::Shutdown) {
-        let mut routes = account_deliveries_write(&transport.account_deliveries);
-        for (route_account_id, route) in routes.iter_mut() {
-            if account_id.is_some_and(|account_id| account_id != route_account_id) {
-                continue;
-            }
-            if matches!(exit, RelayNotificationConsumerExit::Lagged(_)) {
-                route.overflow.record_notification_loss();
-            }
-            // The typed lag is latched across receiver replacement. Only the
-            // account worker may persist it, before returning the close signal.
-            let generation = route
-                .overflow
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .generation;
-            route.overflow.cancel_signal(generation);
-            let (closed_sender, closed_receiver) = mpsc::channel(1);
-            drop(closed_receiver);
-            route.sender = closed_sender;
-        }
-    }
-    RelayNotificationForwarderHealth::increment(
-        &transport.notification_forwarder_health.restarts,
-        1,
-    );
     match exit {
         RelayNotificationConsumerExit::Lagged(skipped) => {
-            RelayNotificationForwarderHealth::increment(
-                &transport.notification_forwarder_health.lag_incidents,
-                1,
+            // The live subscriptions did not fail; only this consumer fell
+            // behind, and it resumes on the same receiver. Keep every route
+            // open and charge the loss to each account's current generation.
+            // A shared receiver's floor cannot be attributed to one account.
+            let floor = if account_id.is_some() {
+                lag_floor
+            } else {
+                NostrNotificationLossFloor::Unbounded
+            };
+            let routes = account_deliveries_read(&transport.account_deliveries);
+            for (route_account_id, route) in routes.iter() {
+                if account_id.is_some_and(|account_id| account_id != route_account_id) {
+                    continue;
+                }
+                // A queued or deferred control record already carries this
+                // generation, and the worker persists the lag without one.
+                if let Some(generation) = route.overflow.record_notification_loss(floor) {
+                    enqueue_account_delivery_overflow_signal(
+                        &route.sender,
+                        &route.overflow,
+                        generation,
+                    );
+                }
+            }
+            drop(routes);
+            // The lag may also have lost end-of-stored-events. It cannot tell
+            // which, so it repairs coverage rather than marking any complete.
+            schedule_eose_repair(
+                transport,
+                account_id,
+                transport.adapter.notification_lag_mark(),
             );
-            RelayNotificationForwarderHealth::increment(
-                &transport.notification_forwarder_health.lagged_notifications,
-                skipped,
-            );
+            let health = &transport.notification_forwarder_health;
+            RelayNotificationForwarderHealth::increment(&health.restarts, 1);
+            RelayNotificationForwarderHealth::increment(&health.lag_incidents, 1);
+            RelayNotificationForwarderHealth::increment(&health.lagged_notifications, skipped);
             tracing::warn!(
                 target: "marmot_app::relay_plane",
                 method = "recover_relay_notification_forwarder",
                 skipped_notifications = skipped,
                 affected_accounts = account_count,
-                "relay notification consumer lagged; restarting inbound delivery",
+                bounded = floor.since_seconds().is_some(),
+                "relay notification consumer lagged; recording notification loss for comparison recovery",
             );
         }
         RelayNotificationConsumerExit::Closed => {
-            RelayNotificationForwarderHealth::increment(
-                &transport.notification_forwarder_health.unexpected_exits,
-                1,
-            );
+            // The receiver itself is gone. Latch account-local evidence before
+            // closing receivers, and keep each loss handle in the account
+            // registry so replacement adapters inherit the fence; the shared
+            // router never awaits account database I/O.
+            let mut routes = account_deliveries_write(&transport.account_deliveries);
+            for (route_account_id, route) in routes.iter_mut() {
+                if account_id.is_some_and(|account_id| account_id != route_account_id) {
+                    continue;
+                }
+                // A queued control record dies with the closed queue. The
+                // account worker persists pending loss before returning the
+                // close signal.
+                let generation = route
+                    .overflow
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .generation;
+                route.overflow.cancel_signal(generation);
+                let (closed_sender, closed_receiver) = mpsc::channel(1);
+                drop(closed_receiver);
+                route.sender = closed_sender;
+            }
+            drop(routes);
+            let health = &transport.notification_forwarder_health;
+            RelayNotificationForwarderHealth::increment(&health.restarts, 1);
+            RelayNotificationForwarderHealth::increment(&health.unexpected_exits, 1);
             tracing::warn!(
                 target: "marmot_app::relay_plane",
                 method = "recover_relay_notification_forwarder",
@@ -2488,6 +3038,180 @@ fn recover_relay_notification_forwarder_scoped(
         }
         RelayNotificationConsumerExit::Shutdown => {}
     }
+}
+
+/// Schedule a repair of the end-of-stored-events a lag on this receiver may
+/// have lost, for the REQs issued by `lag`. `account_id` is the lagging
+/// receiver's account, or `None` for a receiver shared across accounts. The
+/// repair runs once the receiver has gone
+/// [`NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`] without another lag. A later lag in
+/// the same scope postpones it and widens it to the REQs issued by then. A
+/// repair that leaves relays unrepaired schedules itself again the same way.
+fn schedule_eose_repair(
+    transport: &Arc<RelayPlaneTransport>,
+    account_id: Option<&MemberId>,
+    lag: NotificationLagMark,
+) {
+    schedule_eose_repair_pass(transport, account_id, lag, false);
+}
+
+fn schedule_eose_repair_pass(
+    transport: &Arc<RelayPlaneTransport>,
+    account_id: Option<&MemberId>,
+    lag: NotificationLagMark,
+    follow_up: bool,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let settle = Duration::from_millis(transport.eose_repair_settle_ms.load(Ordering::Relaxed));
+    let due = tokio::time::Instant::now() + settle;
+    let scope = account_id.cloned();
+    let mut repairs = transport
+        .eose_repairs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pending) = repairs.get_mut(&scope) {
+        pending.due = due;
+        pending.lag = pending.lag.max(lag);
+        if !follow_up {
+            // A lag that postpones a pending follow-up owns the pass: it
+            // widens it to the REQs issued by the lag.
+            pending.lags = pending.lags.saturating_add(1);
+            pending.follow_up = false;
+        }
+        return;
+    }
+    repairs.insert(
+        scope.clone(),
+        EoseRepairSchedule {
+            due,
+            lag,
+            lags: u64::from(!follow_up),
+            follow_up,
+        },
+    );
+    drop(repairs);
+    runtime.spawn(run_eose_repair(Arc::downgrade(transport), scope));
+}
+
+/// Wait until a scheduled repair is due, then repair each REQ of its scope
+/// that a relay has not answered with end-of-stored-events. Holds the plane
+/// only weakly, so it never keeps a shut-down plane alive.
+async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<MemberId>) {
+    let (transport, lag, lags, follow_up) = loop {
+        let due = {
+            let Some(transport) = transport.upgrade() else {
+                return;
+            };
+            let repairs = transport
+                .eose_repairs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(pending) = repairs.get(&scope) else {
+                return;
+            };
+            pending.due
+        };
+        tokio::time::sleep_until(due).await;
+        let Some(transport) = transport.upgrade() else {
+            return;
+        };
+        let lag = {
+            let mut repairs = transport
+                .eose_repairs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match repairs.get(&scope) {
+                Some(pending) if pending.due <= tokio::time::Instant::now() => repairs
+                    .remove(&scope)
+                    .map(|pending| (pending.lag, pending.lags, pending.follow_up)),
+                // A later lag postponed it.
+                Some(_) => None,
+                None => return,
+            }
+        };
+        if let Some((lag, lags, follow_up)) = lag {
+            break (transport, lag, lags, follow_up);
+        }
+    };
+    if transport.shutting_down.load(Ordering::SeqCst) {
+        return;
+    }
+    // The repair may wait for the subscription lifecycle lock.
+    let adapter = transport.adapter.clone();
+    let weak = Arc::downgrade(&transport);
+    drop(transport);
+    let summary = adapter
+        .reissue_subscriptions_awaiting_eose(scope.as_ref(), lag)
+        .await;
+    tracing::info!(
+        target: "marmot_app::relay_plane",
+        method = "repair_lag_lost_eose",
+        awaiting_relays = summary.awaiting_relays,
+        complete_relays = summary.complete_relays,
+        reissued_relays = summary.reissued_relays,
+        failed_relays = summary.failed_relays,
+        "repaired subscriptions whose end-of-stored-events a notification lag may have lost",
+    );
+    let unrepaired = summary.failed_relays;
+    let Some(transport) = weak.upgrade() else {
+        return;
+    };
+    let follow_up_scheduled = unrepaired > 0 && !transport.shutting_down.load(Ordering::SeqCst);
+    push_eose_repair_report(
+        &transport,
+        EoseRepairReport {
+            scope: scope.clone(),
+            follow_up,
+            lags,
+            summary,
+            follow_up_scheduled,
+            dropped_before: 0,
+        },
+    );
+    if !follow_up_scheduled {
+        return;
+    }
+    // Each unrepaired relay's claim was released. A relay that keeps failing
+    // is tried again at most once per settle window, while a re-issue that
+    // went out keeps its claim, so a replay that lags again cannot loop.
+    tracing::info!(
+        target: "marmot_app::relay_plane",
+        method = "repair_lag_lost_eose",
+        unrepaired_relays = unrepaired,
+        "scheduling another lag-lost end-of-stored-events repair",
+    );
+    schedule_eose_repair_pass(&transport, scope.as_ref(), lag, true);
+}
+
+/// Queue a finished repair for its audit row, dropping the oldest at the
+/// bound. Never waits: the lock guards a small in-memory queue.
+fn push_eose_repair_report(transport: &RelayPlaneTransport, report: EoseRepairReport) {
+    let mut reports = transport
+        .eose_repair_reports
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut report = report;
+    if reports.pending.len() >= EOSE_REPAIR_REPORTS_MAX
+        && let Some(dropped) = reports.pending.pop_front()
+    {
+        // Carry the count to this receiver's next surviving report, the new
+        // one included; otherwise keep only a bounded scalar.
+        let carried = dropped.dropped_before.saturating_add(1);
+        if let Some(next) = reports
+            .pending
+            .iter_mut()
+            .find(|pending| pending.scope == dropped.scope)
+        {
+            next.dropped_before = next.dropped_before.saturating_add(carried);
+        } else if report.scope == dropped.scope {
+            report.dropped_before = report.dropped_before.saturating_add(carried);
+        } else {
+            reports.dropped_unattributed = reports.dropped_unattributed.saturating_add(carried);
+        }
+    }
+    reports.pending.push_back(report);
 }
 
 impl MarmotRelayPlaneAccountAdapter {
@@ -2637,24 +3361,28 @@ impl MarmotRelayPlaneAccountAdapter {
         Ok(Some(result?))
     }
 
-    /// Submit an owned comparison event to this account's delivery queue.
-    /// Durable admission happens in the caller's subsequent drain.
-    pub(crate) async fn queue_reconciled_event(
+    /// This account's deliveries for one owned comparison event. The worker
+    /// admits them directly, never through the live queue.
+    pub(crate) async fn recovered_deliveries(
         &self,
         event: transport_nostr_adapter::NostrRelayEvent,
-    ) -> Result<usize, TransportAdapterError> {
+    ) -> Result<Vec<TransportDelivery>, TransportAdapterError> {
         self.relay_plane
             .inner
             .transport
             .adapter
-            .handle_reconciled_event(&self.account_id, event)
+            .reconciled_deliveries(&self.account_id, event)
             .await
     }
 
+    /// Install a group's post-join maintenance REQ, floored at `since` so a
+    /// notification lag while it is live stays bounded. `None` requests the
+    /// group's full history.
     pub(crate) async fn install_group_maintenance_subscription(
         &self,
         group: TransportGroupSubscription,
         recovery_attempt: u64,
+        since: Option<Timestamp>,
     ) -> Result<String, TransportAdapterError> {
         let sync = self
             .relay_plane
@@ -2679,6 +3407,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 &self.account_id,
                 &group,
                 recovery_attempt,
+                since,
             )
             .await
     }
@@ -2764,10 +3493,102 @@ impl MarmotRelayPlaneAccountAdapter {
 
     fn account_delivery_receive(&self, event: AccountDeliveryEvent) -> AccountDeliveryReceive {
         match event {
-            AccountDeliveryEvent::Delivery(delivery) => AccountDeliveryReceive::Delivery(delivery),
+            AccountDeliveryEvent::Delivery(delivery) => {
+                // Taken, it still caps every commit until its consumer
+                // releases it: a failed ingest's checkpoint must not pass it.
+                self.delivery_overflow.take(
+                    self.delivery_epoch,
+                    account_delivery_restart_key(&delivery),
+                    &delivery.message.id,
+                );
+                AccountDeliveryReceive::Delivery(delivery)
+            }
             AccountDeliveryEvent::Overflow { generation } => {
                 AccountDeliveryReceive::Overflow(self.delivery_overflow.consume_signal(generation))
             }
+        }
+    }
+
+    fn cursor_lookback_secs(&self) -> Option<u64> {
+        self.relay_plane.subscription_rebuild_lookback_secs()
+    }
+
+    /// How far a commit may promote the transport cursor, decided under the
+    /// router's placement lock: at most `candidate`, and never past a
+    /// delivery still queued, or taken and not yet released, that the
+    /// persisted cursor still lets a restart fetch. `None` while loss or a
+    /// spill hand-off is pending. The caller persists the larger of this and
+    /// its current cursor. The restart floor rises here, before the commit's
+    /// save runs, so a delivery that arrives during that save and falls below
+    /// it is spilled rather than queued.
+    pub(crate) fn seal_transport_cursor(&self, candidate: Option<u64>) -> Option<u64> {
+        self.delivery_overflow.seal_cursor(
+            self.delivery_epoch,
+            self.cursor_lookback_secs(),
+            candidate,
+        )
+    }
+
+    /// The delivery of event `id` no longer needs a restart to fetch it: its
+    /// ingest is durable, or its consumer dropped it on purpose, as a
+    /// duplicate or as input the account keeps no trace of by design. Its
+    /// consumer calls this before the save that follows, so a committed
+    /// delivery never holds the cursor back. A delivery whose ingest failed
+    /// is never released: it caps every commit until a redelivery of the
+    /// same event is released or its queue generation ends. An event this
+    /// queue holds no pin for, such as one read back from the spill, has
+    /// nothing to release.
+    pub(crate) fn release_account_delivery(&self, id: &MessageId) {
+        self.delivery_overflow.release(self.delivery_epoch, id);
+    }
+
+    /// A sealed commit's save failed and `restored` is still the persisted
+    /// cursor. Undo the floor its seal raised.
+    pub(crate) fn unseal_transport_cursor(&self, restored: Option<u64>) {
+        self.delivery_overflow
+            .unseal_cursor(self.cursor_lookback_secs(), restored);
+    }
+
+    /// A settled commit (a drain checkpoint, settled loss or a retired
+    /// notice) saved what its seal reached, so the settled floor rises to it
+    /// and the router stops spilling below. `reached` is what the seal
+    /// returned, not the cursor the commit persisted, which may be an earlier
+    /// live promotion's. A live commit never settles.
+    pub(crate) fn settle_transport_cursor(&self, reached: Option<u64>) {
+        self.delivery_overflow
+            .settle_cursor(self.cursor_lookback_secs(), reached, false);
+    }
+
+    /// Record the cursor the account opened with.
+    pub(crate) fn open_transport_cursor(&self, persisted: Option<u64>) {
+        self.delivery_overflow
+            .settle_cursor(self.cursor_lookback_secs(), persisted, true);
+    }
+
+    /// Whether the account has a settled cursor floor: the one it opened
+    /// with, or one a drain checkpoint, settled loss or retired notice made
+    /// durable. Only the account worker settles, so this cannot change
+    /// between the worker's read and its next seal.
+    pub(crate) fn transport_cursor_settled(&self) -> bool {
+        self.delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admission
+            .settled_since
+            .is_some()
+    }
+
+    /// Cumulative account-queue placement counts for the transport-cursor
+    /// audit row. Relaxed counters: a reader sees a recent value, never a
+    /// torn one, and the row reports differences between two reads.
+    pub(crate) fn delivery_placement_counts(&self) -> AccountDeliveryPlacementCounts {
+        let metrics = &self.delivery_overflow.metrics;
+        AccountDeliveryPlacementCounts {
+            spilled_below_floor: metrics.spill_diverted_below_floor.load(Ordering::Relaxed),
+            spilled_queue_full: metrics.spill_diverted_queue_full.load(Ordering::Relaxed),
+            spill_already_seen: metrics.spill_already_seen.load(Ordering::Relaxed),
+            queue_dropped: metrics.dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -2798,12 +3619,23 @@ impl MarmotRelayPlaneAccountAdapter {
             .then(|| AccountDeliveryOverflowState::snapshot(&state))
     }
 
+    /// Whether a queued or deferred control record will still report the
+    /// pending loss generation to this account's consumer.
+    pub(crate) fn delivery_overflow_signal_outstanding(&self) -> bool {
+        let state = self
+            .delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state.pending && state.signal_queued
+    }
+
     pub(crate) fn pending_delivery_overflow(&self) -> Option<AccountDeliveryOverflow> {
         self.delivery_overflow.pending_snapshot()
     }
 
-    /// Begin (or resume after process restart) the unfloored replay required by
-    /// a durable account-delivery overflow marker.
+    /// Begin (or resume after process restart) the recovery job required by a
+    /// durable account-delivery loss marker.
     pub(crate) fn start_delivery_overflow_recovery(
         &self,
         durable_marker_token: u64,
@@ -2828,6 +3660,21 @@ impl MarmotRelayPlaneAccountAdapter {
 
     pub(crate) fn record_delivery_overflow_recovery_success(&self, elapsed_ms: u64) {
         self.delivery_overflow.record_recovery_success(elapsed_ms);
+    }
+
+    /// The pending loss generation, including one a recovery attempt holds.
+    pub(crate) fn pending_delivery_overflow_generation(&self) -> Option<AccountDeliveryOverflow> {
+        self.delivery_overflow.pending_generation()
+    }
+
+    /// Release the cursor fence for loss the account owner retired, only if
+    /// `observed` is still exactly the pending generation. Never counts a
+    /// recovery success. Returns true when no plane loss remains pending.
+    pub(crate) fn retire_delivery_overflow(
+        &self,
+        observed: Option<AccountDeliveryOverflow>,
+    ) -> bool {
+        self.delivery_overflow.retire_recovery(observed)
     }
 
     pub(crate) fn fail_delivery_overflow_recovery(&self) {
@@ -2989,14 +3836,91 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
     }
 }
 
-/// Omit one delivery from a full account queue into the current loss
-/// generation, persisting its evidence before the control record is queued.
-fn omit_account_delivery(route: &AccountDeliveryRoute) {
+/// Hand one delivery to its account without awaiting the account queue: a
+/// single account whose receiver has stalled (full buffer) must not block the
+/// shared router and back-pressure delivery for every other account (and,
+/// upstream, the relay notification pipeline).
+///
+/// A full queue hands the delivery to the account's durable spill, and so
+/// does a delivery that a transport-cursor checkpoint still saving, or a live
+/// promotion alone, stopped a restart from fetching again: the queue never
+/// holds one of those. Only when the spill cannot take it does the delivery
+/// join an explicit loss generation, using the one channel slot reserved for
+/// its control record.
+fn route_account_delivery(transport: &RelayPlaneTransport, delivery: TransportDelivery) {
+    let Some(route) = account_deliveries_read(&transport.account_deliveries)
+        .get(&delivery.account_id)
+        .cloned()
+    else {
+        return;
+    };
     let queue_depth = route
         .sender
         .max_capacity()
         .saturating_sub(route.sender.capacity());
-    let signal_generation = route.overflow.record_drop(queue_depth);
+    route.overflow.observe_queue_depth(queue_depth);
+    let created_at = delivery.message.timestamp.0;
+    let key = account_delivery_restart_key(&delivery);
+    match route.overflow.place(
+        route.epoch,
+        key,
+        route.sender.capacity() <= 1,
+        route.spill.is_some(),
+    ) {
+        AccountDeliveryPlacement::Queue => {
+            match route
+                .sender
+                .try_send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
+            {
+                Ok(()) => {
+                    let queue_depth = route
+                        .sender
+                        .max_capacity()
+                        .saturating_sub(route.sender.capacity());
+                    route.overflow.observe_queue_depth(queue_depth);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    route.overflow.unqueue(route.epoch, key);
+                    // Only this router writes the route, and it reserves one
+                    // control slot above, so reaching Full here indicates a
+                    // violated queue invariant rather than ordinary
+                    // backpressure.
+                    tracing::warn!(
+                        target: "marmot_app::relay_plane",
+                        method = "route_account_delivery",
+                        error_kind = "reserved_overflow_slot_unavailable",
+                        "account delivery queue invariant failed",
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    route.overflow.unqueue(route.epoch, key);
+                }
+            }
+        }
+        AccountDeliveryPlacement::Spill => {
+            let spilled = route
+                .spill
+                .as_ref()
+                .is_some_and(|spill| spill.offer(delivery));
+            if !spilled {
+                // Record the loss before releasing the placement's fence, so
+                // the cursor stays fenced throughout.
+                omit_account_delivery(&route, Some(created_at));
+                route.overflow.finish_spill(1, 0, 0);
+            }
+        }
+        AccountDeliveryPlacement::Omit => omit_account_delivery(&route, Some(created_at)),
+    }
+}
+
+/// Omit one delivery from a full account queue into the current loss
+/// generation, persisting its evidence before the control record is queued.
+fn omit_account_delivery(route: &AccountDeliveryRoute, created_at: Option<u64>) {
+    let queue_depth = route
+        .sender
+        .max_capacity()
+        .saturating_sub(route.sender.capacity());
+    let signal_generation = route.overflow.record_drop(queue_depth, created_at);
     if let Some(marker) = route.recovery_marker.clone() {
         persist_queue_loss(&route.sender, &route.overflow, marker, signal_generation);
     } else if let Some(generation) = signal_generation {

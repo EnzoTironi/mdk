@@ -279,6 +279,17 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         name: String,
         display_name: Option<String>,
+        /// Optional kind-0 fields, mirroring `wn profile update`. An absent field
+        /// keeps the account's currently published value: the connector reads the
+        /// published profile and overlays these instead of replacing it.
+        #[serde(default)]
+        about: Option<String>,
+        #[serde(default)]
+        picture: Option<String>,
+        #[serde(default)]
+        nip05: Option<String>,
+        #[serde(default)]
+        lud16: Option<String>,
     },
     /// Resolve whether the selected account already has a valid published
     /// Nostr kind-0 profile. The connector returns a typed outcome so relay
@@ -345,6 +356,17 @@ pub enum AgentControlRequest {
     GroupInfo {
         account_id_hex: String,
         group_id_hex: String,
+    },
+    /// Update authenticated group profile fields. Omitted fields keep their
+    /// current value; an empty string explicitly clears a field. Only a current
+    /// group admin can publish this MLS commit.
+    GroupProfileUpdate {
+        account_id_hex: String,
+        group_id_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     MaintenanceStatus {
         account_id_hex: String,
@@ -554,6 +576,10 @@ pub enum AgentControlResponse {
         is_direct: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
+    },
+    GroupProfileUpdated {
+        group_id_hex: String,
+        message_ids_hex: Vec<String>,
     },
     MaintenanceStatus {
         status: AgentControlMaintenanceStatus,
@@ -1005,6 +1031,57 @@ mod tests {
     };
 
     #[test]
+    fn account_publish_profile_frames_round_trip_with_optional_fields() {
+        for optional in [false, true] {
+            let request = AgentControlEnvelope::request(
+                Some("profile-1".into()),
+                AgentControlRequest::AccountPublishProfile {
+                    account_id_hex: "11".repeat(32),
+                    name: "Holly Day".into(),
+                    display_name: None,
+                    about: optional.then(|| "Day family assistant.".into()),
+                    picture: optional.then(|| "https://example.com/avatar.png".into()),
+                    nip05: optional.then(|| "holly@example.com".into()),
+                    lud16: optional.then(|| "holly@example.com".into()),
+                },
+            );
+            let encoded = encode_frame(&request).unwrap();
+            let json: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "account_publish_profile");
+            assert_eq!(json["about"].is_null(), !optional);
+            assert_eq!(json["picture"].is_null(), !optional);
+            assert_eq!(json["nip05"].is_null(), !optional);
+            assert_eq!(json["lud16"].is_null(), !optional);
+            assert_eq!(
+                decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+
+        // A client that predates the optional fields sends none of them.
+        let legacy: Value = serde_json::json!({
+            "marmot_agent_control": crate::AGENT_CONTROL_PROTOCOL_V2,
+            "id": "profile-legacy",
+            "type": "account_publish_profile",
+            "account_id_hex": "11".repeat(32),
+            "name": "Holly Day",
+            "display_name": null,
+        });
+        let decoded: AgentControlRequest =
+            serde_json::from_value(legacy).expect("legacy account_publish_profile payload");
+        assert!(matches!(
+            decoded,
+            AgentControlRequest::AccountPublishProfile {
+                about: None,
+                picture: None,
+                nip05: None,
+                lud16: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn group_create_frames_round_trip_with_optional_fields() {
         for optional in [false, true] {
             let request = AgentControlEnvelope::request(
@@ -1066,6 +1143,49 @@ mod tests {
         assert_eq!(
             decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn group_profile_update_round_trips_partial_and_clear_fields() {
+        for (name, description) in [
+            (Some("New name".to_owned()), None),
+            (None, Some("New description".to_owned())),
+            (Some(String::new()), Some(String::new())),
+        ] {
+            let request = AgentControlEnvelope::request(
+                Some("profile-1".into()),
+                AgentControlRequest::GroupProfileUpdate {
+                    account_id_hex: "ab".repeat(32),
+                    group_id_hex: "cd".repeat(16),
+                    name: name.clone(),
+                    description: description.clone(),
+                },
+            );
+            let encoded = encode_frame(&request).unwrap();
+            let json: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "group_profile_update");
+            assert_eq!(json.get("name").is_some(), name.is_some());
+            assert_eq!(json.get("description").is_some(), description.is_some());
+            assert_eq!(
+                decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+
+        let response = AgentControlEnvelope::new(
+            Some("profile-1".into()),
+            AgentControlResponse::GroupProfileUpdated {
+                group_id_hex: "cd".repeat(16),
+                message_ids_hex: vec!["ef".repeat(32)],
+            },
+        );
+        let encoded = encode_frame(&response).unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["type"], "group_profile_updated");
+        assert_eq!(
+            decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
+            response
         );
     }
 
@@ -1717,6 +1837,10 @@ mod tests {
                     account_id_hex: account(),
                     name: "agent".to_owned(),
                     display_name: Some("Agent".to_owned()),
+                    about: None,
+                    picture: None,
+                    nip05: None,
+                    lud16: None,
                 },
                 "account_publish_profile",
             ),
