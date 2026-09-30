@@ -356,6 +356,12 @@ impl ArtifactOutbox {
             .any(|batch| batch.group_ref == group_ref)
     }
 
+    pub(crate) fn has_pending_reply(&self, group_ref: &str, reply_to_ref: &str) -> bool {
+        self.batches
+            .iter()
+            .any(|batch| batch.group_ref == group_ref && batch.reply_to_message_ref == reply_to_ref)
+    }
+
     pub(crate) fn record(&mut self, batch: PendingArtifactBatch) -> Result<()> {
         if let Some(existing) = self
             .batches

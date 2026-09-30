@@ -22,6 +22,10 @@ before changing this crate.
   distinct command, and reject backend observations from older generations.
 - On Unix, spawn each backend in a dedicated process group and preserve the
   cancellation guard that kills the group before the direct child is reaped.
+- Keep every backend byte, record, text event, artifact, reply chunk, and
+  durable output attempt charged against the per-turn `OutputLimits` before it
+  is buffered, parsed, forwarded, or sent. After the `TurnOutputControl` latch
+  fires, send nothing more for that turn.
 - Preserve privacy-safe diagnostics and never log identifiers, paths, prompts,
   model output, or transport data.
 - Changes here must be verified against every terminal harness.

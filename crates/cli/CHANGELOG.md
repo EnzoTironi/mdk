@@ -9,6 +9,20 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` now bound each backend
+  turn's output. They cap single JSONL records, raw stdout, framed events,
+  assistant text, artifact captions and counts, staged reply chunks, and
+  durable send attempts (including retries and status notices). Each cap has a
+  finite default and hard maximum, configurable through
+  `WN_<BACKEND>_MAX_*` variables. On the first breach the connector stops the
+  backend and its process group, sends nothing more for that turn, and leaves a
+  limited turn that `/discard-last` clears (or `/retry-last` reruns when a
+  backend session is known). Durable send
+  budgets persist across restarts and also cap reconciliation replays. See the
+  [terminal harness output limits](../../integrations/terminal-harness/README.md#output-limits).
+
 ## [0.11.0] - 2026-09-29
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through

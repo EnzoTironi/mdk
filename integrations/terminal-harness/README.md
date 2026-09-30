@@ -109,11 +109,56 @@ All connectors:
 - keep short connect/write and ordinary control-response deadlines, but allow a media-download response at least sixteen minutes so the runtime's fifteen-minute acquisition can finish before the connector deadline;
 - reject a complete attachment batch before backend invocation when any download, regular-file/ownership check, count limit, or aggregate-byte limit fails;
 - remove batch copies after every terminal path and reconcile stale connector-owned batch directories on startup;
+- bound every backend invocation's stdout framing, parsed output, and durable
+  output requests with the per-turn [output limits](#output-limits);
 - keep diagnostics free of identifiers, paths, prompts, attachment names, and backend output.
 
 Download timeouts, connector rejections, and local file-validation failures have
 distinct privacy-safe pre-backend replies. The connector never forwards a
 server-provided error string or attachment metadata into those replies.
+
+### Output Limits
+
+Each backend invocation gets finite output budgets. Connectors read them from
+`<PREFIX>_<SUFFIX>`, where the prefix is `WN_CLAUDE`, `WN_CODEX`,
+`WN_OPENCODE`, or `WN_PI`. Every value must be a decimal integer from 1 to its
+hard maximum; zero, signs, malformed values, and values above the maximum are
+rejected at startup without echoing the value.
+
+| Suffix | Default | Hard maximum | Counts |
+| --- | --- | --- | --- |
+| `MAX_BACKEND_RECORD_BYTES` | 1 MiB | 4 MiB | Bytes in one stdout JSONL record, excluding the delimiter |
+| `MAX_BACKEND_STDOUT_BYTES` | 16 MiB | 64 MiB | Raw stdout bytes, including delimiters and blank, ignored, or malformed records |
+| `MAX_BACKEND_EVENTS` | 8192 | 65536 | Framed stdout records, charged before UTF-8 decoding or parsing |
+| `MAX_ASSISTANT_TEXT_BYTES` | 1 MiB | 8 MiB | Parsed assistant-text bytes, including whitespace-only text |
+| `MAX_ASSISTANT_TEXT_EVENTS` | 256 | 4096 | Parsed assistant-text events |
+| `MAX_ARTIFACT_BUFFER_BYTES` | 512 KiB | 4 MiB | Assistant text retained as an artifact caption, including separators |
+| `ARTIFACT_MAX_COUNT` | 10 | 10 | Declared artifacts summed across every artifact event in the turn |
+| `MAX_REPLY_CHUNKS` | 64 | 256 | Reply chunks staged for the turn; a text that would cross the cap stages none of its chunks |
+| `MAX_DURABLE_SENDS` | 128 | 512 | Final, media, and activity requests for the turn, including every retry and status notice |
+
+The stdout framer never buffers more than one record plus a fixed scratch
+buffer, so an unterminated or oversized record is rejected before any of it is
+parsed. The first breached limit wins: the connector stops the backend, drains
+nothing further from it, and terminates its process group. A durable request
+already waiting for acknowledgement is abandoned rather than awaited. Channel
+backpressure between the runner and the delivery loop only delays the runner;
+it never grows a buffer.
+
+After a breach the turn sends nothing more: no buffered text, fallback text,
+liveness or activity notice, artifact, or error reply. The turn is persisted as
+limited behind an incomplete-final barrier, and any chunks staged but unsent
+are withheld from reconciliation. When a backend session is known, the prompt
+is kept as an uncertain-outcome recovery record because the backend may already
+have acted; `/retry-last` reruns it and `/discard-last` clears it. Without a
+session the barrier is discard-only. Either command releases the group's FIFO
+lane; other groups are unaffected.
+
+Durable send budgets survive restarts. Startup and periodic reconciliation
+replay staged chunks only for turns that have finished, charge each replay
+attempt against the same budget, and mark a turn limited instead of sending once
+its budget is exhausted. Records written before budgets existed get a fresh
+finite budget on first replay.
 
 ## Chat Commands
 
