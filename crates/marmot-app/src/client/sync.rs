@@ -4292,6 +4292,17 @@ impl AppClient {
                                         .since_seconds
                                         .is_some_and(|since| since >= window.since))
                                 && scope.goal.until_seconds <= window.until
+                                // A route certificate says nothing about a
+                                // required relay absent from this network pass.
+                                // A comparison pass queries the incremental
+                                // debt's relays; when that debt was not rebuilt
+                                // with this grant, another obligation's scope on
+                                // the same route can require a relay it lacks.
+                                && scope.goal.required_endpoints.iter().all(|endpoint| {
+                                    window.work.endpoints().iter().any(|queried| {
+                                        crate::relay_plane::same_relay(queried.as_str(), endpoint)
+                                    })
+                                })
                         })
                     });
                     let scope_certified = comparison_owned
