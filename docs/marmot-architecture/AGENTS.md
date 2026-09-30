@@ -4,7 +4,7 @@ Agent map for the Marmot architecture docs.
 
 ## Read order
 
-1. `index.md`
+1. `index.md` and `overview/app-core-boundary.md` (MDK/host ownership)
 2. `overview/executive-summary.md`
 3. `overview/target-architecture.md`
 4. `overview/current-state.md`
@@ -22,6 +22,10 @@ Agent map for the Marmot architecture docs.
 
 - **Path:** `overview/`
   - **Role:** Current short orientation docs. Keep these readable in one sitting.
+
+- **Path:** `overview/app-core-boundary.md`
+  - **Role:** Canonical MDK/host-app ownership contract. Android is a minimal display/platform layer;
+    shared product rules, state and operations stay in MDK. Root and crate agent guides link here.
 
 - **Path:** `overview/cgka-engine-quality-and-vectors.md`
   - **Role:** Current near-term engine quality and vector plan.

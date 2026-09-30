@@ -2,6 +2,17 @@
 
 Repository-level map for agents. Read `README.md` first for the human-facing overview.
 
+## MDK and host-app ownership
+
+MDK is the shared product runtime. White Noise Android is a minimal display and
+Android platform layer; reusable behavior belongs in Rust here, exposed through
+bindings. Read [the host-app boundary](docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary)
+before placing logic. It covers persistence, projections, validation, relay/media
+operations, recovery and the platform-adapter exceptions. Missing capabilities
+are implemented/reviewed here before downstream adoption; keep Android's
+[agent guidance](https://github.com/marmot-protocol/whitenoise-android/blob/master/AGENTS.md)
+and binding documentation aligned when the contract changes.
+
 ## Scope
 
 This repo owns the Rust implementation workspace for Marmot:
