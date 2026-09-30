@@ -19,7 +19,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   `WN_<BACKEND>_MAX_*` variables. On the first breach the connector stops the
   backend and its process group, sends nothing more for that turn, and leaves a
   limited turn that `/discard-last` clears (or `/retry-last` reruns when a
-  backend session is known). Durable send
+  backend session is known). A completed buffered reply batch that would
+  exceed the chunk cap is rejected before any of it is sent, and a
+  `/retry-last` that breaches a limit keeps the earlier turn's pending
+  deliveries. Durable send
   budgets persist across restarts and also cap reconciliation replays. See the
   [terminal harness output limits](../../integrations/terminal-harness/README.md#output-limits).
 

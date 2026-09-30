@@ -1022,6 +1022,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         return;
     }
     let limit_context = (cwd.clone(), recovery_prompt.clone());
+    let mut retry_completed = false;
 
     let observed_session = match run_result {
         Ok(Ok(outcome)) => {
@@ -1117,25 +1118,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             } else {
                 delivered_chunks
             };
-            if retrying && outcome.exit_code == Some(0) && !persist_failed {
-                match ctx.recovery.discard(&inbound.group_ref).await {
-                    Ok(_) => {
-                        permit
-                            .queue
-                            .recovery_changed
-                            .send_modify(|generation| *generation = generation.wrapping_add(1));
-                    }
-                    Err(err) => {
-                        warn!(target: TRACE_TARGET, method = "discard_recovery", error_kind = err.privacy_safe_kind(), "failed to discard completed recovery record");
-                        if let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
-                            warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = reset_err.privacy_safe_kind(), "failed to restore retryable recovery state");
-                        }
-                    }
-                }
-                let _ =
-                    discard_unresolved_turns(&ctx, &inbound.group_ref, Some(&inbound.message_ref))
-                        .await;
-            }
+            retry_completed = retrying && outcome.exit_code == Some(0) && !persist_failed;
             let observed_session = outcome.observed_session.clone();
             finish_success(
                 &ctx,
@@ -1263,6 +1246,26 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         )
         .await;
         return;
+    }
+    // The prior obligations are released only after every completion step,
+    // including the terminal status, stayed within this retry's budgets.
+    if retry_completed {
+        match ctx.recovery.discard(&inbound.group_ref).await {
+            Ok(_) => {
+                permit
+                    .queue
+                    .recovery_changed
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
+            Err(err) => {
+                warn!(target: TRACE_TARGET, method = "discard_recovery", error_kind = err.privacy_safe_kind(), "failed to discard completed recovery record");
+                if let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
+                    warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = reset_err.privacy_safe_kind(), "failed to restore retryable recovery state");
+                }
+            }
+        }
+        let _ =
+            discard_unresolved_turns(&ctx, &inbound.group_ref, Some(&inbound.message_ref)).await;
     }
     let pending_artifacts = ctx
         .outbox
@@ -1445,6 +1448,26 @@ impl TurnCollector {
             OutputLimitKind::ReplyChunks,
         )?;
         Ok(count)
+    }
+
+    /// Reserves the combined chunks of a complete batch before any item is
+    /// staged. On a breach nothing from the batch stays reserved.
+    fn reserve_reply_batch(
+        &mut self,
+        texts: &[String],
+        max_reply_bytes: usize,
+    ) -> std::result::Result<usize, OutputLimitKind> {
+        let mut reserved = 0usize;
+        for text in texts {
+            match self.reserve_reply_chunks(text, max_reply_bytes) {
+                Ok(count) => reserved += count,
+                Err(kind) => {
+                    self.release_reply_chunks(reserved);
+                    return Err(kind);
+                }
+            }
+        }
+        Ok(reserved)
     }
 
     /// Returns reserved chunks that were never staged or sent.
@@ -2848,17 +2871,18 @@ async fn deliver_buffered_text(
     delivery_failed: &mut bool,
     persist_failed: &mut bool,
 ) {
-    if *delivery_failed || *persist_failed {
+    if *delivery_failed || *persist_failed || gate.check_stop().is_err() {
+        return;
+    }
+    // The batch is complete, so an over-budget batch must not produce a partial reply.
+    if let Err(kind) = collector.reserve_reply_batch(buffered_text, ctx.cfg.max_reply_bytes) {
+        if let Some(output) = gate.output {
+            output.latch(kind);
+        }
         return;
     }
     for text in buffered_text {
         if gate.check_stop().is_err() {
-            return;
-        }
-        if let Err(kind) = collector.reserve_reply_chunks(text, ctx.cfg.max_reply_bytes) {
-            if let Some(output) = gate.output {
-                output.latch(kind);
-            }
             return;
         }
         let staged = match stage_text_chunks(
@@ -6007,6 +6031,278 @@ mod tests {
         server.abort();
     }
 
+    /// Buffers every text event behind a live artifact grant and declares no
+    /// artifacts, so completed text reaches the buffered fallback path.
+    struct BufferedTextBackend {
+        texts: Vec<String>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Backend for BufferedTextBackend {
+        fn artifact_support(&self) -> ArtifactSupport {
+            ArtifactSupport::CompletionFile
+        }
+
+        async fn run(
+            &self,
+            invocation: Invocation,
+            tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            assert!(
+                invocation.artifact_output.is_some(),
+                "grant must be live so completed text is buffered"
+            );
+            for text in &self.texts {
+                tx.send(RunnerEvent::Text(text.clone())).await.unwrap();
+            }
+            if self.fail {
+                return Err(RunFailure {
+                    error: HarnessError::BackendTimedOut,
+                    observed_session: None,
+                });
+            }
+            Ok(Outcome {
+                observed_session: None,
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
+    async fn run_buffered_fallback_case(
+        texts: &[&str],
+        fail: bool,
+        max_reply_chunks: usize,
+    ) -> (tempfile::TempDir, Arc<BridgeContext>, RecordedRequests) {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let export_root = root.path().join("exports");
+        std::fs::create_dir(&export_root).unwrap();
+        let mut config = limited_config(root.path(), |settings| {
+            settings.max_reply_chunks = max_reply_chunks;
+        });
+        config.artifact_exports = crate::ArtifactExportConfig::new(
+            true,
+            vec![crate::ArtifactExportGrant {
+                group_id_hex: "group".to_owned(),
+                export_root,
+                ttl_seconds: 300,
+            }],
+            root.path().join("staging"),
+            root.path().join("outbox.json"),
+        );
+        let (_server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            Arc::new(BufferedTextBackend {
+                texts: texts.iter().map(|text| (*text).to_owned()).collect(),
+                fail,
+            }),
+        );
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+        (root, ctx, requests)
+    }
+
+    #[tokio::test]
+    async fn buffered_fallback_batch_over_the_chunk_budget_stages_and_sends_nothing() {
+        for fail in [false, true] {
+            let (_root, ctx, requests) = run_buffered_fallback_case(&["one", "two"], fail, 1).await;
+
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "no batch item, status or failure reply may be sent (fail={fail})"
+            );
+            assert!(ctx.deliveries.list().await.is_empty());
+            assert_eq!(
+                ctx.deliveries
+                    .turn_budget("group", "message")
+                    .await
+                    .unwrap()
+                    .phase,
+                crate::store::TurnPhase::Limited
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_fallback_batch_exactly_at_the_chunk_budget_is_delivered() {
+        let (_root, ctx, requests) = run_buffered_fallback_case(&["one", "two"], false, 2).await;
+        assert_eq!(final_texts(&requests), vec!["one", "two"]);
+        assert!(ctx.deliveries.list().await.is_empty());
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "message")
+                .await
+                .is_none()
+        );
+
+        let (_root, ctx, requests) = run_buffered_fallback_case(&["one", "two"], true, 2).await;
+        let finals = final_texts(&requests);
+        assert_eq!(
+            finals.len(),
+            3,
+            "both items plus the ordinary failure reply"
+        );
+        assert_eq!(&finals[..2], ["one", "two"]);
+        assert!(ctx.deliveries.list().await.is_empty());
+    }
+
+    /// Seeds a limited earlier turn holding an acknowledgement-unknown chunk and
+    /// a pending recovery that `/retry-last` will consume.
+    async fn seed_limited_turn_with_recovery(ctx: &BridgeContext, repo: &std::path::Path) {
+        ctx.deliveries
+            .set(
+                "group:original:1",
+                FinalDeliveryRecord {
+                    account_ref: "account".to_owned(),
+                    group_ref: "group".to_owned(),
+                    reply_to_ref: "original".to_owned(),
+                    text: "original chunk".to_owned(),
+                    chunk_index: 1,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.deliveries
+            .begin_turn("group", "original", 4)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.deliveries
+                .reserve_send("group", "original", SendMode::Live, 4)
+                .await
+                .unwrap(),
+            SendAdmission::Admitted
+        );
+        ctx.deliveries
+            .limit_turn("group", "original", 4)
+            .await
+            .unwrap();
+        ctx.recovery
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "private prompt".to_owned(),
+                    media: Vec::new(),
+                    cwd: repo.to_path_buf(),
+                    session_id: "session".to_owned(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Pending,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn assert_original_obligation_retained(deliveries: &FinalDeliveryStore) {
+        let original = deliveries.turn_budget("group", "original").await.unwrap();
+        assert_eq!(original.phase, crate::store::TurnPhase::Limited);
+        assert_eq!(original.sends_charged, 1);
+        let retry = deliveries.turn_budget("group", "retry").await.unwrap();
+        assert_eq!(retry.phase, crate::store::TurnPhase::Limited);
+        assert_eq!(retry.sends_charged, 1);
+        let pending = deliveries.list().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "group:original:1");
+        assert_eq!(pending[0].1.text, "original chunk");
+        assert!(deliveries.has_incomplete_final("group").await);
+        assert!(deliveries.list_reconcilable().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_whose_status_breaches_the_send_budget_keeps_original_obligations() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = limited_config(root.path(), |settings| settings.max_durable_sends = 1);
+        let delivery_path = config.state_path.with_extension("delivery.json");
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(vec![RunnerEvent::LivenessUnknown], Some("session")),
+        );
+        seed_limited_turn_with_recovery(&ctx, &repo).await;
+
+        assert!(dispatch_test_message(ctx.clone(), "retry", "/retry-last").await);
+
+        // Only the liveness notice was admitted; the no-text status breached.
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert!(matches!(
+            &recorded[0],
+            AgentControlRequest::SendFinal { text, .. } if text.contains(LIVENESS_UNKNOWN_TEXT)
+        ));
+        assert_original_obligation_retained(&ctx.deliveries).await;
+        let recovery = ctx.recovery.get("group").await.unwrap();
+        assert_eq!(recovery.kind, RecoveryKind::UncertainOutcome);
+        assert_eq!(recovery.status, RecoveryStatus::Pending);
+        assert!(fifo_is_blocked(&ctx, "group").await);
+
+        let reloaded = FinalDeliveryStore::load(delivery_path).unwrap();
+        assert_original_obligation_retained(&reloaded).await;
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(ctx.deliveries.list().await.is_empty());
+        for reply_to in ["original", "retry"] {
+            assert!(
+                ctx.deliveries
+                    .turn_budget("group", reply_to)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(ctx.recovery.get("group").await.is_none());
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        // The discard confirmation is a connector reply, not turn output.
+        let finals = final_texts(&requests);
+        assert_eq!(finals.len(), 2);
+        assert!(!finals.iter().any(|text| text == "original chunk"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_within_every_budget_clears_original_obligations() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = limited_config(root.path(), |settings| settings.max_durable_sends = 2);
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["done"]), Some("session")),
+        );
+        seed_limited_turn_with_recovery(&ctx, &repo).await;
+
+        assert!(dispatch_test_message(ctx.clone(), "retry", "/retry-last").await);
+
+        assert_eq!(final_texts(&requests), vec!["done"]);
+        assert!(ctx.deliveries.list().await.is_empty());
+        for reply_to in ["original", "retry"] {
+            assert!(
+                ctx.deliveries
+                    .turn_budget("group", reply_to)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(!ctx.deliveries.has_incomplete_final("group").await);
+        assert!(ctx.recovery.get("group").await.is_none());
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn turns_within_every_budget_complete_and_prune_their_budget() {
         let root = tempfile::tempdir().unwrap();
@@ -6165,6 +6461,14 @@ mod tests {
         );
         collector.release_reply_chunks(2);
         assert_eq!(collector.reserve_reply_chunks("abcd", 4), Ok(1));
+
+        collector.release_reply_chunks(1);
+        let batch = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        assert_eq!(
+            collector.reserve_reply_batch(&batch, 4),
+            Err(OutputLimitKind::ReplyChunks)
+        );
+        assert_eq!(collector.reserve_reply_batch(&batch[..2], 4), Ok(2));
     }
 
     #[tokio::test]
@@ -6213,5 +6517,139 @@ mod tests {
                 .sends_charged,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn stale_reconciliation_snapshot_cannot_replay_a_turn_that_became_active() {
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let client = ControlClient::new(config.socket.clone(), None, Duration::from_secs(1), "wn");
+        let deliveries = FinalDeliveryStore::load(root.path().join("delivery.json")).unwrap();
+        deliveries
+            .set(
+                "group:message:1",
+                FinalDeliveryRecord {
+                    account_ref: "account".to_owned(),
+                    group_ref: "group".to_owned(),
+                    reply_to_ref: "message".to_owned(),
+                    text: "pending".to_owned(),
+                    chunk_index: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = deliveries.list_reconcilable().await;
+        assert_eq!(snapshot.len(), 1);
+        deliveries.begin_turn("group", "message", 4).await.unwrap();
+
+        let (_, record) = &snapshot[0];
+        let gate = TurnGate::replay(&deliveries, &record.group_ref, &record.reply_to_ref, 4);
+        let result = send_final_with_retry(
+            &client,
+            Some(gate),
+            &record.account_ref,
+            &record.group_ref,
+            &record.reply_to_ref,
+            &record.text,
+            record.chunk_index,
+        )
+        .await;
+
+        assert!(matches!(result, Err(HarnessError::DeliveryWithheld)));
+        assert!(requests.lock().unwrap().is_empty());
+        let budget = deliveries.turn_budget("group", "message").await.unwrap();
+        assert_eq!(budget.phase, crate::store::TurnPhase::Active);
+        assert_eq!(budget.sends_charged, 0);
+        assert_eq!(deliveries.list().await.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_during_an_admitted_request_abandons_it_and_admits_nothing_more() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("hold.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        // Accepts and holds each connection without ever acknowledging it.
+        let server = tokio::spawn(async move {
+            let mut accepted_tx = Some(accepted_tx);
+            let mut held = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                counted.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+                if let Some(tx) = accepted_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        let client = ControlClient::new(socket, None, Duration::from_secs(30), "wn");
+        let deliveries = FinalDeliveryStore::load(root.path().join("delivery.json")).unwrap();
+        deliveries.begin_turn("group", "message", 4).await.unwrap();
+        let output = TurnOutputControl::default();
+        let gate = TurnGate {
+            deliveries: &deliveries,
+            group_ref: "group",
+            reply_to_ref: "message",
+            mode: SendMode::Live,
+            default_max: 4,
+            output: Some(&output),
+        };
+
+        let (result, ()) = tokio::join!(
+            send_final_with_retry(
+                &client,
+                Some(gate),
+                "account",
+                "group",
+                "message",
+                "text",
+                1
+            ),
+            async {
+                accepted_rx.await.unwrap();
+                output.latch(OutputLimitKind::ReplyChunks);
+            }
+        );
+
+        assert!(matches!(
+            result,
+            Err(HarnessError::OutputLimitExceeded {
+                kind: OutputLimitKind::ReplyChunks
+            })
+        ));
+        // The admitted attempt stays charged: its effect is unknown, not refunded.
+        let charged = || async {
+            deliveries
+                .turn_budget("group", "message")
+                .await
+                .unwrap()
+                .sends_charged
+        };
+        assert_eq!(charged().await, 1);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+
+        let again = send_final_with_retry(
+            &client,
+            Some(gate),
+            "account",
+            "group",
+            "message",
+            "text",
+            2,
+        )
+        .await;
+        assert!(matches!(
+            again,
+            Err(HarnessError::OutputLimitExceeded { .. })
+        ));
+        assert_eq!(charged().await, 1);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

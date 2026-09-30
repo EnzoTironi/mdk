@@ -134,7 +134,7 @@ rejected at startup without echoing the value.
 | `MAX_ASSISTANT_TEXT_EVENTS` | 256 | 4096 | Parsed assistant-text events |
 | `MAX_ARTIFACT_BUFFER_BYTES` | 512 KiB | 4 MiB | Assistant text retained as an artifact caption, including separators |
 | `ARTIFACT_MAX_COUNT` | 10 | 10 | Declared artifacts summed across every artifact event in the turn |
-| `MAX_REPLY_CHUNKS` | 64 | 256 | Reply chunks staged for the turn; a text that would cross the cap stages none of its chunks |
+| `MAX_REPLY_CHUNKS` | 64 | 256 | Reply chunks staged for the turn; a text, or a completed buffered batch, that would cross the cap stages none of its chunks |
 | `MAX_DURABLE_SENDS` | 128 | 512 | Final, media, and activity requests for the turn, including every retry and status notice |
 
 The stdout framer never buffers more than one record plus a fixed scratch
@@ -152,7 +152,10 @@ are withheld from reconciliation. When a backend session is known, the prompt
 is kept as an uncertain-outcome recovery record because the backend may already
 have acted; `/retry-last` reruns it and `/discard-last` clears it. Without a
 session the barrier is discard-only. Either command releases the group's FIFO
-lane; other groups are unaffected.
+lane; other groups are unaffected. A retry releases the earlier turn's pending
+deliveries only after its own completion, including its final status notice,
+stays within every limit; a retry that breaches a limit keeps both turns behind
+the barrier until `/discard-last`.
 
 Durable send budgets survive restarts. Startup and periodic reconciliation
 replay staged chunks only for turns that have finished, charge each replay

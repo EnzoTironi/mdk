@@ -689,7 +689,9 @@ impl FinalDeliveryStore {
     /// Durably charges one send attempt before its effect. Replay is admitted
     /// only for reconcilable turns, so stale reconciliation snapshots cannot
     /// race a live, crashed or limited turn. A legacy entry without a budget
-    /// receives a fresh finite budget of `default_max` sends.
+    /// receives a fresh finite budget of `default_max` sends. `Live` callers
+    /// must already hold the active budget persisted by `begin_turn`, whose
+    /// failure prevents the backend from spawning.
     pub(crate) async fn reserve_send(
         &self,
         group_ref: &str,
