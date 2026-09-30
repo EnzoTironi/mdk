@@ -2836,10 +2836,17 @@ async fn finished_worker_is_replaced_on_first_requested_lookup() {
         },
     );
 
-    let replacement = timeout(Duration::from_secs(5), manager.worker_commands("alice"))
-        .await
-        .expect("lookup completes")
-        .expect("finished worker is replaced on first lookup");
+    // This lookup also opens a cold SQLCipher account. Bound it by the runtime
+    // readiness contract plus teardown margin; a five-second wall-clock bound
+    // races the encrypted open on contended CI runners. The regression below
+    // still requires replacement on this first lookup, without a later retry.
+    let replacement = timeout(
+        APP_RUNTIME_ACCOUNT_READY_WAIT + APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
+        manager.worker_commands("alice"),
+    )
+    .await
+    .expect("lookup completes")
+    .expect("finished worker is replaced on first lookup");
     assert!(!replacement.same_channel(&old_commands));
     assert!(manager.workers.lock().await[&account.account_id_hex].ready);
     runtime.shutdown().await;
@@ -2868,10 +2875,13 @@ async fn finished_worker_is_replaced_on_first_batch_reconcile() {
         },
     );
 
-    timeout(Duration::from_secs(5), runtime.reconcile_accounts())
-        .await
-        .expect("batch reconcile completes")
-        .expect("finished worker is replaced in the same batch");
+    timeout(
+        APP_RUNTIME_ACCOUNT_READY_WAIT + APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
+        runtime.reconcile_accounts(),
+    )
+    .await
+    .expect("batch reconcile completes")
+    .expect("finished worker is replaced in the same batch");
     let replacement = manager
         .worker_commands("alice")
         .await

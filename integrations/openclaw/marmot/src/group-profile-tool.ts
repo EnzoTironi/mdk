@@ -52,10 +52,12 @@ export function createMarmotGroupProfileTool(ctx: OpenClawPluginToolContext, fal
         return textResult({ ok: true, ...response });
       } catch (error) {
         if (error instanceof AgentControlError && !error.retryable &&
-            !["invalid_group_profile_response", "wrong_protocol", "agent_control_error"].includes(error.code)) {
-          return textResult({ ok: false, error: error.code, outcome: "rejected" });
+            ["not_group_admin", "invalid_group_profile", "unauthorized", "invalid_hex"].includes(error.code)) {
+          return textResult({ ok: false, error: error.code, outcome: "rejected", retryable: false,
+            control_retryable: error.retryable });
         }
         return textResult({ ok: false, error: "group_profile_outcome_unknown", outcome: "unknown", retryable: false,
+          ...(error instanceof AgentControlError ? { control_error: error.code, control_retryable: error.retryable } : {}),
           hint: "Check the current group details before retrying; the update may have committed." });
       }
     },

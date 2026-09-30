@@ -37,7 +37,19 @@ describe("marmot_group_profile", () => {
   it("projects admin rejection without exposing server error prose", async () => {
     mocks.update.mockRejectedValue(new AgentControlError("private detail", { code: "not_group_admin" }));
     const result = await createMarmotGroupProfileTool({ config: {} } as never, {}).execute("call", { group_id_hex: "22".repeat(16), name: "New" });
-    expect(result.details).toEqual({ ok: false, error: "not_group_admin", outcome: "rejected" });
+    expect(result.details).toEqual({ ok: false, error: "not_group_admin", outcome: "rejected", retryable: false,
+      control_retryable: false });
+  });
+  it("keeps post-commit control errors uncertain and preserves their retryability separately", async () => {
+    const tool = createMarmotGroupProfileTool({ config: {} } as never, {});
+    for (const [code, retryable] of [["app_error", false], ["app_error", true], ["not_group_admin", true]] as const) {
+      mocks.update.mockRejectedValue(new AgentControlError("private detail", { code, retryable }));
+      const result = await tool.execute("call", { group_id_hex: "22".repeat(16), name: "New" });
+      expect(result.details).toMatchObject({ ok: false, outcome: "unknown", retryable: false,
+        control_error: code, control_retryable: retryable });
+      expect(JSON.stringify(result)).not.toContain("private detail");
+    }
+    expect(mocks.update).toHaveBeenCalledTimes(3);
   });
   it("never retries a timeout, EOF or malformed response", async () => {
     const tool = createMarmotGroupProfileTool({ config: {} } as never, {});

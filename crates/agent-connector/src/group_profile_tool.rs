@@ -7,7 +7,7 @@ use agent_control::{AgentControlRequest, AgentControlResponse};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::bootstrap::{BootstrapError, ControlClient};
+use crate::bootstrap::ControlClient;
 
 /// Explicit local route; deliberately excludes secrets and identifiers from Debug.
 pub struct GroupProfileToolConfig {
@@ -69,17 +69,33 @@ pub async fn run_group_profile_tool(config: GroupProfileToolConfig, input: &[u8]
             {
                 json!({"ok": true, "group_id_hex": group_id_hex, "message_ids_hex": message_ids_hex})
             }
-            AgentControlResponse::Error { code, .. } => {
-                // Return stable codes, never server-provided paths or error prose.
-                json!({"ok": false, "error": code, "outcome": "rejected"})
-            }
+            AgentControlResponse::Error {
+                code, retryable, ..
+            } => control_error(code, retryable),
             _ => unknown_outcome(),
         },
-        Err(BootstrapError::ControlRejected { code, .. }) => {
-            json!({"ok": false, "error": code, "outcome": "rejected"})
-        }
         Err(_) => unknown_outcome(),
     }
+}
+
+fn control_error(code: String, retryable: bool) -> Value {
+    // Only explicit pre-mutation validation/authorization errors prove rejection.
+    // A generic app/storage/publish error can occur after the commit is durable,
+    // even when the connector marks that error non-retryable.
+    if !retryable
+        && matches!(
+            code.as_str(),
+            "not_group_admin" | "invalid_group_profile" | "unauthorized" | "invalid_hex"
+        )
+    {
+        return json!({"ok": false, "error": code, "outcome": "rejected", "retryable": false,
+            "control_retryable": retryable});
+    }
+    let mut result = unknown_outcome();
+    result["control_error"] = json!(code);
+    // Preserve the wire flag separately from permission to repeat this mutation.
+    result["control_retryable"] = json!(retryable);
+    result
 }
 
 fn unknown_outcome() -> Value {
@@ -125,7 +141,7 @@ mod tests {
     #[tokio::test]
     async fn partial_update_clear_admin_rejection_and_unknown_outcome_use_one_request() {
         let root = tempfile::tempdir().unwrap();
-        for scenario in 0..4 {
+        for scenario in 0..7 {
             let socket = root.path().join(format!("socket-{scenario}"));
             let listener = UnixListener::bind(&socket).unwrap();
             let server = tokio::spawn(async move {
@@ -152,11 +168,15 @@ mod tests {
                 if scenario == 3 {
                     return;
                 }
-                let payload = if scenario == 2 {
+                let payload = if scenario == 2 || scenario >= 4 {
                     AgentControlResponse::Error {
-                        code: "not_group_admin".into(),
+                        code: if scenario == 2 || scenario == 6 {
+                            "not_group_admin".into()
+                        } else {
+                            "app_error".into()
+                        },
                         message: "private detail".into(),
-                        retryable: false,
+                        retryable: scenario >= 5,
                     }
                 } else {
                     AgentControlResponse::GroupProfileUpdated {
@@ -181,6 +201,13 @@ mod tests {
                 0 => assert_eq!(result["ok"], true),
                 2 => {
                     assert_eq!(result["error"], "not_group_admin");
+                    assert_eq!(result["control_retryable"], false);
+                    assert!(!result.to_string().contains("private detail"));
+                }
+                4..=6 => {
+                    assert_eq!(result["outcome"], "unknown");
+                    assert_eq!(result["retryable"], false);
+                    assert_eq!(result["control_retryable"], scenario >= 5);
                     assert!(!result.to_string().contains("private detail"));
                 }
                 _ => assert_eq!(result["outcome"], "unknown"),
