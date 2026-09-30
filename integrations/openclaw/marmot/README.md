@@ -55,6 +55,18 @@ contain only fixed reason classes and aggregate limits/counts, never identifiers
 - Pinned OpenClaw development SDK: **`openclaw@2026.7.1-2`**.
 - Toolchain: TypeScript, pnpm, Node ≥ 22.19, Vitest.
 
+## Admin group profile tool
+
+The model-callable `marmot_group_profile` tool updates an existing group name,
+description, or both through the selected Marmot delivery account. Supply
+`group_id_hex` and at least one field. Omit a field to keep it; an empty string
+clears it. Names are bounded to 256 UTF-8 bytes and descriptions to 4096 bytes.
+MDK requires current group admin authority when committing. Successful replies
+include the published commit message ids. Transport timeouts or invalid
+acknowledgements have an unknown outcome and are never retried automatically;
+check current group details before retrying. This tool preserves the existing
+full-control socket authentication boundary.
+
 ## Install (release)
 
 Versioned `wn-agent` builds and this plugin are published as [`wn-agent-v*`](https://github.com/marmot-protocol/mdk/releases)

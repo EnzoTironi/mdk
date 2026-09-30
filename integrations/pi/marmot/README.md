@@ -114,6 +114,14 @@ shared harness answers its own reserved commands, including `/help`, `/status`,
 documented in the
 [shared chat-command reference](../../terminal-harness/README.md#chat-commands).
 
+## Admin group profile updates
+
+This harness exposes the shared `wn-agent group-profile` command to the agent
+for the active conversation. It supports name and description changes for
+current admins, partial updates and explicit clearing. See the
+[shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates)
+for routing, release compatibility, permissions and uncertain outcomes.
+
 ## Configuration
 
 | Environment variable | Default | Meaning |

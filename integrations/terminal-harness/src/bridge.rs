@@ -828,18 +828,27 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         idle_timeout: ctx.cfg.backend_idle_timeout,
         cwd: cwd.clone(),
         session_id,
-        prompt,
+        prompt: format!("{prompt}{}", crate::group_profile::INSTRUCTIONS),
         artifact_output,
     };
     let (tx, mut rx) = mpsc::channel(16);
     let backend = ctx.backend.clone();
+    let control_context = crate::GroupProfileContext {
+        socket: ctx.cfg.socket.clone(),
+        auth_token: ctx.cfg.auth_token.clone(),
+        account_id_hex: inbound.account_ref.clone(),
+        group_id_hex: inbound.group_ref.clone(),
+        request_timeout: ctx.cfg.request_timeout,
+    };
     let runner = tokio::spawn(async move {
         // The staging lease lives in the backend task so its paths cannot
         // disappear while that task still has access to them.
         let _attachment_batch = attachment_batch;
-        backend
-            .run_with_attachments(invocation, attachments, tx)
-            .await
+        crate::with_group_profile_context(
+            control_context,
+            backend.run_with_attachments(invocation, attachments, tx),
+        )
+        .await
     });
     // Dropping a JoinHandle detaches its task. Abort explicitly when this
     // message handler is cancelled so the task drops its staging lease too.
@@ -3958,10 +3967,17 @@ mod tests {
 
         let invocations = backend.invocations.lock().await;
         assert_eq!(invocations.len(), 2);
-        assert_eq!(invocations[0].prompt, "  /status \n");
+        assert_eq!(
+            invocations[0].prompt,
+            format!("  /status \n{}", crate::group_profile::INSTRUCTIONS)
+        );
         assert_eq!(
             invocations[1].prompt,
-            commands::apply_goal("finish the migration", "check status")
+            format!(
+                "{}{}",
+                commands::apply_goal("finish the migration", "check status"),
+                crate::group_profile::INSTRUCTIONS
+            )
         );
         assert_eq!(
             invocations[1]

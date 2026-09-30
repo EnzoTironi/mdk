@@ -115,6 +115,14 @@ as independent lanes. Do not resume the connector-owned UUID concurrently from
 another Claude Code client. V1 does not claim simultaneous TUI observation or
 a shared event bus.
 
+## Admin group profile updates
+
+This harness exposes the shared `wn-agent group-profile` command to the agent
+for the active conversation. It supports name and description changes for
+current admins, partial updates and explicit clearing. See the
+[shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates)
+for routing, release compatibility, permissions and uncertain outcomes.
+
 ## Configuration
 
 | Environment variable | Default | Meaning |

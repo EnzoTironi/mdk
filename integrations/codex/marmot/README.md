@@ -122,6 +122,14 @@ never retried automatically. `/goal <text>` stores a standing instruction that
 the harness prepends to every later prompt in that chat, which keeps the
 instruction alive across thread resets and Codex-side context compaction.
 
+## Admin group profile updates
+
+This harness exposes the shared `wn-agent group-profile` command to the agent
+for the active conversation. It supports name and description changes for
+current admins, partial updates and explicit clearing. See the
+[shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates)
+for routing, release compatibility, permissions and uncertain outcomes.
+
 ## Configuration
 
 | Environment variable | Default | Meaning |
