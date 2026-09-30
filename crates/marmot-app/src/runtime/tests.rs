@@ -2745,6 +2745,11 @@ async fn account_setup_create_identity_rejects_import_nsec_sidecar() {
     assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }
 
+/// Deadline for a real account open (SQLCipher key derivation and migrations)
+/// to reach or finish. Debug CI runners already spend over four seconds there,
+/// so this bounds a hang rather than timing the open.
+const ACCOUNT_OPEN_TEST_DEADLINE: Duration = Duration::from_secs(30);
+
 fn install_local_open_gate(
     app: &MarmotApp,
     account_ref: &str,
@@ -2759,7 +2764,7 @@ fn install_local_open_gate(
 async fn wait_for_test_signal(receiver: std::sync::mpsc::Receiver<()>, signal: &'static str) {
     tokio::task::spawn_blocking(move || {
         receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(ACCOUNT_OPEN_TEST_DEADLINE)
             .unwrap_or_else(|err| panic!("timed out waiting for {signal}: {err}"));
     })
     .await
@@ -2836,17 +2841,10 @@ async fn finished_worker_is_replaced_on_first_requested_lookup() {
         },
     );
 
-    // This lookup also opens a cold SQLCipher account. Bound it by the runtime
-    // readiness contract plus teardown margin; a five-second wall-clock bound
-    // races the encrypted open on contended CI runners. The regression below
-    // still requires replacement on this first lookup, without a later retry.
-    let replacement = timeout(
-        APP_RUNTIME_ACCOUNT_READY_WAIT + APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
-        manager.worker_commands("alice"),
-    )
-    .await
-    .expect("lookup completes")
-    .expect("finished worker is replaced on first lookup");
+    let replacement = timeout(ACCOUNT_OPEN_TEST_DEADLINE, manager.worker_commands("alice"))
+        .await
+        .expect("lookup completes")
+        .expect("finished worker is replaced on first lookup");
     assert!(!replacement.same_channel(&old_commands));
     assert!(manager.workers.lock().await[&account.account_id_hex].ready);
     runtime.shutdown().await;
@@ -2875,13 +2873,10 @@ async fn finished_worker_is_replaced_on_first_batch_reconcile() {
         },
     );
 
-    timeout(
-        APP_RUNTIME_ACCOUNT_READY_WAIT + APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
-        runtime.reconcile_accounts(),
-    )
-    .await
-    .expect("batch reconcile completes")
-    .expect("finished worker is replaced in the same batch");
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, runtime.reconcile_accounts())
+        .await
+        .expect("batch reconcile completes")
+        .expect("finished worker is replaced in the same batch");
     let replacement = manager
         .worker_commands("alice")
         .await
@@ -3014,7 +3009,7 @@ async fn failed_account_startup_preserves_ready_sibling() {
         wait_for_test_signal(bob_reached, "bob open"),
     );
     bob_proceed.send(()).expect("release healthy bob");
-    timeout(Duration::from_secs(5), async {
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
         loop {
             if manager.workers.lock().await[&bob.account_id_hex].ready {
                 break;

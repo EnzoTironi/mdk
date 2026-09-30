@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-09-28
+updated: 2026-09-30
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -197,15 +197,26 @@ every cause and every caller runs it:
   not compared.
 - Known-event demand compares its route and completes once that exact event is durably
   retained.
+- A startup or explicit-sync comparison request records its routes as incremental-history
+  debt, and each comparison pass compares that debt, never the live routing snapshot. A
+  selected obligation contributes the scopes its grant installs, which follow the current
+  relays and keep their windows, including routes discovered after the request, such as a
+  group joined from a Welcome during startup. Otherwise the pass uses the stored scopes. So
+  a comparison queries exactly the relays its settlement certifies, and a route, window or
+  relay that changed after the request cannot make the plan invalid. Certifying that debt
+  settles the request with it.
 - A route compares all of its relays in one request, each under its own deadline, however
   many relays it lists.
-- Explicit catch-up, `sync()` and a directly owned client's `next_event()` drain the live
-  queue first, so the frozen inventory holds what the live subscriptions delivered. With
-  debt a grant could select, they then wait for a credit, drain once more and run one job
-  in place, holding the credit through admission and checkpoint; without it they take no
-  credit. The worker keeps serving snapshot reads while
-  an explicit caller's job runs. Startup runs its job only when a credit is free. Without a
-  credit nothing is selected, so no reservation is spent.
+- A runtime catch-up (host `catch_up_accounts` and the post-mutation catch-ups) only drains
+  the live queue, like a delivery. It joins no comparison, takes no credit and runs no job,
+  so it crosses a worker-owned job instead of holding sends and conversation opens behind
+  it; the owner's paced job serves the debt (mdk#2110).
+- `sync()` and a directly owned client's `next_event()` have no worker to run that job.
+  They drain the live queue first, so the frozen inventory holds what the live
+  subscriptions delivered. With debt a grant could select, they then wait for a credit,
+  drain once more and run one job in place, holding the credit through admission and
+  checkpoint; without it they take no credit. Startup runs its job only when a credit is
+  free. Without a credit nothing is selected, so no reservation is spent.
 - Explicit repair runs the job in place too. Its one pass compares every route of the grant
   inside the first 50 seconds of its 60-second budget. At that network deadline a route
   still comparing times out and the routes that finished come back; their events are
