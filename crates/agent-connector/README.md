@@ -71,6 +71,16 @@ path below the limit can still be too long after staging. Startup reports
 logging the path. Use a shorter `--home` or an explicit shorter `--socket` path
 inside an appropriately private directory; do not relax its permissions.
 
+For the default `<home>/dev/wn-agent.sock`, let `H` be the encoded byte length of
+the home path without a trailing slash and `P` the number of decimal PID digits.
+The final address uses `H + 18` bytes; the staging address uses `H + 39 + P`.
+Therefore the home budget is `107 - 39 - P` bytes on Linux and `103 - 39 - P`
+on macOS. With a seven-digit PID, that is at most 61 and 57 bytes respectively.
+Count the expanded path (not a literal `~`) in bytes rather than characters;
+non-ASCII components can consume multiple bytes per character. A custom
+`--socket` changes this calculation: measure both its final address and
+`<parent>/.sock.<pid>.<filename>/<filename>` against the platform limit.
+
 In another terminal, create or reuse the local agent account and print the phone invite details:
 
 ```sh
