@@ -68,8 +68,11 @@ all of the account's active reactions on the target in one durable delete event.
 `edit_message` lets a control client update a message authored by the selected
 local account. Supply `account_id_hex`, `group_id_hex`, `target_message_id_hex`,
 and replacement `text`. Before publishing, `wn-agent` checks that the target is
-visible, available, and self-authored; a foreign, deleted, or missing target is
-rejected. A successful request returns `final_sent` with the edit event id. This
+visible, available, self-authored, and a kind-9 chat message
+(`MARMOT_APP_EVENT_KIND_CHAT`). A foreign, deleted, invalidated, missing, or
+non-chat target is rejected before publication with the non-retryable
+`invalid_edit_target` error code; `unauthorized` remains reserved for peer
+authorization failures. A successful request returns `final_sent` with the edit event id. This
 lets an agent update a pinned status message without adding another chat row.
 
 An edit has no idempotency key. If the response is lost after publication, read

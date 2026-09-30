@@ -294,7 +294,7 @@ impl AgentConnector {
         })
     }
 
-    /// Require a visible self-authored target before publishing an edit event.
+    /// Require an available, visible, self-authored chat target before publishing an edit event.
     pub(crate) async fn edit_message_response(
         &self,
         account_id_hex: &str,
@@ -313,9 +313,10 @@ impl AgentConnector {
                 message: Some(message),
                 ..
             } if message.sender.account_id_hex == account.account_id_hex
+                && message.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
                 && message.availability
                     == agent_control::AgentControlTimelineMessageAvailability::Available => {}
-            _ => return Err(ConnectorError::Unauthorized),
+            _ => return Err(ConnectorError::InvalidEditTarget),
         }
         let summary = self
             .runtime
