@@ -118,7 +118,10 @@ server-provided error string or attachment metadata into those replies.
 ## Admin group profile updates
 
 Codex, Claude Code, OpenCode and Pi receive the same connector-provided control
-instructions on each turn, including resumed turns. When the user asks the
+instructions on each ordinary turn, including resumed turns. Literal `//`
+forwarding omits this suffix, including after durable recovery and `/retry-last`.
+Old recovery records without a forwarding discriminator retain ordinary-turn
+behavior. When the user asks the
 agent to change this conversation's name or description, it can invoke the
 `wn-agent` binary from the same release bundle with a JSON object on stdin:
 
