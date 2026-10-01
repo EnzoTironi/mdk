@@ -4,6 +4,13 @@
 
 ### Added
 
+- `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair
+  without signing or publishing. `OnboardingRepairProposalFfi.relay_repair` carries
+  the typed before/after tags, exact diff, restored capabilities and ManualReview
+  mode. Regenerate Swift/Kotlin bindings and update record initializers for the new
+  optional field. Optional passed-step previews retain readiness when dismissed
+  before approval.
+
 - `Marmot::poll_votes` pages each voter's effective poll selection
   (`PollVoteFfi`: voter account id, option ids, vote time) for a "View votes"
   sheet, 1..=100 per `PollVotePageFfi` with a `(voted_at, voter)` cursor. It

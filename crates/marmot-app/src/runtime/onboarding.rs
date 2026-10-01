@@ -2249,26 +2249,7 @@ impl AccountManager {
         if c.approved || c.snapshot.revision != revision || proposal.revision != revision {
             return Err(onboarding_error());
         }
-        if let Some(repair) = &proposal.relay_repair {
-            let (expected, read_relays, write_relays) = self.minimal_relay_repair(
-                proposal.step,
-                c.records[proposal.step.index()].as_ref(),
-                &c.options.default_relays,
-            );
-            if (repair.mode == OnboardingRelayRepairMode::RemovalOnly
-                && c.snapshot.steps[proposal.step.index()]
-                    .findings
-                    .iter()
-                    .any(|finding| finding.issue == OnboardingIssue::NoUsableRoute))
-                || expected.mode == OnboardingRelayRepairMode::ManualReview
-                || *repair != expected
-                || proposal.read_relays != read_relays
-                || proposal.write_relays != write_relays
-                || repair.original_event_id != proposal.previous_event_id
-            {
-                return Err(onboarding_error());
-            }
-        }
+        self.validate_typed_onboarding_repair(&c, &proposal)?;
         let sources = self
             .await_while_onboarding_live(
                 &account_id,
@@ -2324,6 +2305,34 @@ impl AccountManager {
         }
         Ok(c.snapshot)
     }
+    // Validate persisted approved previews again before their first signature, including after restart.
+    fn validate_typed_onboarding_repair(
+        &self,
+        c: &OnboardingCheckpoint,
+        proposal: &OnboardingRepairProposal,
+    ) -> Result<(), AppError> {
+        if let Some(repair) = &proposal.relay_repair {
+            let (expected, read_relays, write_relays) = self.minimal_relay_repair(
+                proposal.step,
+                c.records[proposal.step.index()].as_ref(),
+                &c.options.default_relays,
+            );
+            if (repair.mode == OnboardingRelayRepairMode::RemovalOnly
+                && c.snapshot.steps[proposal.step.index()]
+                    .findings
+                    .iter()
+                    .any(|finding| finding.issue == OnboardingIssue::NoUsableRoute))
+                || expected.mode == OnboardingRelayRepairMode::ManualReview
+                || *repair != expected
+                || proposal.read_relays != read_relays
+                || proposal.write_relays != write_relays
+                || repair.original_event_id != proposal.previous_event_id
+            {
+                return Err(onboarding_error());
+            }
+        }
+        Ok(())
+    }
     async fn publish_onboarding_repair(
         &self,
         c: &mut OnboardingCheckpoint,
@@ -2346,6 +2355,7 @@ impl AccountManager {
             }
         };
         if c.signed_repair.is_none() {
+            self.validate_typed_onboarding_repair(c, &proposal)?;
             self.require_live_onboarding_attempt(c)?;
             if account.external_signing {
                 c.set(

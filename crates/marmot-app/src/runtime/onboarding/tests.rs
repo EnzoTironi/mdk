@@ -1725,6 +1725,66 @@ async fn minimal_relay_repair_rejects_modified_preview_without_publication() {
 }
 
 #[tokio::test]
+async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signing() {
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://custom.example".into()],
+            vec!["r".into(), "wss://relay.damus.io".into()],
+        ],
+        "opaque content",
+        unix_now_seconds() - 1,
+    );
+    *network.events.lock().unwrap() = vec![source.clone()];
+    let mut checkpoint = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(source);
+    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+    runtime
+        .accounts()
+        .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let original = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+
+    for variant in 0..3 {
+        let mut changed = original.clone();
+        changed.approved = true;
+        let proposal = changed.snapshot.proposal.as_mut().unwrap();
+        match variant {
+            0 => proposal
+                .relay_repair
+                .as_mut()
+                .unwrap()
+                .proposed_content
+                .push_str(" modified"),
+            1 => proposal.relay_repair.as_mut().unwrap().after_tags[0].fields[1]
+                .push_str(".attacker"),
+            _ => proposal.read_relays.push("wss://attacker.example".into()),
+        }
+        runtime
+            .accounts()
+            .app
+            .account_home()
+            .set_account_onboarding(&id, &serde_json::to_vec(&changed).unwrap())
+            .unwrap();
+        assert!(runtime.accounts().run_onboarding(&id).await.is_err());
+        assert!(network.attempts.lock().unwrap().is_empty());
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn minimal_relay_repair_rejects_changed_source_without_publication() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let source = signed(
