@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-09-30
+updated: 2026-10-01
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -84,10 +84,14 @@ The simulator comes first; Jeff validates on a phone.
      It shows "history may be incomplete" and offers an explicit deep repair, which can
      still complete it with qualified coverage, or an explicit retirement. There are no
      further automatic retries.
-   - Comparisons whose required relays failed or timed out do not count toward the budget. A
-     relay that answered but could not hand over a claimed event, an event that was not
-     durably admitted, and a backend that cannot compare a route all give a finished answer,
-     so they do count.
+   - Comparisons whose required relays failed or timed out do not count toward the quiet
+     budget. A request that ran and was answered by at least one of the scope's required
+     relays spends a separate budget: after 6 such unserved comparisons for an unchanged
+     goal and required relays, the scope counts as exhausted too (mdk#2110). Six is where
+     retry pacing reaches its cap. A quiet comparison starts this count over. Offline
+     passes, local deadline cuts, unsupported backends and refused admission count nothing.
+     A relay that answered but could not hand over a claimed event, or whose events were
+     not durably admitted, still answered and can spend the quiet budget.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
 3. **Required relays are the relays we operate.** `MarmotAppConfig::recovery_operated_relays`

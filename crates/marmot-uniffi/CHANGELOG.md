@@ -11,6 +11,13 @@
   optional field. Optional passed-step previews retain readiness when dismissed
   before approval.
 
+- `create_identity`, `create_identity_with_profile`, `login`,
+  `login_recovering_incomplete_setup`, `login_external_signer` and
+  `publish_relay_lists` take a trailing `inbox_relays` argument, and
+  `OnboardingOptionsFfi` an `inbox_relays` field, that set the kind-10050 inbox
+  list separately from `default_relays`. Both default to empty, which declares
+  `default_relays` in both lists as before, so existing Swift, Kotlin and
+  Python callers keep working unchanged.
 - `Marmot::poll_votes` pages each voter's effective poll selection
   (`PollVoteFfi`: voter account id, option ids, vote time) for a "View votes"
   sheet, 1..=100 per `PollVotePageFfi` with a `(voted_at, voter)` cursor. It
@@ -27,6 +34,14 @@
   tags in `timeline.tags`, and `ConversationReactionFfi.reaction_message_id_hex`
   names the earliest active kind-7 for that emoji, whose custom image
   `list_media` returns under the same message id.
+
+### Changed
+
+- Attachment downloads report `Failed` instead of staying `RetryScheduled`
+  indefinitely when the blob is gone (404/410 everywhere) or its epoch key stays
+  unavailable for about eight minutes. Hosts should offer Retry: it derives a
+  missing key from retained epoch state, recovering attachments whose key was
+  never cached. Retry budgets are unchanged.
 
 
 ## 0.11.0 - 2026-09-29

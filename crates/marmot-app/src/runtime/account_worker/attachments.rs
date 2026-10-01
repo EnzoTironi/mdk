@@ -255,16 +255,31 @@ pub(super) fn schedule(
             storage.finish_attachment_preparation(&candidate, now, None)?;
             continue;
         };
-        let prepared = match client.prepare_background_attachment_download(&group, reference, max) {
+        // Queued explicit work (Retry, download again) derives a missing
+        // source-epoch key from the retained anchor; automatic work reads only
+        // what projection and sync cached.
+        let prepared = if explicit {
+            client
+                .cache_attachment_source_epoch_secret(&group, &reference)
+                .and_then(|()| {
+                    client.prepare_background_attachment_download(&group, reference, max)
+                })
+        } else {
+            client.prepare_background_attachment_download(&group, reference, max)
+        };
+        let prepared = match prepared {
             Ok(Some(prepared)) => prepared,
-            // Local readiness is not a failed transfer. Defer only this candidate
-            // for one maintenance tick, preserving siblings and their attempts.
+            // Local readiness is not a failed transfer. Defer only this candidate,
+            // preserving siblings and their attempts. The deferral streak is
+            // bounded: material that never arrives fails the job, not the loop.
             Ok(None) | Err(_) => {
-                storage.finish_attachment_preparation(
-                    &candidate,
-                    now,
-                    Some(now.saturating_add(15)),
-                )?;
+                if storage.defer_attachment_preparation(&candidate, now)? {
+                    tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "attachment_acquisition",
+                        "attachment decryption material stayed unavailable; acquisition failed"
+                    );
+                }
                 return Ok(more);
             }
         };

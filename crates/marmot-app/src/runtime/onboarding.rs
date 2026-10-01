@@ -296,14 +296,28 @@ pub struct OnboardingSnapshot {
     #[serde(default)]
     pub cancellation_pending: bool,
 }
-/// Hosts pass the same default relay set used by account creation. Discovery
+/// Hosts pass the same default relay sets used by account creation. Discovery
 /// relays are independent indexers. They are not advertised as account relays;
 /// generated-account setup may send public relay lists and profile metadata
 /// to them for discovery.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingOptions {
     pub default_relays: Vec<String>,
     pub discovery_relays: Vec<String>,
+    /// Recommended relays for the kind-10050 inbox list. Empty uses
+    /// `default_relays`, which otherwise serve both relay-list steps.
+    #[serde(default)]
+    pub inbox_relays: Vec<String>,
+}
+impl OnboardingOptions {
+    /// The recommended relays for a relay-list step.
+    fn defaults_for(&self, step: OnboardingStep) -> &[String] {
+        if step == OnboardingStep::InboxRelays && !self.inbox_relays.is_empty() {
+            &self.inbox_relays
+        } else {
+            &self.default_relays
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct OnboardingCheckpoint {
@@ -1179,8 +1193,12 @@ impl AccountManager {
         }))
     }
     fn validate_onboarding_options(&self, options: &OnboardingOptions) -> Result<(), AppError> {
-        for endpoints in [&options.default_relays, &options.discovery_relays] {
-            if endpoints.is_empty()
+        for (endpoints, required) in [
+            (&options.default_relays, true),
+            (&options.discovery_relays, true),
+            (&options.inbox_relays, false),
+        ] {
+            if (required && endpoints.is_empty())
                 || endpoints.len() > MAX_RELAYS
                 || self
                     .app
@@ -1615,6 +1633,7 @@ impl AccountManager {
         let options = OnboardingOptions {
             default_relays: c.options.default_relays.clone(),
             discovery_relays,
+            inbox_relays: c.options.inbox_relays.clone(),
         };
         self.validate_onboarding_options(&options)?;
         c.options = options;
@@ -1959,7 +1978,7 @@ impl AccountManager {
                     }
                     let defaults = c
                         .options
-                        .default_relays
+                        .defaults_for(step)
                         .iter()
                         .map(|relay| relay_key(relay))
                         .collect::<HashSet<_>>();
@@ -2055,7 +2074,7 @@ impl AccountManager {
                 .as_ref()
                 .map(raw_relay_keys)
                 .unwrap_or_default();
-            for relay in &c.options.default_relays {
+            for relay in c.options.defaults_for(step) {
                 let url = relay_key(relay);
                 if inherited.contains(&url) || known.contains_key(&url) {
                     continue;
