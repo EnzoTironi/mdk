@@ -904,6 +904,35 @@ impl FinalDeliveryStore {
         self.commit(&mut state, next).await
     }
 
+    /// `limit_turn` for a replay whose budget was exhausted. A discard may
+    /// tombstone or release the turn between the exhausted admission and this
+    /// call; that discard owns the turn, so only a turn still reconcilable or
+    /// limited is marked. Returns whether the turn is limited.
+    pub(crate) async fn limit_replayed_turn(
+        &self,
+        group_ref: &str,
+        reply_to_ref: &str,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().await;
+        if !matches!(
+            state.turn_phase(group_ref, reply_to_ref),
+            Some(TurnPhase::Reconcilable | TurnPhase::Limited)
+        ) {
+            return Ok(false);
+        }
+        let mut next = state.clone();
+        next.turn_budgets
+            .get_mut(&turn_key(group_ref, reply_to_ref))
+            .expect("replayed turn budget exists")
+            .phase = TurnPhase::Limited;
+        next.incomplete_finals
+            .entry(group_ref.to_owned())
+            .or_default()
+            .insert(reply_to_ref.to_owned());
+        self.commit(&mut state, next).await?;
+        Ok(true)
+    }
+
     /// Removes a reconcilable budget once no records or `keep` work remain.
     pub(crate) async fn prune_turn(
         &self,
@@ -1846,6 +1875,69 @@ mod tests {
         assert!(!store.blocks_group("group").await);
         assert!(!store.requires_recovery_command("group").await);
         assert!(store.turn_budget("group", "limited").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn exhausted_replay_limits_only_a_turn_not_owned_by_a_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        let store = FinalDeliveryStore::load(path.clone()).unwrap();
+        store.begin_turn("group", "turn", 1).await.unwrap();
+        for chunk in [1, 2] {
+            store
+                .set(&format!("turn:{chunk}"), delivery_record("turn", chunk))
+                .await
+                .unwrap();
+        }
+        store.finish_turn("group", "turn", false).await.unwrap();
+        assert_eq!(
+            store
+                .reserve_record_replay("turn:1", "group", "turn", 8)
+                .await
+                .unwrap(),
+            SendAdmission::Admitted
+        );
+        // Two concurrent replays of the turn both find its budget exhausted.
+        for key in ["turn:1", "turn:2"] {
+            assert_eq!(
+                store
+                    .reserve_record_replay(key, "group", "turn", 8)
+                    .await
+                    .unwrap(),
+                SendAdmission::Exhausted
+            );
+        }
+        assert!(store.limit_replayed_turn("group", "turn").await.unwrap());
+        assert_eq!(
+            store.turn_budget("group", "turn").await.unwrap().phase,
+            TurnPhase::Limited
+        );
+        assert!(store.has_incomplete_final("group").await);
+
+        // A discard tombstones the turn before the second replay records its
+        // limit, which must not turn the tombstone back into a limited turn.
+        let discarded = store.begin_discard("group", None).await.unwrap();
+        assert_eq!(discarded, vec!["turn".to_owned()]);
+        assert!(!store.limit_replayed_turn("group", "turn").await.unwrap());
+        let tombstone = store.turn_budget("group", "turn").await.unwrap();
+        assert_eq!(tombstone.phase, TurnPhase::Discarded);
+        assert_eq!(
+            (tombstone.sends_charged, tombstone.max_durable_sends),
+            (1, 1)
+        );
+        assert!(!store.has_incomplete_final("group").await);
+
+        // A limit recorded after the release neither recreates the turn nor
+        // re-blocks the group whose discard reported it released.
+        store.release_discarded("group", &discarded).await.unwrap();
+        assert!(!store.limit_replayed_turn("group", "turn").await.unwrap());
+        drop(store);
+        let store = FinalDeliveryStore::load(path).unwrap();
+        assert!(store.turn_budget("group", "turn").await.is_none());
+        assert!(store.list().await.is_empty());
+        assert!(!store.has_incomplete_final("group").await);
+        assert!(!store.blocks_group("group").await);
+        assert!(!store.requires_recovery_command("group").await);
     }
 
     #[tokio::test]

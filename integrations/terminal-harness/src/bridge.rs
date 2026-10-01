@@ -1862,7 +1862,6 @@ async fn replay_artifact_batches(ctx: &Arc<BridgeContext>, pending: Vec<PendingA
                     &ctx.deliveries,
                     &batch.group_ref,
                     &batch.reply_to_message_ref,
-                    default_max,
                     kind,
                 )
                 .await;
@@ -3082,14 +3081,7 @@ async fn reconcile_pending_deliveries(
                 "final-delivery replay withheld for an unresolved turn"
             ),
             Err(HarnessError::OutputLimitExceeded { kind }) => {
-                limit_replayed_turn(
-                    store,
-                    &record.group_ref,
-                    &record.reply_to_ref,
-                    default_max,
-                    kind,
-                )
-                .await;
+                limit_replayed_turn(store, &record.group_ref, &record.reply_to_ref, kind).await;
             }
             Err(err) => {
                 warn!(target: TRACE_TARGET, method = "final_reconcile", error_kind = err.privacy_safe_kind(), "final-delivery reconciliation remains pending");
@@ -3118,11 +3110,11 @@ async fn prune_replayed_turn(
 
 /// Stops replay for a turn whose durable-send budget is exhausted; its pending
 /// work stays behind the incomplete-final barrier until explicitly discarded.
+/// A turn already being discarded keeps its tombstone.
 async fn limit_replayed_turn(
     store: &FinalDeliveryStore,
     group_ref: &str,
     reply_to_ref: &str,
-    default_max: usize,
     kind: OutputLimitKind,
 ) {
     warn!(
@@ -3131,7 +3123,7 @@ async fn limit_replayed_turn(
         limit = kind.as_str(),
         "delivery replay exceeded its turn budget; remaining output is withheld"
     );
-    if let Err(err) = store.limit_turn(group_ref, reply_to_ref, default_max).await {
+    if let Err(err) = store.limit_replayed_turn(group_ref, reply_to_ref).await {
         warn!(target: TRACE_TARGET, method = "turn_budget", error_kind = err.privacy_safe_kind(), "failed to persist the limited turn");
     }
 }

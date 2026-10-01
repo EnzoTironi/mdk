@@ -199,8 +199,8 @@ never reaches the backend:
 | `/new` | End the active backend session and keep the workdir. |
 | `/reset-session` | Same as `/new`. |
 | `/session-status` | Reserved for the active-turn status lane; until that lane is supported, return an unavailable reply without invoking the backend. |
-| `/retry-last` | Retry the durable recovery record that currently blocks this chat. |
-| `/discard-last` | Discard the durable recovery record without replay. |
+| `/retry-last` | Retry the pending durable recovery record that blocks this chat. |
+| `/discard-last` | Discard the recovery record and any incomplete, interrupted, or limited turn that blocks this chat, without replay. |
 | `/goal <text>` | Store a standing instruction for this chat. `/goal` shows it; `/goal clear` removes it. |
 
 A reserved name used with arguments it does not accept, such as
@@ -239,11 +239,18 @@ That costs prompt tokens on every turn and, in exchange, survives session
 resets, lost session ids, and backend context compaction. Goals are bounded to
 4096 bytes and live only in the connector's private per-group state file.
 
-`/retry-last` and `/discard-last` are available only while one matching durable
-recovery record blocks that group. Retry consumes that record once and runs ahead
-of queued prompts; discard removes it without replay. An uncertain outcome warns
-that retrying may repeat side effects. Recovery state is stored in private files
-and is never included in logs or diagnostics.
+`/retry-last` and `/discard-last` run ahead of queued prompts and are refused
+while a turn is running. Retry requires a pending durable recovery record for
+that group: it consumes the record once and reruns its prompt in the saved
+session and workdir. A barrier without such a record, such as an incomplete,
+interrupted, or limited turn with no known backend session, cannot be retried.
+Discard removes the recovery record when one exists and also clears every
+incomplete-final, interrupted, or limited-turn barrier in that group, with or
+without a record or session. Nothing from a discarded turn is replayed, and the
+discard is confirmed only after the turn's pending deliveries are durably
+removed (see [output limits](#output-limits)). An uncertain outcome warns that
+retrying may repeat side effects. Recovery state is stored in private files and
+is never included in logs or diagnostics.
 
 The connector READMEs document their environment variables, installer topology,
 and backend contracts:
