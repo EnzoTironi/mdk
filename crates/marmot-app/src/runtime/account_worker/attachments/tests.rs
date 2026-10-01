@@ -18,6 +18,7 @@ use marmot_account::AccountHome;
 use storage_sqlite::{StoredAccountGroup, StoredAccountState, StoredAppEvent};
 
 const GROUP: &str = "abababababababababababababababab";
+/// Build a stored group whose invitation state can be varied without an MLS engine.
 fn group(pending: bool) -> StoredAccountGroup {
     StoredAccountGroup {
         group_id_hex: GROUP.into(),
@@ -56,10 +57,21 @@ fn group(pending: bool) -> StoredAccountGroup {
         }],
     }
 }
+/// Seed the default received-source projection used by adjacent worker tests.
 fn seed(
     storage: &SqliteAccountStorage,
     reference: &crate::MediaAttachmentReference,
     pending: bool,
+) {
+    seed_direction(storage, reference, pending, "received");
+}
+
+/// Seed an accepted source row with an explicit direction under the same attachment identity.
+fn seed_direction(
+    storage: &SqliteAccountStorage,
+    reference: &crate::MediaAttachmentReference,
+    pending: bool,
+    direction: &str,
 ) {
     storage
         .save_account_projection_state(
@@ -88,7 +100,7 @@ fn seed(
             message_id_hex: "11".repeat(32),
             source_message_id_hex: Some("22".repeat(32)),
             source_epoch: Some(3),
-            direction: "received".into(),
+            direction: direction.into(),
             sender: "33".repeat(32),
             plaintext: String::new(),
             kind: 9,
@@ -100,6 +112,7 @@ fn seed(
         })
         .unwrap();
 }
+/// Give worker tests a group policy that points to the attachment fixture's Blossom endpoint.
 fn projection(reference: &crate::MediaAttachmentReference) -> crate::AppGroupRecord {
     let mut projection = crate::conversions::app_group_from_stored_group(group(false)).unwrap();
     projection.encrypted_media = crate::AppGroupEncryptedMediaComponent {
@@ -122,6 +135,7 @@ fn projection(reference: &crate::MediaAttachmentReference) -> crate::AppGroupRec
     projection
 }
 
+/// Create a local account and accepted attachment source without a live media endpoint.
 async fn offline_fixture() -> (
     tempfile::TempDir,
     AppClient,
@@ -154,6 +168,7 @@ async fn offline_fixture() -> (
     (dir, client, storage, reference)
 }
 
+/// Supply a bounded media HTTP lane and its completion receiver to worker tests.
 fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
     let (tx, rx) = mpsc::unbounded_channel();
     (
@@ -168,16 +183,23 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
     )
 }
 
+/// Count loopback response bytes once, then prove the retained asset survives a client restart.
 #[tokio::test]
 async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_through_restart() {
-    download_without_engine_and_retain(false).await;
-    download_without_engine_and_retain(true).await;
+    download_without_engine_and_retain(false, "received").await;
+    download_without_engine_and_retain(true, "received").await;
+    download_without_engine_and_retain(false, "sent").await;
 }
 
-async fn download_without_engine_and_retain(explicit: bool) {
+/// Exercise received or sent-source rows without a second HTTP body on local re-open.
+async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut reference, ciphertext) =
         crate::media::tests::attachment_worker_fixture(b"retained worker bytes");
+    let expected_body_bytes = ciphertext.len();
+    let served_body_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_body_bytes = Arc::clone(&served_body_bytes);
+    let (stop_observing, observation_complete) = oneshot::channel::<()>();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     reference.locators = vec![crate::MediaLocator {
         kind: "blossom-v1".into(),
@@ -202,6 +224,13 @@ async fn download_without_engine_and_retain(explicit: bool) {
             .await
             .unwrap();
         socket.write_all(&ciphertext).await.unwrap();
+        server_body_bytes.fetch_add(ciphertext.len(), std::sync::atomic::Ordering::SeqCst);
+        drop(socket);
+        tokio::select! {
+            biased;
+            connection = listener.accept() => panic!("retained return requested another ciphertext body: {connection:?}"),
+            _ = observation_complete => {}
+        }
     });
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -219,7 +248,7 @@ async fn download_without_engine_and_retain(explicit: bool) {
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     let storage = app.account_storage("alice").unwrap();
-    seed(&storage, &reference, true);
+    seed_direction(&storage, &reference, true, direction);
     let projection = projection(&reference);
     client.state.groups.push(projection);
     storage
@@ -241,7 +270,7 @@ async fn download_without_engine_and_retain(explicit: bool) {
             .is_empty()
     );
     // Accept the invitation, without creating or hydrating an MLS group.
-    seed(&storage, &reference, false);
+    seed_direction(&storage, &reference, false, direction);
     assert!(
         client
             .prepare_background_attachment_download(
@@ -302,7 +331,6 @@ async fn download_without_engine_and_retain(explicit: bool) {
         .await
         .unwrap()
         .unwrap();
-    server.await.unwrap();
     assert_eq!(
         shared.attachment_transfer.available_permits(),
         0,
@@ -353,6 +381,12 @@ async fn download_without_engine_and_retain(explicit: bool) {
             .unwrap()
             .unwrap(),
         b"retained worker bytes"
+    );
+    stop_observing.send(()).unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        served_body_bytes.load(std::sync::atomic::Ordering::SeqCst),
+        expected_body_bytes,
     );
 }
 
