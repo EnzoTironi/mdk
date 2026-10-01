@@ -15,9 +15,23 @@
   rows are rejected.
 - `ConversationReaction::reaction_message_id_hex` names the earliest active
   kind-7 carrying that emoji, so a NIP-30 reaction's image can be resolved.
+- Account-worker startup is observable stage by stage. Six runtime
+  operations, `account_startup_spawned`, `_open_queued`, `_account_state`,
+  `_session_open`, `_client_restore` and `_ready_handoff`, record one span
+  per stage a starting worker enters. A span stays in flight while the stage
+  runs, even after its worker was aborted, and ends as a timeout if the
+  ready-wait expired in that stage. An expired ready-wait now fails with
+  `account worker startup timed out at <stage>`; hosts that matched the old
+  message exactly should match its prefix. (#1911, #2098)
 
 ### Fixed
 
+- A route change, such as creating or leaving a group, no longer resets
+  history recovery for every route. Routes whose own window and required
+  relays are unchanged keep their certificates and quiet streak; only changed
+  and new routes are compared again. Before, each new DM restarted recovery
+  over every route, so on accounts with many chats it rarely finished
+  (#2110).
 - Host catch-up (`catch_up_accounts`) and the catch-up after creating or
   changing a group no longer run a recovery job while holding the account
   worker. They drain live input and return; the worker's paced recovery job
