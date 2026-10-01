@@ -181,16 +181,15 @@ impl ManagedAccountWorker {
     }
 }
 
-/// The pre-ready step an account worker last entered (mdk#1911).
+/// The pre-ready step an account worker is in (mdk#1911).
 ///
-/// The startup path records nothing durable until the worker is ready, so a
-/// ready-wait that expires reports this instead: which step the worker was
-/// blocked in. The set is closed and names only steps; it is exported as a
-/// runtime operation name, never with account context.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The startup path records nothing durable until the worker is ready, so
+/// each step is an in-flight span on its runtime operation instead. The set is
+/// closed and names only steps; it is exported as a runtime operation name,
+/// never with account context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AccountStartupStage {
     /// The worker task exists but has not submitted its blocking open.
-    #[default]
     Spawned,
     /// The blocking open is waiting for a blocking-pool thread.
     OpenQueued,
@@ -220,9 +219,8 @@ impl AccountStartupStage {
         }
     }
 
-    /// The runtime operation whose `timeouts` counter counts ready-waits that
-    /// expired while a worker was in this stage.
-    pub(crate) const fn timeout_operation(self) -> RuntimeOp {
+    /// The runtime operation that carries this stage's spans.
+    pub(crate) const fn operation(self) -> RuntimeOp {
         match self {
             Self::Spawned => RuntimeOp::AccountStartupSpawned,
             Self::OpenQueued => RuntimeOp::AccountStartupOpenQueued,
@@ -234,21 +232,94 @@ impl AccountStartupStage {
     }
 }
 
-/// Shared cell a starting worker advances and its ready-waiter reads.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct AccountStartupProgress(Arc<Mutex<AccountStartupStage>>);
+/// The stage a starting worker is in and its open span, shared by the worker,
+/// its blocking open and its ready-waiter.
+///
+/// Entering a stage completes the previous span. The last clone to drop ends
+/// an open span as cancelled, so a blocking open that outlives its aborted
+/// worker keeps its stage in flight until the open itself moves on.
+#[derive(Clone, Debug)]
+pub(crate) struct AccountStartupProgress {
+    telemetry: crate::AppPerformanceTelemetry,
+    state: Arc<Mutex<StartupStageState>>,
+}
+
+#[derive(Debug)]
+struct StartupStageState {
+    stage: AccountStartupStage,
+    span: StageSpan,
+}
+
+#[derive(Debug, Default)]
+struct StageSpan {
+    observation: Option<Observation>,
+    /// The ready-wait expired in this stage: the span ends as a timeout,
+    /// whenever and however it ends.
+    expired: bool,
+}
+
+impl StageSpan {
+    fn end(&mut self, outcome: TelemetryOutcome) {
+        if let Some(observation) = self.observation.take() {
+            observation.finish(if self.expired {
+                TelemetryOutcome::Timeout
+            } else {
+                outcome
+            });
+        }
+    }
+}
+
+impl Drop for StageSpan {
+    fn drop(&mut self) {
+        self.end(TelemetryOutcome::Cancelled);
+    }
+}
 
 impl AccountStartupProgress {
-    pub(crate) fn enter(&self, stage: AccountStartupStage) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stage;
+    /// Open the `Spawned` span of a worker about to be spawned.
+    pub(crate) fn new(telemetry: crate::AppPerformanceTelemetry) -> Self {
+        let stage = AccountStartupStage::Spawned;
+        let span = StageSpan {
+            observation: Some(telemetry.observe(stage.operation())),
+            expired: false,
+        };
+        Self {
+            telemetry,
+            state: Arc::new(Mutex::new(StartupStageState { stage, span })),
+        }
     }
 
-    pub(crate) fn stage(&self) -> AccountStartupStage {
-        *self
-            .0
+    pub(crate) fn enter(&self, stage: AccountStartupStage) {
+        let next = StageSpan {
+            observation: Some(self.telemetry.observe(stage.operation())),
+            expired: false,
+        };
+        let mut previous = {
+            let mut state = self.state();
+            state.stage = stage;
+            std::mem::replace(&mut state.span, next)
+        };
+        previous.end(TelemetryOutcome::Success);
+    }
+
+    /// End the current stage's span: the worker signalled ready, or its open
+    /// failed.
+    pub(crate) fn finish(&self, outcome: TelemetryOutcome) {
+        let mut span = std::mem::take(&mut self.state().span);
+        span.end(outcome);
+    }
+
+    /// Mark the ready-wait expired in the current stage and name it. The span
+    /// stays in flight for as long as the worker's open is in that stage.
+    pub(crate) fn expire(&self) -> AccountStartupStage {
+        let mut state = self.state();
+        state.span.expired = true;
+        state.stage
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, StartupStageState> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -667,13 +738,15 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
-    /// Explicit recovery runs one job in place, so it waits while the
+    /// Full-history repair runs one job in place, so it waits while the
     /// account's worker-owned job is in flight: there is one job per account.
+    /// A catch-up only drains live input, like a delivery, so it crosses the
+    /// job instead of holding later sends and opens behind it (mdk#2110).
     fn waits_for_recovery_job(&self) -> bool {
-        matches!(self, Self::CatchUp { .. } | Self::RepairFullHistory { .. })
+        matches!(self, Self::RepairFullHistory { .. })
     }
 
-    /// Reads that can cross a deferred explicit catch-up without changing the
+    /// Reads that can cross a deferred full-history repair without changing the
     /// recovery grant or the order of later mutations.
     fn readable_during_comparison_catch_up(&self) -> bool {
         matches!(
@@ -944,6 +1017,7 @@ async fn run_app_runtime_account_worker(
             client
         }
         Err(err) => {
+            startup_progress.finish(TelemetryOutcome::Failure);
             let message = account_error_message("runtime startup failed", &err);
             publish_app_runtime_account_error(
                 &events,
@@ -1027,6 +1101,7 @@ async fn run_app_runtime_account_worker(
             worker_started_at.elapsed(),
             true,
         );
+        startup_progress.finish(TelemetryOutcome::Success);
         let _ = ready.send(Ok(()));
     }
 
@@ -3005,7 +3080,7 @@ async fn handle_account_worker_catch_up(
                 barrier.wait().await;
             }
             client
-                .sync_with_stage_telemetry(&stage_telemetry, true)
+                .sync_with_stage_telemetry(Some(&stage_telemetry), crate::client::SyncMode::Drain)
                 .await
         });
         loop {
@@ -4324,7 +4399,10 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::CatchUp { respond } => Box::pin(async move {
             let sync_started_at = Instant::now();
-            let result = match client.sync_with_classified_partial_progress().await {
+            let result = match client
+                .sync_with_stage_telemetry(None, crate::client::SyncMode::Drain)
+                .await
+            {
                 Ok(summary) => {
                     publish_app_runtime_summary_with_v5(
                         client,
@@ -8051,12 +8129,12 @@ mod tests {
                 relay_plane: app.relay_plane.clone(),
                 events,
                 lifecycle: shared.lifecycle(),
-                shared,
+                shared: shared.clone(),
             },
             commands.clone(),
             receiver,
             ready,
-            AccountStartupProgress::default(),
+            AccountStartupProgress::new(shared.app_performance_telemetry()),
             shutdown_rx,
         );
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
@@ -8692,7 +8770,10 @@ mod tests {
         let shared = RuntimeSharedServices::default();
         let before = relay.unfloored_account_subscription_count();
         client
-            .sync_with_stage_telemetry(&shared.app_performance_telemetry(), false)
+            .sync_with_stage_telemetry(
+                Some(&shared.app_performance_telemetry()),
+                crate::client::SyncMode::Startup,
+            )
             .await
             .unwrap();
         for (seam, reason) in [
@@ -8829,7 +8910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_catch_up_runs_prearmed_backfill_before_success_response() {
+    async fn catch_up_leaves_prearmed_backfill_to_the_owner() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -8874,12 +8955,12 @@ mod tests {
         response.await.unwrap().unwrap();
         assert!(
             client.has_pending_epoch_backfill(),
-            "ordinary catch-up cannot certify complete historical coverage",
+            "a draining catch-up leaves the backfill to the owner's paced job",
         );
         assert_eq!(
             relay.unfloored_account_subscription_count(),
             before,
-            "the backfill acquires history by comparison, never by an unfloored replay"
+            "catch-up never replays unfloored history"
         );
         assert_eq!(
             app.account_storage("alice")
@@ -8887,13 +8968,14 @@ mod tests {
                 .recovery_retry_state()
                 .unwrap()
                 .attempt_serial,
-            1
+            0,
+            "catch-up reserves no recovery work (mdk#2110)"
         );
         drop(command_tx);
     }
 
     #[tokio::test]
-    async fn explicit_catch_up_succeeds_after_ordinary_sync_when_backfill_defers() {
+    async fn catch_up_succeeds_with_an_unavailable_backfill_intent() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -8954,13 +9036,24 @@ mod tests {
             client.has_pending_epoch_backfill(),
             "the unavailable recovery intent must remain pending"
         );
+        // The catch-up ran no job, so the owner's first pass runs one and
+        // cannot complete the unavailable intent. Its retry pacing then defers
+        // the next pass, which must stay distinct from no pending work.
+        let first = client
+            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("the owner's pass over an unavailable intent must not fail");
+        assert!(
+            matches!(first, EpochBackfillRunOutcome::Incomplete(_)),
+            "an unavailable intent cannot complete: {first:?}"
+        );
         let outcome = client
             .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
             .await
             .expect("rechecking a deferred intent must not fail");
         assert!(
             matches!(outcome, EpochBackfillRunOutcome::Deferred),
-            "deferred work must remain distinct from no pending work"
+            "deferred work must remain distinct from no pending work: {outcome:?}"
         );
         drop(command_tx);
     }
@@ -9885,7 +9978,8 @@ mod tests {
                     .recovery_retry_state()
                     .unwrap()
                     .attempt_serial,
-                1
+                0,
+                "Bob's catch-up only drains; it reserves no recovery work"
             );
         }
     }
