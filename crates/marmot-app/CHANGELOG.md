@@ -32,6 +32,12 @@
   and new routes are compared again. Before, each new DM restarted recovery
   over every route, so on accounts with many chats it rarely finished
   (#2110).
+- History recovery no longer retries forever when a required relay never
+  answers while another required relay answers. After six such comparisons
+  for an unchanged goal and required relays, the route counts toward parking
+  with the existing "history may be incomplete" notice. Offline passes and
+  routes skipped or timed out by the local deadline spend no parking budget
+  (#2110).
 - Host catch-up (`catch_up_accounts`) and the catch-up after creating or
   changing a group no longer run a recovery job while holding the account
   worker. They drain live input and return; the worker's paced recovery job

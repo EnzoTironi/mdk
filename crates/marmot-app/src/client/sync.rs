@@ -584,6 +584,8 @@ pub(crate) struct RouteComparison {
     /// certified nor admitted anything is quiet. A failed or timed-out relay,
     /// or a route this pass skipped, did not answer.
     pub(crate) answered: bool,
+    /// Queried relays that answered, including incomplete comparisons.
+    pub(crate) reached_endpoints: Vec<String>,
     /// What the route's relays returned, for the attempt's audit row only.
     /// Settlement never reads it.
     pub(crate) acquisition: super::audit_recovery::RouteAcquisition,
@@ -4319,9 +4321,6 @@ impl AppClient {
                         storage_sqlite::RecoveryPassProgress::Progressed
                     } else if !refused
                         && compared.is_some_and(|compared| {
-                            // A route no comparison backend could compare
-                            // was not answered by its relays, so it spends
-                            // no parking budget.
                             compared.answered
                                 && compared.outcome
                                     != storage_sqlite::RecoveryComparisonOutcome::Unsupported
@@ -4337,8 +4336,18 @@ impl AppClient {
                             obligation_progress,
                             scope_progress,
                         ));
+                        if scope_progress != storage_sqlite::RecoveryPassProgress::Unserved
+                            || compared.is_some_and(|compared| {
+                                scope.goal.required_endpoints.iter().any(|required| {
+                                    compared.reached_endpoints.iter().any(|reached| {
+                                        crate::relay_plane::same_relay(required, reached)
+                                    })
+                                })
+                            })
+                        {
+                            progress.push((scope.goal.scope_id, scope_progress));
+                        }
                     }
-                    progress.push((scope.goal.scope_id, scope_progress));
                     let retained_known_event = match (&route, scope.goal.known_event_id) {
                         (Some(route), Some(event)) => storage.retained_recovery_event(
                             route,
