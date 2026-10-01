@@ -18,6 +18,7 @@ use marmot_account::AccountHome;
 use storage_sqlite::{StoredAccountGroup, StoredAccountState, StoredAppEvent};
 
 const GROUP: &str = "abababababababababababababababab";
+/// Build a stored group whose invitation state can be varied without an MLS engine.
 fn group(pending: bool) -> StoredAccountGroup {
     StoredAccountGroup {
         group_id_hex: GROUP.into(),
@@ -56,10 +57,21 @@ fn group(pending: bool) -> StoredAccountGroup {
         }],
     }
 }
+/// Seed the default received-source projection used by adjacent worker tests.
 fn seed(
     storage: &SqliteAccountStorage,
     reference: &crate::MediaAttachmentReference,
     pending: bool,
+) {
+    seed_direction(storage, reference, pending, "received");
+}
+
+/// Seed an accepted source row with an explicit direction under the same attachment identity.
+fn seed_direction(
+    storage: &SqliteAccountStorage,
+    reference: &crate::MediaAttachmentReference,
+    pending: bool,
+    direction: &str,
 ) {
     storage
         .save_account_projection_state(
@@ -88,7 +100,7 @@ fn seed(
             message_id_hex: "11".repeat(32),
             source_message_id_hex: Some("22".repeat(32)),
             source_epoch: Some(3),
-            direction: "received".into(),
+            direction: direction.into(),
             sender: "33".repeat(32),
             plaintext: String::new(),
             kind: 9,
@@ -100,6 +112,7 @@ fn seed(
         })
         .unwrap();
 }
+/// Give worker tests a group policy that points to the attachment fixture's Blossom endpoint.
 fn projection(reference: &crate::MediaAttachmentReference) -> crate::AppGroupRecord {
     let mut projection = crate::conversions::app_group_from_stored_group(group(false)).unwrap();
     projection.encrypted_media = crate::AppGroupEncryptedMediaComponent {
@@ -122,6 +135,7 @@ fn projection(reference: &crate::MediaAttachmentReference) -> crate::AppGroupRec
     projection
 }
 
+/// Create a local account and accepted attachment source without a live media endpoint.
 async fn offline_fixture() -> (
     tempfile::TempDir,
     AppClient,
@@ -154,6 +168,7 @@ async fn offline_fixture() -> (
     (dir, client, storage, reference)
 }
 
+/// Supply a bounded media HTTP lane and its completion receiver to worker tests.
 fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
     let (tx, rx) = mpsc::unbounded_channel();
     (
@@ -168,16 +183,23 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
     )
 }
 
+/// Count loopback response bytes once, then prove the retained asset survives a client restart.
 #[tokio::test]
 async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_through_restart() {
-    download_without_engine_and_retain(false).await;
-    download_without_engine_and_retain(true).await;
+    download_without_engine_and_retain(false, "received").await;
+    download_without_engine_and_retain(true, "received").await;
+    download_without_engine_and_retain(false, "sent").await;
 }
 
-async fn download_without_engine_and_retain(explicit: bool) {
+/// Exercise received or sent-source rows without a second HTTP body on local re-open.
+async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut reference, ciphertext) =
         crate::media::tests::attachment_worker_fixture(b"retained worker bytes");
+    let expected_body_bytes = ciphertext.len();
+    let served_body_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_body_bytes = Arc::clone(&served_body_bytes);
+    let (stop_observing, observation_complete) = oneshot::channel::<()>();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     reference.locators = vec![crate::MediaLocator {
         kind: "blossom-v1".into(),
@@ -202,6 +224,13 @@ async fn download_without_engine_and_retain(explicit: bool) {
             .await
             .unwrap();
         socket.write_all(&ciphertext).await.unwrap();
+        server_body_bytes.fetch_add(ciphertext.len(), std::sync::atomic::Ordering::SeqCst);
+        drop(socket);
+        tokio::select! {
+            biased;
+            connection = listener.accept() => panic!("retained return requested another ciphertext body: {connection:?}"),
+            _ = observation_complete => {}
+        }
     });
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -219,7 +248,7 @@ async fn download_without_engine_and_retain(explicit: bool) {
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     let storage = app.account_storage("alice").unwrap();
-    seed(&storage, &reference, true);
+    seed_direction(&storage, &reference, true, direction);
     let projection = projection(&reference);
     client.state.groups.push(projection);
     storage
@@ -241,7 +270,7 @@ async fn download_without_engine_and_retain(explicit: bool) {
             .is_empty()
     );
     // Accept the invitation, without creating or hydrating an MLS group.
-    seed(&storage, &reference, false);
+    seed_direction(&storage, &reference, false, direction);
     assert!(
         client
             .prepare_background_attachment_download(
@@ -302,7 +331,6 @@ async fn download_without_engine_and_retain(explicit: bool) {
         .await
         .unwrap()
         .unwrap();
-    server.await.unwrap();
     assert_eq!(
         shared.attachment_transfer.available_permits(),
         0,
@@ -353,6 +381,12 @@ async fn download_without_engine_and_retain(explicit: bool) {
             .unwrap()
             .unwrap(),
         b"retained worker bytes"
+    );
+    stop_observing.send(()).unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        served_body_bytes.load(std::sync::atomic::Ordering::SeqCst),
+        expected_body_bytes,
     );
 }
 
@@ -451,6 +485,231 @@ async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings
     }
     assert!(completions.try_recv().is_err());
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn attachment_missing_secret_deferral_is_bounded_and_explicit_retry_readmits() {
+    let (_dir, client, storage, reference) = offline_fixture().await;
+    assert!(
+        client
+            .prepare_background_attachment_download(&GroupId::new(vec![0xab; 16]), reference, 1024)
+            .unwrap()
+            .is_none()
+    );
+    let now = crate::unix_now_seconds();
+    // Earlier worker ticks already found the source-epoch material missing.
+    let mut at = now - 10_000;
+    admit_demands(&storage, at, false).unwrap();
+    let asset = storage
+        .due_attachment_acquisitions(at, 1)
+        .unwrap()
+        .remove(0);
+    for _ in 0..5 {
+        assert!(!storage.defer_attachment_preparation(&asset, at).unwrap());
+        at = storage
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .due
+            .unwrap();
+    }
+    assert!(at <= now);
+    let shared = RuntimeSharedServices::default();
+    let (http, mut completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    admission.ready().await;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    let status = storage
+        .attachment_acquisition_status(&asset)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::Blocked
+    );
+    assert_eq!(status.attempts, 0);
+    assert!(status.due.is_none());
+    let transfer = || {
+        storage
+            .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Failed);
+    assert!(completions.try_recv().is_err());
+    assert!(storage.explicitly_retry_attachment(&asset, now).unwrap());
+    assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Queued);
+}
+
+/// Rows projected before projection cached the source epoch's key stay
+/// uncached. Retry must derive it from the epoch's retained anchor rather than
+/// repeat the same six misses and fail again.
+#[test]
+fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
+    crate::tests::run_composed_app_runtime_test("attachment-retry-anchor", || async {
+        use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY;
+        use cgka_traits::engine::SendIntent;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig {
+                attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
+                allow_loopback_blob_endpoints: true,
+                ..Default::default()
+            },
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let group_id = client.create_group("retry media", &[]).await.unwrap();
+        let group_hex = hex::encode(group_id.as_slice());
+        // Group creation caches its founding epoch; the source epoch is the
+        // next one, and the group has left it by the time the row exists.
+        let self_update = SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        };
+        client.runtime.send(self_update.clone()).await.unwrap();
+        let (source_epoch, secret) = client
+            .runtime
+            .exporter_secret_with_epoch(&group_id, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
+            .unwrap();
+        client.runtime.send(self_update).await.unwrap();
+
+        let (mut reference, ciphertext) =
+            crate::media::tests::attachment_worker_fixture_with_secret(
+                b"anchored bytes",
+                secret.as_ref(),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        reference.source_epoch = source_epoch.0;
+        reference.locators = vec![crate::MediaLocator {
+            kind: "blossom-v1".into(),
+            value: format!("{base_url}/{}", reference.ciphertext_sha256),
+        }];
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        ciphertext.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&ciphertext).await.unwrap();
+        });
+        // No fallback dial may leave the loopback server.
+        client
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_hex)
+            .unwrap()
+            .encrypted_media
+            .default_blob_endpoints = vec![crate::AppBlobEndpoint {
+            locator_kind: "blossom-v1".into(),
+            base_url,
+        }];
+        storage
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: group_hex.clone(),
+                message_id_hex: "11".repeat(32),
+                source_message_id_hex: Some("22".repeat(32)),
+                source_epoch: Some(source_epoch.0),
+                direction: "received".into(),
+                sender: "33".repeat(32),
+                plaintext: String::new(),
+                kind: 9,
+                tags: vec![vec![
+                    "imeta".into(),
+                    format!("v {}", reference.version),
+                    format!("locator blossom-v1 {}", reference.locators[0].value),
+                    format!("ciphertext_sha256 {}", reference.ciphertext_sha256),
+                    format!("plaintext_sha256 {}", reference.plaintext_sha256),
+                    format!("nonce {}", reference.nonce_hex),
+                    format!("m {}", reference.media_type),
+                    format!("filename {}", reference.file_name),
+                ]],
+                recorded_at: 10,
+                received_at: 10,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+
+        // Automatic work only reads the cache: five earlier misses, then the
+        // sixth in this pass fails the job.
+        let now = crate::unix_now_seconds();
+        let mut at = now - 10_000;
+        admit_demands(&storage, at, true).unwrap();
+        let asset = storage
+            .due_attachment_acquisitions(at, 1)
+            .unwrap()
+            .remove(0);
+        for _ in 0..5 {
+            assert!(!storage.defer_attachment_preparation(&asset, at).unwrap());
+            at = storage
+                .attachment_acquisition_status(&asset)
+                .unwrap()
+                .unwrap()
+                .due
+                .unwrap();
+        }
+        let shared = RuntimeSharedServices::default();
+        let (http, mut completions) = context();
+        let mut admission = Admission::default();
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        admission.ready().await;
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        let transfer = || {
+            storage
+                .attachment_transfer_status(
+                    &group_hex,
+                    &"11".repeat(32),
+                    &"22".repeat(32),
+                    0,
+                    crate::unix_now_seconds(),
+                    true,
+                )
+                .unwrap()
+                .unwrap()
+                .state
+        };
+        assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Failed);
+        assert!(completions.try_recv().is_err());
+
+        assert!(storage.explicitly_retry_attachment(&asset, now).unwrap());
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        admission.ready().await;
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(10), completions.recv())
+            .await
+            .expect("Retry must start the transfer")
+            .unwrap();
+        server.await.unwrap();
+        complete_media_http(&mut client, done, &shared, &http).await;
+        assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Ready);
+        assert_eq!(
+            &*storage
+                .read_retained_attachment(&asset, crate::unix_now_seconds(), 0, 100)
+                .unwrap()
+                .unwrap(),
+            b"anchored bytes"
+        );
+    });
 }
 
 #[tokio::test]

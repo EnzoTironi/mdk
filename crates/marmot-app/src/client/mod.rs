@@ -1756,7 +1756,11 @@ impl AppClient {
                 key_package_event_id: member.source.as_ref().map(|source| source.event_id.clone()),
             });
         }
-        self.refresh_routing()?;
+        self.refresh_member_inbox_routes(
+            founding_selections
+                .iter()
+                .map(|selection| selection.recipient_hex.as_str()),
+        )?;
         let constructable = self.runtime.constructable_capabilities(&members)?;
         require_initial_group_component_support(&constructable, &request.app_components)?;
         let uploads_inline_image =
@@ -5000,8 +5004,10 @@ impl AppClient {
             .await
     }
 
-    /// Storage-only preparation for automatic work. Secret warming belongs to
-    /// sync; missing/retired epoch material cannot trigger engine hydration here.
+    /// Storage-only preparation for automatic work. Received-message projection
+    /// caches each message's source-epoch secret and sync warms current epochs;
+    /// missing/retired epoch material cannot trigger engine hydration here.
+    /// Queued explicit work first calls `cache_attachment_source_epoch_secret`.
     pub(crate) fn prepare_background_attachment_download(
         &self,
         group_id: &GroupId,
@@ -5043,6 +5049,22 @@ impl AppClient {
                 .clone()
                 .with_download_limit(max_bytes),
         }))
+    }
+
+    /// Cache `reference`'s source-epoch secret, exported live or derived from
+    /// the epoch's retained anchor, as the `DownloadMedia` command does. Queued
+    /// explicit work (Retry, download again) needs this for references projected
+    /// before their source epoch was cached. Reads live engine state only: an
+    /// unhydrated group errors instead of hydrating.
+    pub(crate) fn cache_attachment_source_epoch_secret(
+        &self,
+        group_id: &GroupId,
+        reference: &MediaAttachmentReference,
+    ) -> Result<(), AppError> {
+        self.ensure_group(group_id)?;
+        let component_id = EncryptedMediaVersion::parse(&reference.version)?.component_id();
+        self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch, component_id)?;
+        Ok(())
     }
 
     pub(crate) async fn prepare_encrypted_media_download(
@@ -5666,7 +5688,7 @@ impl AppClient {
     }
 
     fn encrypted_media_secret_for_epoch(
-        &mut self,
+        &self,
         group_id: &GroupId,
         source_epoch: u64,
         component_id: u16,
@@ -5686,16 +5708,11 @@ impl AppClient {
         {
             return Ok(SecretBytes::new(secret));
         }
-        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
-            group_id,
-            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
-            32,
-        )?;
-        if epoch.0 == source_epoch {
+        if let Some(secret) = self.exportable_encrypted_media_secret(group_id, source_epoch)? {
             self.remember_encrypted_media_epoch_secret_for_component(
                 group_id,
                 component_id,
-                epoch.0,
+                source_epoch,
                 secret.as_ref(),
             )?;
             if let Some(secret) =
@@ -5728,6 +5745,105 @@ impl AppClient {
             32,
         )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())
+    }
+
+    /// Cache the exporter secret a received media message's attachments are
+    /// keyed to. The message names its source epoch, which the group may have
+    /// left before the message is projected: a convergence pass merges the
+    /// commits it adopts before its replayed applications are drained, and a
+    /// delayed message is read from retained past-epoch secrets. Caching the
+    /// then-current epoch instead leaves every such attachment unreadable.
+    /// The engine captures the secret while it authenticates the message at
+    /// its source epoch (`carried_secret`), because a pass advancing past the
+    /// anchor horizon prunes that epoch's anchor before this runs; deriving it
+    /// here is only the fallback for events that carry none.
+    fn remember_received_encrypted_media_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+        tags: &[Vec<String>],
+        carried_secret: Option<&cgka_traits::EncryptedMediaSecret>,
+    ) -> Result<(), AppError> {
+        let allow_loopback = self.app.allow_loopback_blob_endpoints();
+        let mut component_ids = Vec::new();
+        for tag in tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        {
+            let Ok(reference) = crate::media::media_attachment_from_imeta_tag(
+                tag,
+                Some(source_epoch),
+                allow_loopback,
+            ) else {
+                continue;
+            };
+            let Ok(version) = EncryptedMediaVersion::parse(&reference.version) else {
+                continue;
+            };
+            let component_id = version.component_id();
+            if !component_ids.contains(&component_id)
+                && self
+                    .cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
+                    .is_none()
+            {
+                component_ids.push(component_id);
+            }
+        }
+        if component_ids.is_empty() {
+            return Ok(());
+        }
+        let derived;
+        let secret: &[u8] = match carried_secret {
+            Some(secret) => secret.as_bytes(),
+            None => {
+                derived = self
+                    .exportable_encrypted_media_secret(group_id, source_epoch)?
+                    .ok_or_else(|| {
+                        AppError::InvalidEncryptedMedia(format!(
+                            "encrypted media secret unavailable for epoch {source_epoch}"
+                        ))
+                    })?;
+                derived.as_slice()
+            }
+        };
+        for component_id in component_ids {
+            self.remember_encrypted_media_epoch_secret_for_component(
+                group_id,
+                component_id,
+                source_epoch,
+                secret,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The group's encrypted-media exporter secret at `source_epoch`: exported
+    /// live while that epoch is current, otherwise derived from the epoch's
+    /// retained anchor. `None` once the epoch has left the anchor horizon.
+    /// A failed live export still consults the anchor; its error surfaces only
+    /// when the anchor yields no secret either.
+    fn exportable_encrypted_media_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+    ) -> Result<Option<SecretBytes>, AppError> {
+        let live_error = match self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
+            32,
+        ) {
+            Ok((epoch, secret)) if epoch.0 == source_epoch => return Ok(Some(secret)),
+            Ok(_) => None,
+            Err(error) => Some(error),
+        };
+        let retained = self
+            .runtime
+            .retained_encrypted_media_exporter_secret(group_id, cgka_traits::EpochId(source_epoch));
+        match (retained, live_error) {
+            (Ok(Some(secret)), _) => Ok(Some(secret)),
+            (_, Some(live_error)) => Err(live_error.into()),
+            (retained, None) => Ok(retained?),
+        }
     }
 }
 
@@ -5991,6 +6107,23 @@ impl AppClient {
             .group_routes
             .retain(|route| !group_is_terminal(&self.runtime, &route.group_id));
         self.routing.replace(snapshot);
+        Ok(())
+    }
+
+    /// Install the inbox routes of the given members, which a Welcome publish
+    /// needs. Key-package resolution has just stored their relay lists, and
+    /// nothing else in the table can have changed, so this replaces a
+    /// `refresh_routing` rebuild whose cost grows with the account's chats
+    /// (mdk#2110). The new group's own routes are installed by `add_group`.
+    fn refresh_member_inbox_routes<'a>(
+        &self,
+        members: impl Iterator<Item = &'a str>,
+    ) -> Result<(), AppError> {
+        for member in members {
+            let route = self.app.member_inbox_route(member)?;
+            self.routing
+                .replace_inbox_route(cgka_traits::MemberId::new(hex::decode(member)?), route);
+        }
         Ok(())
     }
 
