@@ -507,6 +507,15 @@ async fn acquire_dispatch_permit(
 async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut permit: GroupPermit) {
     let mut inbound = inbound;
     let disposition = classify_prompt(&inbound.text);
+    // Literal (`//`) forwards preserve the caller's bytes after slash stripping.
+    // Backend control routing remains available through the task-local context.
+    let add_control_instructions = !matches!(
+        disposition,
+        PromptDisposition::Forward {
+            allow_workdir_picker: false,
+            ..
+        }
+    );
     if is_inspect_disposition(&disposition) {
         match disposition {
             PromptDisposition::HarnessCommand(command) => {
@@ -828,7 +837,11 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         idle_timeout: ctx.cfg.backend_idle_timeout,
         cwd: cwd.clone(),
         session_id,
-        prompt: format!("{prompt}{}", crate::group_profile::INSTRUCTIONS),
+        prompt: if add_control_instructions {
+            format!("{prompt}{}", crate::group_profile::INSTRUCTIONS)
+        } else {
+            prompt
+        },
         artifact_output,
     };
     let (tx, mut rx) = mpsc::channel(16);
@@ -3962,17 +3975,23 @@ mod tests {
             .unwrap();
 
         dispatch_test_message(ctx.clone(), "literal", "  //status \n").await;
+        dispatch_test_message(ctx.clone(), "ordinary", "update the group name").await;
         dispatch_test_message(ctx.clone(), "set-goal", "/goal finish the migration").await;
         dispatch_test_message(ctx.clone(), "prompt", "check status").await;
+        dispatch_test_message(ctx.clone(), "literal-with-goal", "//status").await;
 
         let invocations = backend.invocations.lock().await;
-        assert_eq!(invocations.len(), 2);
-        assert_eq!(
-            invocations[0].prompt,
-            format!("  /status \n{}", crate::group_profile::INSTRUCTIONS)
-        );
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(invocations[0].prompt.as_bytes(), b"  /status \n");
         assert_eq!(
             invocations[1].prompt,
+            format!(
+                "update the group name{}",
+                crate::group_profile::INSTRUCTIONS
+            )
+        );
+        assert_eq!(
+            invocations[2].prompt,
             format!(
                 "{}{}",
                 commands::apply_goal("finish the migration", "check status"),
@@ -3980,11 +3999,15 @@ mod tests {
             )
         );
         assert_eq!(
-            invocations[1]
+            invocations[2]
                 .prompt
                 .matches("Standing goal for this chat")
                 .count(),
             1
+        );
+        assert_eq!(
+            invocations[3].prompt,
+            commands::apply_goal("finish the migration", "/status")
         );
         drop(invocations);
         server.abort();
