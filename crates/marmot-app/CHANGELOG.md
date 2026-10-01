@@ -4,6 +4,14 @@
 
 ### Added
 
+- Hosts can declare a separate kind-10050 inbox relay list.
+  `AccountSetupRequest::inbox_relays`, `AccountRelayListBootstrap::inbox_relays`
+  (`with_inbox_relays`) and `OnboardingOptions::inbox_relays` set it for
+  generated-account bootstrap, missing-list publication on import or login,
+  and onboarding's recommended inbox relays. Empty keeps the previous
+  behavior: `default_relays` declare both the NIP-65 and the inbox list.
+  Persisted setup contexts and onboarding checkpoints without the field resume
+  unchanged.
 - `MarmotAppRuntime::poll_votes` pages each voter's effective poll selection
   (`PollVotePage` of `PollVote`) with the same rules as the timeline poll
   tally. (#2091)
@@ -26,6 +34,28 @@
 
 ### Fixed
 
+- v5 audit rows keep the engine's `pre_membership_event`,
+  `app_payload_retention_expired`, `peel_failed_no_snapshot` and
+  `quarantined_group_input_deferred` message reasons instead of writing them
+  as `unclassified`. Older v5 rows with an `unclassified` reason stay
+  ambiguous (#2120).
+- A route change, such as creating or leaving a group, no longer resets
+  history recovery for every route. Routes whose own window and required
+  relays are unchanged keep their certificates and quiet streak; only changed
+  and new routes are compared again. Before, each new DM restarted recovery
+  over every route, so on accounts with many chats it rarely finished
+  (#2110).
+- History recovery no longer retries forever when a required relay never
+  answers while another required relay answers. After six such comparisons
+  for an unchanged goal and required relays, the route counts toward parking
+  with the existing "history may be incomplete" notice. Offline passes and
+  routes skipped or timed out by the local deadline spend no parking budget
+  (#2110).
+- Creating a group no longer rebuilds the whole routing table. It installs only
+  the invitees' inbox routes, which the Welcome publish needs; `add_group`
+  already installs the new group's routes. The rebuild took about 13 ms per
+  create at 1000 chats, most of it a quadratic pass over deleted-group routes
+  (#2110).
 - Host catch-up (`catch_up_accounts`) and the catch-up after creating or
   changing a group no longer run a recovery job while holding the account
   worker. They drain live input and return; the worker's paced recovery job
