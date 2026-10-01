@@ -4286,3 +4286,18 @@ Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, 
 [Source](src/commands/audit.rs#L54)
 
 </details>
+
+<details>
+<summary>New exports — complete and organize before merging</summary>
+
+### `MessageDraftRevisionFfi::includes_chat_list_version`
+
+```rust
+pub fn includes_chat_list_version(&self, version: String) -> bool
+```
+
+Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes malformed input and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-unreleased).
+
+[Source](src/conversions/conversation_window.rs#L340)
+
+</details>

@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotPresentedChatRow` gains owned nullable `draft_version` and
+  `marmot_message_draft_revision_includes_chat_list_version` compares it against
+  a borrowed selected revision without exposing account/group identifiers.
+  Newer identical drafts remain distinguishable. Rebuild with matching generated
+  headers/libraries; the row layout changes. See the shared chat-list contract.
+
 - `marmot_poll_votes` returns a `MarmotPollVotePage` of each voter's effective
   poll selection, 1..=100 per page with a `(voted_at, voter)` cursor; all pages
   sum to the `MarmotPollProjection` tally. Free it with
