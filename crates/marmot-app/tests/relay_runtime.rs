@@ -3249,8 +3249,10 @@ async fn app_component_lifecycle() {
         Some(cgka_traits::EngineError::NotGroupAdmin { .. })
     ));
 
+    // Keep live relay processing from expiring the fixture before the explicit
+    // sweep. The supplied clock below advances a full day to test deletion.
     runtime
-        .update_message_retention(&alice, &group, 1)
+        .update_message_retention(&alice, &group, 3_600)
         .await
         .unwrap();
     runtime
