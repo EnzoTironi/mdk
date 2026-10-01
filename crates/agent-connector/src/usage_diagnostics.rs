@@ -223,9 +223,13 @@ mod tests {
 
     #[tokio::test]
     async fn owner_socket_updates_the_active_consent_without_starting_collectors() {
-        // Private socket binding adds a staging directory to the path. Keep
-        // the fixture short enough for sun_path even with a long user home.
-        let home = tempfile::tempdir().unwrap();
+        // Private socket binding adds a staging directory to the path. Use a
+        // private directory under a short Unix base, independent of both HOME
+        // and TMPDIR (which is especially long on macOS).
+        let home = tempfile::Builder::new()
+            .prefix("mdk-use-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let app = MarmotApp::try_with_relays_and_account_home_and_config(
             home.path(),
             Vec::new(),
