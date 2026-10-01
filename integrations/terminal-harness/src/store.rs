@@ -97,6 +97,10 @@ pub(crate) enum TurnPhase {
     /// An output limit was exceeded, or the connector stopped while the turn
     /// was active; nothing is sent until explicit discard.
     Limited,
+    /// Explicitly discarded while its artifact intents may still be pending.
+    /// Nothing is sent and the group stays blocked; the tombstone is removed
+    /// only after every matching outbox intent is durably gone.
+    Discarded,
 }
 
 /// Durable per-turn send accounting. Identities are never logged.
@@ -546,15 +550,16 @@ impl FinalDeliveryStore {
             }
             match budget.phase {
                 TurnPhase::Active => return false,
-                TurnPhase::Limited => unresolved = true,
+                TurnPhase::Limited | TurnPhase::Discarded => unresolved = true,
                 TurnPhase::Reconcilable => {}
             }
         }
         unresolved
     }
 
-    /// Live and limited turns block the group like an incomplete final; a
-    /// limited turn stays until it is explicitly discarded.
+    /// Live, limited and discarded turns block the group like an incomplete
+    /// final; a limited turn stays until it is explicitly discarded, and a
+    /// discarded one until its artifact intents are removed.
     pub(crate) async fn blocks_group(&self, group_ref: &str) -> bool {
         let unresolved_turn =
             self.state.lock().await.turn_budgets.values().any(|budget| {
@@ -657,11 +662,14 @@ impl FinalDeliveryStore {
         self.commit(&mut state, next).await
     }
 
-    /// Clears the group's incomplete-final barrier and unresolved (active or
-    /// limited) turns, removing only the records and budgets that belong to
-    /// those reply sets. Other groups, later complete reply sets and
+    /// First step of discarding the group's incomplete-final barrier and
+    /// unresolved (active, limited or already discarded) turns. In one write it
+    /// clears their barrier and records and leaves a `Discarded` tombstone for
+    /// each reply set, so their pending artifact intents can never be replayed
+    /// on a fresh budget. Call `release_discarded` once those intents are
+    /// durably removed. Other groups, later complete reply sets and
     /// `keep_reply_to` are left in place. Returns the discarded reply sets.
-    pub(crate) async fn discard_incomplete_final(
+    pub(crate) async fn begin_discard(
         &self,
         group_ref: &str,
         keep_reply_to: Option<&str>,
@@ -697,13 +705,39 @@ impl FinalDeliveryStore {
         next.records.retain(|_, record| {
             record.group_ref != group_ref || !discarded.contains(&record.reply_to_ref)
         });
-        next.turn_budgets.retain(|_, budget| {
-            budget.group_ref != group_ref || !discarded.contains(&budget.reply_to_ref)
-        });
+        for reply_to_ref in &discarded {
+            next.turn_budgets
+                .entry(turn_key(group_ref, reply_to_ref))
+                .or_insert_with(|| TurnBudgetRecord {
+                    group_ref: group_ref.to_owned(),
+                    reply_to_ref: reply_to_ref.clone(),
+                    max_durable_sends: 0,
+                    sends_charged: 0,
+                    phase: TurnPhase::Discarded,
+                })
+                .phase = TurnPhase::Discarded;
+        }
         self.commit(&mut state, next).await?;
         let mut discarded: Vec<_> = discarded.into_iter().collect();
         discarded.sort();
         Ok(discarded)
+    }
+
+    /// Final step of a discard: removes the `Discarded` tombstones of
+    /// `reply_tos` after their artifact intents are durably gone.
+    pub(crate) async fn release_discarded(
+        &self,
+        group_ref: &str,
+        reply_tos: &[String],
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.turn_budgets.retain(|_, budget| {
+            budget.group_ref != group_ref
+                || budget.phase != TurnPhase::Discarded
+                || !reply_tos.contains(&budget.reply_to_ref)
+        });
+        self.commit(&mut state, next).await
     }
 
     /// Persists an active budget before the backend is spawned. A retained
@@ -732,10 +766,13 @@ impl FinalDeliveryStore {
 
     /// Durably charges one send attempt before its effect. Replay is admitted
     /// only for reconcilable turns, so stale reconciliation snapshots cannot
-    /// race a live, crashed or limited turn. A legacy entry without a budget
-    /// receives a fresh finite budget of `default_max` sends. `Live` callers
-    /// must already hold the active budget persisted by `begin_turn`, whose
-    /// failure prevents the backend from spawning.
+    /// race a live, crashed, limited or discarded turn. A legacy entry without a
+    /// budget receives a fresh finite budget of `default_max` sends, so replay
+    /// callers must first confirm their work item is still pending (see
+    /// `reserve_record_replay`); otherwise discarded work, whose budget is gone,
+    /// would look like a legacy entry. `Live` callers must already hold the
+    /// active budget persisted by `begin_turn`, whose failure prevents the
+    /// backend from spawning.
     pub(crate) async fn reserve_send(
         &self,
         group_ref: &str,
@@ -743,8 +780,44 @@ impl FinalDeliveryStore {
         mode: SendMode,
         default_max: usize,
     ) -> Result<SendAdmission> {
+        self.reserve(group_ref, reply_to_ref, mode, default_max, None)
+            .await
+    }
+
+    /// Replay reservation for one staged final record. It is admitted only
+    /// while `record_key` is still pending, checked under the same lock as the
+    /// charge, so a stale snapshot cannot resend a record that was delivered
+    /// or discarded after it was taken.
+    pub(crate) async fn reserve_record_replay(
+        &self,
+        record_key: &str,
+        group_ref: &str,
+        reply_to_ref: &str,
+        default_max: usize,
+    ) -> Result<SendAdmission> {
+        self.reserve(
+            group_ref,
+            reply_to_ref,
+            SendMode::Replay,
+            default_max,
+            Some(record_key),
+        )
+        .await
+    }
+
+    async fn reserve(
+        &self,
+        group_ref: &str,
+        reply_to_ref: &str,
+        mode: SendMode,
+        default_max: usize,
+        pending_record: Option<&str>,
+    ) -> Result<SendAdmission> {
         self.fail_injected_budget_write()?;
         let mut state = self.state.lock().await;
+        if pending_record.is_some_and(|record_key| !state.records.contains_key(record_key)) {
+            return Ok(SendAdmission::Withheld);
+        }
         let key = turn_key(group_ref, reply_to_ref);
         let mut budget =
             state
@@ -759,7 +832,7 @@ impl FinalDeliveryStore {
                     phase: TurnPhase::Reconcilable,
                 });
         let withheld = match (mode, budget.phase) {
-            (_, TurnPhase::Limited) => true,
+            (_, TurnPhase::Limited | TurnPhase::Discarded) => true,
             (SendMode::Replay, TurnPhase::Active) => true,
             (SendMode::Replay, TurnPhase::Reconcilable) => {
                 state.is_incomplete(group_ref, reply_to_ref)
@@ -1390,19 +1463,28 @@ mod tests {
         assert_eq!(store.list().await.len(), 1);
         assert!(store.list_reconcilable().await.is_empty());
         assert_eq!(
-            store.discard_incomplete_final("group", None).await.unwrap(),
+            discard(&store, "group", None).await,
             vec!["message".to_owned()]
         );
         assert!(!store.has_incomplete_final("group").await);
         assert!(!store.blocks_group("group").await);
         assert!(store.list().await.is_empty());
-        assert!(
-            store
-                .discard_incomplete_final("group", None)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(discard(&store, "group", None).await.is_empty());
+    }
+
+    /// Both discard steps, as the bridge runs them for a turn with no
+    /// pending artifact intents.
+    async fn discard(
+        store: &FinalDeliveryStore,
+        group_ref: &str,
+        keep_reply_to: Option<&str>,
+    ) -> Vec<String> {
+        let discarded = store.begin_discard(group_ref, keep_reply_to).await.unwrap();
+        store
+            .release_discarded(group_ref, &discarded)
+            .await
+            .unwrap();
+        discarded
     }
 
     fn delivery_record(reply_to_ref: &str, chunk_index: usize) -> FinalDeliveryRecord {
@@ -1494,7 +1576,7 @@ mod tests {
         }
         assert_eq!(store.list().await.len(), 2);
         assert_eq!(
-            store.discard_incomplete_final("group", None).await.unwrap(),
+            discard(&store, "group", None).await,
             vec!["active".to_owned(), "limited".to_owned()]
         );
         assert!(!store.blocks_group("group").await);
@@ -1546,7 +1628,7 @@ mod tests {
         store.finish_turn("group", "retry", false).await.unwrap();
         assert!(store.requires_recovery_command("group").await);
         assert_eq!(
-            store.discard_incomplete_final("group", None).await.unwrap(),
+            discard(&store, "group", None).await,
             vec!["active".to_owned()]
         );
         assert!(!store.requires_recovery_command("group").await);
@@ -1694,16 +1776,118 @@ mod tests {
         store.limit_turn("group", "old", 4).await.unwrap();
         store.begin_turn("group", "current", 4).await.unwrap();
         assert_eq!(
-            store
-                .discard_incomplete_final("group", Some("current"))
-                .await
-                .unwrap(),
+            discard(&store, "group", Some("current")).await,
             vec!["old".to_owned()]
         );
         assert_eq!(
             store.turn_budget("group", "current").await.unwrap().phase,
             TurnPhase::Active
         );
+    }
+
+    #[tokio::test]
+    async fn discarded_turn_stays_withheld_and_blocking_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        let store = FinalDeliveryStore::load(path.clone()).unwrap();
+        store.begin_turn("group", "limited", 1).await.unwrap();
+        store
+            .set("limited:1", delivery_record("limited", 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_send("group", "limited", SendMode::Live, 1)
+                .await
+                .unwrap(),
+            SendAdmission::Admitted
+        );
+        store.limit_turn("group", "limited", 1).await.unwrap();
+        // A barrier-only reply set without any budget also gets a tombstone.
+        store
+            .mark_incomplete_final("group", "barrier")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.begin_discard("group", None).await.unwrap(),
+            vec!["barrier".to_owned(), "limited".to_owned()]
+        );
+        drop(store);
+        let store = FinalDeliveryStore::load(path).unwrap();
+        assert!(store.list().await.is_empty());
+        assert!(!store.has_incomplete_final("group").await);
+        assert!(store.blocks_group("group").await);
+        assert!(store.requires_recovery_command("group").await);
+        for reply_to in ["limited", "barrier"] {
+            assert_eq!(
+                store.turn_budget("group", reply_to).await.unwrap().phase,
+                TurnPhase::Discarded
+            );
+            for mode in [SendMode::Replay, SendMode::Live] {
+                assert_eq!(
+                    store
+                        .reserve_send("group", reply_to, mode, 8)
+                        .await
+                        .unwrap(),
+                    SendAdmission::Withheld
+                );
+            }
+        }
+        // The original accounting is retained, not replaced by a fresh budget.
+        let limited = store.turn_budget("group", "limited").await.unwrap();
+        assert_eq!((limited.sends_charged, limited.max_durable_sends), (1, 1));
+
+        // A repeated discard resumes the tombstoned reply sets.
+        assert_eq!(
+            discard(&store, "group", None).await,
+            vec!["barrier".to_owned(), "limited".to_owned()]
+        );
+        assert!(!store.blocks_group("group").await);
+        assert!(!store.requires_recovery_command("group").await);
+        assert!(store.turn_budget("group", "limited").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_replay_is_admitted_only_while_the_record_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FinalDeliveryStore::load(dir.path().join("delivery.json")).unwrap();
+        store
+            .set("legacy:1", delivery_record("legacy", 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_record_replay("legacy:1", "group", "legacy", 2)
+                .await
+                .unwrap(),
+            SendAdmission::Admitted
+        );
+        assert!(store.remove("legacy:1").await.unwrap());
+        assert_eq!(
+            store
+                .reserve_record_replay("legacy:1", "group", "legacy", 2)
+                .await
+                .unwrap(),
+            SendAdmission::Withheld
+        );
+        assert_eq!(
+            store
+                .turn_budget("group", "legacy")
+                .await
+                .unwrap()
+                .sends_charged,
+            1
+        );
+        // A record removed by a completed discard never mints a fresh budget.
+        assert_eq!(
+            store
+                .reserve_record_replay("gone:1", "group", "gone", 2)
+                .await
+                .unwrap(),
+            SendAdmission::Withheld
+        );
+        assert!(store.turn_budget("group", "gone").await.is_none());
     }
 
     #[tokio::test]

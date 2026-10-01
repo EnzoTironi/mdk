@@ -1303,6 +1303,21 @@ struct TurnGate<'a> {
     mode: SendMode,
     default_max: usize,
     output: Option<&'a TurnOutputControl>,
+    work: Option<ReplayWork<'a>>,
+}
+
+/// The durable item a replay sends. Each admission first confirms the item is
+/// still pending, so a stale snapshot cannot resend work that was delivered or
+/// discarded after the snapshot was taken.
+#[derive(Clone, Copy)]
+enum ReplayWork<'a> {
+    Final {
+        key: &'a str,
+    },
+    Artifact {
+        outbox: &'a Mutex<ArtifactOutbox>,
+        key: &'a str,
+    },
 }
 
 impl<'a> TurnGate<'a> {
@@ -1318,6 +1333,7 @@ impl<'a> TurnGate<'a> {
             mode: SendMode::Live,
             default_max: output.limits().max_durable_sends(),
             output: Some(output),
+            work: None,
         }
     }
 
@@ -1326,6 +1342,7 @@ impl<'a> TurnGate<'a> {
         group_ref: &'a str,
         reply_to_ref: &'a str,
         default_max: usize,
+        work: ReplayWork<'a>,
     ) -> Self {
         Self {
             deliveries,
@@ -1334,6 +1351,7 @@ impl<'a> TurnGate<'a> {
             mode: SendMode::Replay,
             default_max,
             output: None,
+            work: Some(work),
         }
     }
 
@@ -1346,16 +1364,41 @@ impl<'a> TurnGate<'a> {
 
     async fn admit(&self) -> Result<()> {
         self.check_stop()?;
-        match self
-            .deliveries
-            .reserve_send(
-                self.group_ref,
-                self.reply_to_ref,
-                self.mode,
-                self.default_max,
-            )
-            .await?
-        {
+        let admission = match self.work {
+            None => {
+                self.deliveries
+                    .reserve_send(
+                        self.group_ref,
+                        self.reply_to_ref,
+                        self.mode,
+                        self.default_max,
+                    )
+                    .await?
+            }
+            Some(ReplayWork::Final { key }) => {
+                self.deliveries
+                    .reserve_record_replay(key, self.group_ref, self.reply_to_ref, self.default_max)
+                    .await?
+            }
+            Some(ReplayWork::Artifact { outbox, key }) => {
+                // A discard tombstones the turn before it removes the intent under
+                // this lock, so admission sees the tombstone or no intent.
+                let outbox = outbox.lock().await;
+                if outbox.contains(key) {
+                    self.deliveries
+                        .reserve_send(
+                            self.group_ref,
+                            self.reply_to_ref,
+                            self.mode,
+                            self.default_max,
+                        )
+                        .await?
+                } else {
+                    SendAdmission::Withheld
+                }
+            }
+        };
+        match admission {
             SendAdmission::Admitted => {}
             SendAdmission::Exhausted => {
                 let kind = OutputLimitKind::DurableSends;
@@ -1552,17 +1595,16 @@ async fn handle_output_limit(
 }
 
 /// Discards incomplete-final barriers and unresolved turns for a group,
-/// including their pending artifact batches. Returns whether anything was discarded.
+/// including their pending artifact batches. Returns whether anything was
+/// discarded. The turns stay tombstoned, withheld and blocking until every
+/// matching artifact intent is durably removed; any failure is returned so the
+/// discard is never confirmed, and a later discard resumes it.
 async fn discard_unresolved_turns(
     ctx: &BridgeContext,
     group_ref: &str,
     keep_reply_to: Option<&str>,
 ) -> Result<bool> {
-    let discarded = match ctx
-        .deliveries
-        .discard_incomplete_final(group_ref, keep_reply_to)
-        .await
-    {
+    let discarded = match ctx.deliveries.begin_discard(group_ref, keep_reply_to).await {
         Ok(discarded) => discarded,
         Err(err) => {
             warn!(target: TRACE_TARGET, method = "discard_incomplete_final", error_kind = err.privacy_safe_kind(), "failed to discard incomplete-final barrier");
@@ -1583,8 +1625,23 @@ async fn discard_unresolved_turns(
         })
         .collect();
     for batch in batches {
-        discard_artifact_batch(ctx, &batch.idempotency_key, group_ref).await;
+        match remove_artifact_batch(ctx, &batch.idempotency_key).await {
+            Ok(paths) => remove_staged_files(&ctx.cfg.artifact_exports, paths),
+            Err(err) => {
+                warn!(target: TRACE_TARGET, method = "artifact_outbox_discard", error_kind = err.privacy_safe_kind(), "failed to discard a pending artifact delivery intent; the discarded turn stays withheld");
+                return Err(err);
+            }
+        }
     }
+    if let Err(err) = ctx
+        .deliveries
+        .release_discarded(group_ref, &discarded)
+        .await
+    {
+        warn!(target: TRACE_TARGET, method = "discard_incomplete_final", error_kind = err.privacy_safe_kind(), "failed to release discarded turns; the group stays blocked until discarded again");
+        return Err(err);
+    }
+    ctx.queues.signal_group_changed(group_ref).await;
     Ok(true)
 }
 
@@ -1765,14 +1822,24 @@ async fn retry_pending_artifacts(ctx: &Arc<BridgeContext>) {
     if !ctx.cfg.artifact_exports.enabled() {
         return;
     }
-    let default_max = ctx.cfg.output_limits.max_durable_sends();
     let pending = ctx.outbox.lock().await.pending();
+    replay_artifact_batches(ctx, pending).await;
+}
+
+/// Replays a snapshot of pending batches; each admission rechecks that its
+/// batch is still pending, so the snapshot may be stale.
+async fn replay_artifact_batches(ctx: &Arc<BridgeContext>, pending: Vec<PendingArtifactBatch>) {
+    let default_max = ctx.cfg.output_limits.max_durable_sends();
     for batch in pending {
         let gate = TurnGate::replay(
             &ctx.deliveries,
             &batch.group_ref,
             &batch.reply_to_message_ref,
             default_max,
+            ReplayWork::Artifact {
+                outbox: &ctx.outbox,
+                key: &batch.idempotency_key,
+            },
         );
         match send_pending_artifact_batch(ctx, &batch, gate).await {
             Ok(()) => {
@@ -2973,8 +3040,8 @@ async fn deliver_buffered_text(
 }
 
 /// Replays acknowledgement-unknown finals. Every attempt is admitted against
-/// its turn's durable budget at send time, so a stale snapshot cannot replay
-/// an active or limited turn.
+/// its turn's durable budget at send time, and only while its record is still
+/// pending, so a stale snapshot cannot replay an active, limited or discarded turn.
 async fn reconcile_pending_deliveries(
     client: &ControlClient,
     store: &FinalDeliveryStore,
@@ -2982,7 +3049,13 @@ async fn reconcile_pending_deliveries(
     default_max: usize,
 ) {
     for (key, record) in store.list_reconcilable().await {
-        let gate = TurnGate::replay(store, &record.group_ref, &record.reply_to_ref, default_max);
+        let gate = TurnGate::replay(
+            store,
+            &record.group_ref,
+            &record.reply_to_ref,
+            default_max,
+            ReplayWork::Final { key: &key },
+        );
         match send_final_with_retry(
             client,
             Some(gate),
@@ -3852,9 +3925,9 @@ mod tests {
     ) -> Vec<agent_control::AgentControlRequest> {
         let root = tempfile::tempdir().unwrap();
         let export_root = root.path().join("exports");
-        std::fs::create_dir(&export_root).unwrap();
-        std::fs::write(export_root.join("report.pdf"), b"report").unwrap();
-        std::fs::write(export_root.join("chart.png"), b"chart").unwrap();
+        fs_private::create_dir_all_private(&export_root).unwrap();
+        fs_private::write_private(&export_root.join("report.pdf"), b"report").unwrap();
+        fs_private::write_private(&export_root.join("chart.png"), b"chart").unwrap();
 
         let socket = root.path().join("control.sock");
         let listener = StdUnixListener::bind(&socket).unwrap();
@@ -4738,7 +4811,7 @@ mod tests {
         let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
         let export_root = root.path().join("exports");
-        std::fs::create_dir(&export_root).unwrap();
+        fs_private::create_dir_all_private(&export_root).unwrap();
 
         let socket = root.path().join("control.sock");
         let listener = StdUnixListener::bind(&socket).unwrap();
@@ -4865,8 +4938,8 @@ mod tests {
         let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
         let export_root = root.path().join("exports");
-        std::fs::create_dir(&export_root).unwrap();
-        std::fs::write(export_root.join("report.pdf"), b"report").unwrap();
+        fs_private::create_dir_all_private(&export_root).unwrap();
+        fs_private::write_private(&export_root.join("report.pdf"), b"report").unwrap();
 
         let socket = root.path().join("control.sock");
         let listener = StdUnixListener::bind(&socket).unwrap();
@@ -5698,13 +5771,7 @@ mod tests {
             CompletionRoute::IncompleteFinal
         );
 
-        assert!(
-            !ctx.deliveries
-                .discard_incomplete_final("group", None)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(discard_unresolved_turns(&ctx, "group", None).await.unwrap());
         assert!(!fifo_is_blocked(&ctx, "group").await);
         assert!(ctx.deliveries.list().await.is_empty());
     }
@@ -6494,6 +6561,354 @@ mod tests {
         server.abort();
     }
 
+    /// A context whose artifact exports cover `group` and `other`, staged in
+    /// `root` like a restarted connector's outbox.
+    fn artifact_replay_context(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        backend: Arc<dyn Backend>,
+    ) -> (
+        Arc<BridgeContext>,
+        tokio::task::JoinHandle<()>,
+        RecordedRequests,
+    ) {
+        let mut config = limited_config(root, |settings| settings.max_durable_sends = 4);
+        config.artifact_exports = crate::ArtifactExportConfig::new(
+            true,
+            ["group", "other"]
+                .into_iter()
+                .map(|group| crate::ArtifactExportGrant {
+                    group_id_hex: group.to_owned(),
+                    export_root: root.to_path_buf(),
+                    ttl_seconds: 300,
+                })
+                .collect(),
+            root.to_path_buf(),
+            root.join("outbox.json"),
+        );
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(root, home, config, backend);
+        (ctx, server, requests)
+    }
+
+    /// Durably records one valid staged batch answering `reply_to`.
+    async fn record_staged_artifact_batch(
+        ctx: &BridgeContext,
+        root: &std::path::Path,
+        group_ref: &str,
+        reply_to: &str,
+    ) -> PendingArtifactBatch {
+        let staged = root.join(format!("{group_ref}-{reply_to}.bin"));
+        fs_private::write_private(&staged, b"payload").unwrap();
+        let artifacts = vec![crate::artifacts::StagedArtifact {
+            path: staged,
+            media_type: "application/octet-stream".to_owned(),
+            file_name: "result.bin".to_owned(),
+            size_bytes: 7,
+            plaintext_sha256: hex::encode(sha2::Sha256::digest(b"payload")),
+        }];
+        let caption = Some("Report attached");
+        let batch = PendingArtifactBatch {
+            idempotency_key: crate::artifacts::artifact_idempotency_key(
+                ctx.cfg.spec.reply_prefix,
+                "account",
+                group_ref,
+                reply_to,
+                caption,
+                &artifacts,
+            )
+            .unwrap(),
+            account_ref: "account".to_owned(),
+            group_ref: group_ref.to_owned(),
+            reply_to_message_ref: reply_to.to_owned(),
+            caption: caption.map(str::to_owned),
+            remaining_text: vec!["remaining text".to_owned()],
+            artifacts,
+        };
+        validate_staged_batch(&ctx.cfg.artifact_exports, ctx.cfg.spec.reply_prefix, &batch)
+            .unwrap();
+        ctx.outbox.lock().await.record(batch.clone()).unwrap();
+        batch
+    }
+
+    /// Seeds a limited turn whose only allowed send is already charged, with a
+    /// pending artifact batch withheld behind it.
+    async fn seed_limited_artifact_turn(
+        ctx: &BridgeContext,
+        root: &std::path::Path,
+        reply_to: &str,
+    ) -> PendingArtifactBatch {
+        ctx.deliveries
+            .begin_turn("group", reply_to, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.deliveries
+                .reserve_send("group", reply_to, SendMode::Live, 1)
+                .await
+                .unwrap(),
+            SendAdmission::Admitted
+        );
+        let batch = record_staged_artifact_batch(ctx, root, "group", reply_to).await;
+        ctx.deliveries
+            .limit_turn("group", reply_to, 1)
+            .await
+            .unwrap();
+        batch
+    }
+
+    async fn assert_discarded_with_original_accounting(
+        deliveries: &FinalDeliveryStore,
+        reply_to: &str,
+    ) {
+        let budget = deliveries.turn_budget("group", reply_to).await.unwrap();
+        assert_eq!(budget.phase, crate::store::TurnPhase::Discarded);
+        assert_eq!((budget.sends_charged, budget.max_durable_sends), (1, 1));
+        assert!(deliveries.blocks_group("group").await);
+        assert!(deliveries.requires_recovery_command("group").await);
+    }
+
+    /// Media sent to `group`, plus finals and activity answering one of
+    /// `reply_tos` there: turn output, as opposed to command replies.
+    fn turn_output_requests(requests: &RecordedRequests, reply_tos: &[&str]) -> usize {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| match request {
+                AgentControlRequest::SendMedia { group_id_hex, .. } => group_id_hex == "group",
+                AgentControlRequest::SendFinal {
+                    group_id_hex,
+                    reply_to_message_id_hex,
+                    ..
+                }
+                | AgentControlRequest::SendAgentActivity {
+                    group_id_hex,
+                    reply_to_message_id_hex,
+                    ..
+                } => {
+                    group_id_hex == "group"
+                        && reply_to_message_id_hex
+                            .as_deref()
+                            .is_some_and(|reply_to| reply_tos.contains(&reply_to))
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn failed_artifact_discard_keeps_the_limited_turn_withheld_across_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let (ctx, server, requests) =
+            artifact_replay_context(root.path(), &home, Arc::new(NoopBackend));
+        let batch = seed_limited_artifact_turn(&ctx, root.path(), "original").await;
+        record_staged_artifact_batch(&ctx, root.path(), "other", "legacy").await;
+        let outbox_temp = root.path().join("outbox.tmp");
+        std::fs::create_dir(&outbox_temp).unwrap();
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+
+        assert!(final_texts(&requests)[0].contains("Failed to discard"));
+        assert!(ctx.outbox.lock().await.contains(&batch.idempotency_key));
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+        assert!(fifo_is_blocked(&ctx, "group").await);
+        let reloaded =
+            FinalDeliveryStore::load(ctx.cfg.state_path.with_extension("delivery.json")).unwrap();
+        assert_discarded_with_original_accounting(&reloaded, "original").await;
+        assert!(
+            ArtifactOutbox::load(root.path().join("outbox.json"))
+                .unwrap()
+                .contains(&batch.idempotency_key)
+        );
+
+        std::fs::remove_dir(&outbox_temp).unwrap();
+        let before = requests.lock().unwrap().len();
+        retry_pending_artifacts(&ctx).await;
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 4).await;
+        // The unrelated legacy batch is replayed on a finite budget; the
+        // discarded turn sends nothing and keeps its original accounting.
+        let replayed = requests.lock().unwrap()[before..].to_vec();
+        assert_eq!(replayed.len(), 2);
+        assert!(replayed.iter().all(|request| matches!(
+            request,
+            AgentControlRequest::SendMedia { group_id_hex, .. }
+                | AgentControlRequest::SendFinal { group_id_hex, .. } if group_id_hex == "other"
+        )));
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+        assert!(ctx.outbox.lock().await.contains(&batch.idempotency_key));
+
+        // Repeating the discard resumes and completes it.
+        assert!(dispatch_test_message(ctx.clone(), "discard-again", "/discard-last").await);
+        assert!(
+            final_texts(&requests)
+                .last()
+                .unwrap()
+                .contains("queued work can continue")
+        );
+        assert!(ctx.outbox.lock().await.pending().is_empty());
+        assert!(!batch.artifacts[0].path.exists());
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "original")
+                .await
+                .is_none()
+        );
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        assert_eq!(turn_output_requests(&requests, &["original"]), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_artifact_snapshot_cannot_replay_a_turn_during_or_after_its_discard() {
+        const TURNS: &[&str] = &["original", "second", "unbudgeted"];
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let (ctx, server, requests) =
+            artifact_replay_context(root.path(), &home, Arc::new(NoopBackend));
+        seed_limited_artifact_turn(&ctx, root.path(), "original").await;
+        let snapshot = ctx.outbox.lock().await.pending();
+        assert_eq!(snapshot.len(), 1);
+
+        // Disposal has begun: the turn is tombstoned, its intent not yet removed.
+        assert_eq!(
+            ctx.deliveries.begin_discard("group", None).await.unwrap(),
+            vec!["original".to_owned()]
+        );
+        replay_artifact_batches(&ctx, snapshot.clone()).await;
+        assert_eq!(turn_output_requests(&requests, TURNS), 0);
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+
+        // Disposal has completed: the stale snapshot names a removed intent.
+        // Staged-file removal is best effort, so the bytes may outlive it.
+        assert!(discard_unresolved_turns(&ctx, "group", None).await.unwrap());
+        fs_private::write_private(&snapshot[0].artifacts[0].path, b"payload").unwrap();
+        validate_staged_batch(
+            &ctx.cfg.artifact_exports,
+            ctx.cfg.spec.reply_prefix,
+            &snapshot[0],
+        )
+        .unwrap();
+        replay_artifact_batches(&ctx, snapshot).await;
+        assert_eq!(turn_output_requests(&requests, TURNS), 0);
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "original")
+                .await
+                .is_none(),
+            "discarded work must not receive a fresh legacy budget"
+        );
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+
+        // Replay racing a discard paused after its delivery-store write.
+        seed_limited_artifact_turn(&ctx, root.path(), "second").await;
+        let snapshot = ctx.outbox.lock().await.pending();
+        let held = ctx.outbox.lock().await;
+        let discard = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { discard_unresolved_turns(&ctx, "group", None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ctx
+                .deliveries
+                .turn_budget("group", "second")
+                .await
+                .is_none_or(|budget| budget.phase != crate::store::TurnPhase::Discarded)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("discard tombstones the turn before touching the outbox");
+        let replay = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { replay_artifact_batches(&ctx, snapshot).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+        assert!(discard.await.unwrap().unwrap());
+        replay.await.unwrap();
+        assert_eq!(turn_output_requests(&requests, TURNS), 0);
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "second")
+                .await
+                .is_none()
+        );
+        assert!(ctx.outbox.lock().await.pending().is_empty());
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+
+        // Positive control: an unbudgeted (legacy) batch that was never
+        // discarded is still replayed: its media and remaining text.
+        record_staged_artifact_batch(&ctx, root.path(), "group", "unbudgeted").await;
+        retry_pending_artifacts(&ctx).await;
+        assert_eq!(turn_output_requests(&requests, TURNS), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_cleanup_failure_keeps_the_original_artifact_turn_withheld() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (ctx, server, requests) = artifact_replay_context(
+            root.path(),
+            &home,
+            ScriptedEventsBackend::new(texts(&["done"]), Some("session")),
+        );
+        let batch = seed_limited_artifact_turn(&ctx, root.path(), "original").await;
+        ctx.recovery
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "private prompt".to_owned(),
+                    media: Vec::new(),
+                    cwd: repo.clone(),
+                    session_id: "session".to_owned(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Pending,
+                },
+            )
+            .await
+            .unwrap();
+        let outbox_temp = root.path().join("outbox.tmp");
+        std::fs::create_dir(&outbox_temp).unwrap();
+
+        assert!(dispatch_test_message(ctx.clone(), "retry", "/retry-last").await);
+
+        assert_eq!(final_texts(&requests), vec!["done"]);
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+        assert!(ctx.outbox.lock().await.contains(&batch.idempotency_key));
+        assert!(ctx.recovery.get("group").await.is_none());
+        assert!(fifo_is_blocked(&ctx, "group").await);
+
+        std::fs::remove_dir(&outbox_temp).unwrap();
+        retry_pending_artifacts(&ctx).await;
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 4).await;
+        assert_eq!(final_texts(&requests), vec!["done"]);
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| matches!(request, AgentControlRequest::SendMedia { .. }))
+        );
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(ctx.outbox.lock().await.pending().is_empty());
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "original")
+                .await
+                .is_none()
+        );
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn turns_within_every_budget_complete_and_prune_their_budget() {
         let root = tempfile::tempdir().unwrap();
@@ -6682,6 +7097,7 @@ mod tests {
             mode: SendMode::Live,
             default_max: 4,
             output: Some(&output),
+            work: None,
         };
         output.latch(OutputLimitKind::StdoutBytes);
         let polled = std::sync::atomic::AtomicBool::new(false);
@@ -6734,8 +7150,14 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         deliveries.begin_turn("group", "message", 4).await.unwrap();
 
-        let (_, record) = &snapshot[0];
-        let gate = TurnGate::replay(&deliveries, &record.group_ref, &record.reply_to_ref, 4);
+        let (key, record) = &snapshot[0];
+        let gate = TurnGate::replay(
+            &deliveries,
+            &record.group_ref,
+            &record.reply_to_ref,
+            4,
+            ReplayWork::Final { key },
+        );
         let result = send_final_with_retry(
             &client,
             Some(gate),
@@ -6790,6 +7212,7 @@ mod tests {
             mode: SendMode::Live,
             default_max: 4,
             output: Some(&output),
+            work: None,
         };
 
         let (result, ()) = tokio::join!(

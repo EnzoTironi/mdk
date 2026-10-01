@@ -23,7 +23,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   exceed the chunk cap is rejected before any of it is sent, and a
   `/retry-last` that breaches a limit keeps the earlier turn's pending
   deliveries. Durable send budgets persist across restarts and also cap
-  reconciliation replays. A turn interrupted by a connector restart is loaded
+  reconciliation replays. A discarded turn stays withheld until its pending
+  artifact deliveries are durably removed; if that fails, `/discard-last`
+  reports the failure instead of releasing the turn's output on a fresh
+  budget. A turn interrupted by a connector restart is loaded
   as a limited turn that `/discard-last` clears, and a message queued behind a
   limited turn receives one notice naming the recovery command instead of
   waiting silently. See the

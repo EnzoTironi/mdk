@@ -157,6 +157,13 @@ deliveries only after its own completion, including its final status notice,
 stays within every limit; a retry that breaches a limit keeps both turns behind
 the barrier until `/discard-last`.
 
+A discard keeps its turns withheld and the group blocked until the turns'
+pending artifact deliveries are durably removed. If that removal fails,
+`/discard-last` reports the failure and nothing from those turns is sent,
+including after a restart. Sending `/discard-last` again completes the discard.
+Replay rechecks that each staged chunk or artifact delivery is still pending
+before it is sent, so a discarded turn is never replayed on a fresh budget.
+
 Durable send budgets survive restarts. Startup and periodic reconciliation
 replay staged chunks only for turns that have finished, charge each replay
 attempt against the same budget, and mark a turn limited instead of sending once
