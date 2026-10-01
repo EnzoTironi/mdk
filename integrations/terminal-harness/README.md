@@ -163,6 +163,15 @@ access. The local token still grants the existing full control API; the turn
 route is convenience context, not a new per-group security capability. Use an
 isolated connector home for a separate trust boundary.
 
+A configured token, including one loaded from a token file, is passed as the raw
+`MARMOT_AGENT_AUTH_TOKEN` value to each backend child. Tool shells, MCP servers
+and other descendants that inherit its environment can use the full control
+API for every account in that connector home. Only run trusted descendants in
+that boundary. Backend environment filtering must explicitly preserve the
+turn's `MARMOT_*` route and token for `wn-agent group-profile`; permission to
+launch a shell alone does not ensure that these values reach it. Without a turn
+token, the CLI retains its normal connector-home `control.token` fallback.
+
 ## Chat Commands
 
 Terminal backends run through their non-interactive machine interfaces, which do

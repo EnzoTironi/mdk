@@ -40,6 +40,12 @@ acknowledgements have an unknown outcome and are never retried automatically;
 check current group details before retrying. This tool preserves the existing
 full-control socket authentication boundary.
 
+The tool binds the selected account to the current delivery context but accepts
+an explicit target group, like the message tool. This is intentionally not a
+per-conversation capability: the selected account must be a current admin of
+the target group. Use conversation metadata for the current group, and target
+another group only when the user explicitly requests it.
+
 ## Install (release)
 
 Versioned `wn-agent` builds and this plugin are published as [`wn-agent-v*`](https://github.com/marmot-protocol/mdk/releases)

@@ -38,7 +38,8 @@ pub(crate) fn configure_command(command: &mut Command) {
                 "MARMOT_GROUP_PROFILE_TIMEOUT_SECS",
                 ctx.request_timeout.as_secs().clamp(1, 300).to_string(),
             )
-            // Stale parent token files must not override this turn's route.
+            // Ignore the parent's token-file override; the CLI still falls back to
+            // the connector home's control.token when no turn token is provided.
             .env_remove("MARMOT_AGENT_AUTH_TOKEN_FILE");
         match &ctx.auth_token {
             Some(token) => {

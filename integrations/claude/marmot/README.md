@@ -168,6 +168,12 @@ The CLI contract and event schema were checked against Claude Code 2.1.270.
 
 ## Security Notes
 
+- Group-profile routing passes a configured bearer token as a raw child
+  environment value, including tokens loaded from files. Trusted tool shells,
+  MCP servers and other descendants may inherit its full connector authority.
+  Backend environment filtering must preserve the turn's route and token;
+  see the [shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates).
+
 - An allowlisted sender can cause Claude Code to read, modify, and execute code
   with the service user's authority. Use a dedicated OS user, container, or VM
   for broad execution profiles.

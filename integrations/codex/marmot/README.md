@@ -207,6 +207,12 @@ Batch copies remain available for the complete turn and are removed after succes
 
 ## Security Notes
 
+- Group-profile routing passes a configured bearer token as a raw child
+  environment value, including tokens loaded from files. Trusted tool shells,
+  MCP servers and other descendants may inherit its full connector authority.
+  Backend environment filtering must preserve the turn's route and token;
+  see the [shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates).
+
 - The configured sender list controls prompt execution and is mirrored
   additively into the `wn-agent` welcomer allowlist. To revoke access, remove the
   sender from `WN_CODEX_ALLOWED_SENDERS_HEX`, restart `wn-codex`, and remove it

@@ -116,7 +116,7 @@ mod tests {
             auth_token: Some("test-token".into()),
             account_id_hex: "11".repeat(32),
             group_id_hex: "22".repeat(16),
-            request_timeout: Duration::from_millis(100),
+            request_timeout: Duration::from_secs(2),
         }
     }
 

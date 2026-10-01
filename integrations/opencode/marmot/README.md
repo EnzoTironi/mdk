@@ -234,6 +234,12 @@ migration for other terminal harnesses.
 
 ## Security Notes
 
+- Group-profile routing passes a configured bearer token as a raw child
+  environment value, including tokens loaded from files. Trusted tool shells,
+  MCP servers and other descendants may inherit its full connector authority.
+  Backend environment filtering must preserve the turn's route and token;
+  see the [shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates).
+
 - The control socket is local Unix-domain only. Use the normal `wn-agent`
   socket mode and bearer-token options for shared local-user setups.
 - The same allowlist controls invite acceptance in `wn-agent` and prompt
