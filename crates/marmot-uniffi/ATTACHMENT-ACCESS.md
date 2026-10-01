@@ -100,6 +100,17 @@ Obsolete references return false; obsolete/unavailable slots return no reference
 cannot download attachments before acceptance. These commands persist intent without waiting for
 network readiness; acquisition needs an active, non-frozen account runtime.
 
+HTTP 404 or 410 means that locator cannot serve the blob: when every candidate locator is
+missing or otherwise permanently unusable, the job reports `Failed` at once. Other 4xx, 5xx,
+timeouts and connection failures stay retryable. When the group's decryption key for the
+attachment's source epoch is not available locally, the job waits as `RetryScheduled` without
+spending an attempt (15 seconds, doubling) and reports `Failed` on the sixth consecutive miss,
+about eight minutes after the first. Disk-reserve and retained-quota pressure still defer without
+that limit. `Failed` survives restart and repeated demand; render a download action. Explicit
+work (Retry, download-again) starts a fresh window and derives a missing key from the group's
+retained MLS state for that epoch (the newest five epochs), so Retry recovers attachments whose
+key was never cached.
+
 `attachmentDownloadPolicy` / `setAttachmentDownloadPolicy` read/write a durable per-account
 policy. In `NativeAutomatic` mode automatic acquisition defaults on: 2 GiB retained quota, 256 MiB free-disk reserve plus
 SQLite/WAL headroom, 64 MiB automatic ciphertext ceiling, one runtime-wide acquisition at a time.

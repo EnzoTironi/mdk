@@ -28,6 +28,14 @@
   names the earliest active kind-7 for that emoji, whose custom image
   `list_media` returns under the same message id.
 
+### Changed
+
+- Attachment downloads report `Failed` instead of staying `RetryScheduled`
+  indefinitely when the blob is gone (404/410 everywhere) or its epoch key stays
+  unavailable for about eight minutes. Hosts should offer Retry: it derives a
+  missing key from retained epoch state, recovering attachments whose key was
+  never cached. Retry budgets are unchanged.
+
 
 ## 0.11.0 - 2026-09-29
 
