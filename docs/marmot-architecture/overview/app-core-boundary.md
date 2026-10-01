@@ -1,7 +1,7 @@
 ---
 title: "App Core Boundary"
 created: 2026-05-15
-updated: 2026-09-30
+updated: 2026-10-01
 tags: [marmot, app-core, android, swift, cli, tui]
 status: overview
 ---
@@ -14,7 +14,7 @@ Shared product policy and protocol state must remain behind the app-core API.
 
 ## Host-app boundary
 
-White Noise Android is a **minimal display and Android platform layer**:
+Each host is a **minimal display and platform layer**:
 
 | Owner | Responsibilities |
 | --- | --- |

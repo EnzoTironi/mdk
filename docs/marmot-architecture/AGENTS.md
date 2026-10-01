@@ -36,7 +36,7 @@ order and the roles agents most often need.
 - **Path:** `overview/whitenoise-integration-map.md`
   - **Role:** Current shim map and engine API friction list for whitenoise-rs integration.
 
-- **Path:** `overview/marmot-app-runtime.md`, `overview/app-core-boundary.md`
+- **Path:** `overview/marmot-app-runtime.md`
   - **Role:** `marmot-app` runtime boundary for client applications and the app-core layer under `wn`.
 
 - **Path:** `overview/observability.md`
