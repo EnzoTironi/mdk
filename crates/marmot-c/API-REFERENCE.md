@@ -2557,6 +2557,16 @@ Stored raw app messages for a group (`group_id_hex` non-NULL) or the whole accou
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotmessages) · [Header contract](include/marmot.h#L7340)
 
+### `marmot_message_draft_revision_includes_chat_list_version`
+
+```c
+MarmotStatus marmot_message_draft_revision_includes_chat_list_version(const struct MarmotMessageDraftRevision *revision, const char *version, uint8_t *out);
+```
+
+Compare the opaque `draft_version` from a presented chat-list row with a live captured draft revision. Returns 1 only for the same account-store/group scope at or before that captured revision; malformed, foreign and newer versions return 0. Borrow both inputs for the call and supply a non-NULL output byte, which is reset on errors. Treat the version as private presentation correlation: never parse, log or persist it, and never use it to select a newer draft for deletion. Revision-checked draft cleanup remains authoritative. Regenerate bindings and consume the matching native binary before adopting this added row field.
+
+[Header contract](include/marmot.h#L10375)
+
 ### `marmot_message_drafts`
 
 ```c
@@ -5088,14 +5098,5 @@ Configure or disable the dedicated v5 OTLP sender in memory. To enable, supply a
 
 [Header contract](include/marmot.h#L8266)
 
-### `marmot_message_draft_revision_includes_chat_list_version`
-
-```c
-MarmotStatus marmot_message_draft_revision_includes_chat_list_version(const struct MarmotMessageDraftRevision *revision, const char *version, uint8_t *out);
-```
-
-Compare the opaque `draft_version` from a presented chat-list row with a live captured draft revision. Returns 1 only for the same account-store/group scope at or before that captured revision; malformed, foreign and newer versions return 0. Borrow both inputs for the call and supply a non-NULL output byte, which is reset on errors. Treat the version as private presentation correlation: never parse, log or persist it, and never use it to select a newer draft for deletion. Revision-checked draft cleanup remains authoritative. Regenerate bindings and consume the matching native binary before adopting this added row field.
-
-[Header contract](include/marmot.h#L10375)
 
 </details>

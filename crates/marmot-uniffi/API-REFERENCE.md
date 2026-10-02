@@ -3343,6 +3343,21 @@ Observe block-list snapshots.
 </details>
 
 <details>
+<summary>conversions/conversation_window.rs</summary>
+
+### `MessageDraftRevisionFfi::includes_chat_list_version`
+
+```rust
+pub fn includes_chat_list_version(&self, version: String) -> bool
+```
+
+Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes malformed input and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-unreleased).
+
+[Source](src/conversions/conversation_window.rs#L340)
+
+</details>
+
+<details>
 <summary>conversions/attachment_history.rs</summary>
 
 ### `AttachmentHistoryVersion::change_since`
@@ -4295,20 +4310,5 @@ pub fn set_audit_otlp_config_v5( &self, mut config: AuditOtlpConfigV5Ffi, ) -> R
 Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, provide a stable destination identity, an HTTPS `/v1/logs` endpoint, and a bearer token; local loopback testing additionally requires `allow_loopback_dev: true`. The returned configuration always omits the token. With `enabled: false`, the runtime clears the sender. This does not enable recording, change the v4 Goggles route, or persist credentials. A configuration change fences in-flight acknowledgments.
 
 [Source](src/commands/audit.rs#L54)
-
-</details>
-
-<details>
-<summary>New exports — complete and organize before merging</summary>
-
-### `MessageDraftRevisionFfi::includes_chat_list_version`
-
-```rust
-pub fn includes_chat_list_version(&self, version: String) -> bool
-```
-
-Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes malformed input and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-unreleased).
-
-[Source](src/conversions/conversation_window.rs#L340)
 
 </details>
