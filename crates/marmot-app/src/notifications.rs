@@ -312,6 +312,8 @@ pub struct NotificationUpdate {
     /// pubkey-reference (`p`) tag or an inline nostr pubkey entity (a bare
     /// `@npub1…` handle or an explicit `nostr:` URI) on the inbound app event.
     /// This is computed from event semantics, not the rendered preview text.
+    /// A durable chat mute still emits direct mentions with this flag set;
+    /// blocked senders remain suppressed before an update is emitted.
     pub is_mention: bool,
     pub message_id_hex: Option<String>,
     pub sender: NotificationUser,
@@ -1862,6 +1864,11 @@ fn notification_traffic_for_kind(kind: u64) -> Option<NotificationTrafficClass> 
     }
 }
 
+/// Resolve one delivered message into a typed notification candidate.
+///
+/// Durable whole-chat mute filters ordinary traffic after blocked-sender and
+/// kind checks, while a direct mention of the receiving account remains
+/// eligible for the host's permission, channel, and foreground policy.
 fn notification_update_from_message(
     app: &MarmotApp,
     resolver: &mut NotificationResolver,
@@ -1897,12 +1904,14 @@ fn notification_update_from_message(
         Err(AppError::UnknownGroup(_)) => return Ok(None),
         Err(err) => return Err(err),
     };
-    if muted {
+    // Durable mute silences everything except a direct mention of this account.
+    let is_from_self = event.message.sender == event.account_id_hex;
+    let is_mention = notification_is_mention(&event.message, &event.account_id_hex, is_from_self);
+    if muted && !is_mention {
         return Ok(None);
     }
     let receiver = resolver.user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, resolver, &event.message)?;
-    let is_from_self = event.message.sender == event.account_id_hex;
     // Resolve the reacted-to row from the materialized timeline by id (not raw
     // app_events): the timeline reflects deletion/invalidation and never carries
     // removed text, so a reaction can't leak it into a preview. Notify only the
@@ -1941,7 +1950,7 @@ fn notification_update_from_message(
         group_id_hex,
         group_name: group_name(group.as_ref()),
         is_dm: false,
-        is_mention: notification_is_mention(&event.message, &event.account_id_hex, is_from_self),
+        is_mention,
         message_id_hex: Some(event.message.message_id_hex.clone()),
         sender,
         receiver,
