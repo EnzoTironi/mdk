@@ -39,6 +39,20 @@
   `quarantined_group_input_deferred` message reasons instead of writing them
   as `unclassified`. Older v5 rows with an `unclassified` reason stay
   ambiguous (#2120).
+- Import and external-signer onboarding now searches the built-in public
+  indexers alongside the host's discovery relays when checking an identity's
+  profile, follows, and kind-10002/10050 relay lists. Previously a host that
+  passed only its own messaging relays could see an existing identity's lists
+  as missing and be offered (or automatically approve) a defaults-only
+  replacement. A missing list is now concluded, and a repair approved, only
+  when every searched relay, indexers included, answers. Indexers are dialed
+  on top of the 16-relay inspection cap, so they neither displace the host's
+  or the account's declared relays nor get dropped themselves. Repairs still
+  publish only to the host's discovery relays and the account's declared
+  relays, not to the indexers. A host-selected set from
+  `set_onboarding_discovery_relays` is used as given, without indexers, so an
+  unreachable indexer can be bypassed. Loopback (development) routes are
+  unchanged, and the KeyPackage device check keeps its existing sources.
 - A route change, such as creating or leaving a group, no longer resets
   history recovery for every route. Routes whose own window and required
   relays are unchanged keep their certificates and quiet streak; only changed
