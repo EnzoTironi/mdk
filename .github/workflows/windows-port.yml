@@ -1,0 +1,34 @@
+name: Windows filesystem contracts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-port-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-filesystem:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Test filesystem, account replacement, and audit delivery
+        run: cargo test --locked -p fs-private -p marmot-account -p marmot-forensics
+      - name: Test runtime root ownership
+        run: cargo test --locked -p marmot-app --lib root_runtime_lease
