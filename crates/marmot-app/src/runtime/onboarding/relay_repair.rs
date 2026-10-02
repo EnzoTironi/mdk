@@ -320,7 +320,7 @@ impl AccountManager {
         let (mut repair, mut read_relays, mut write_relays) = self.minimal_relay_repair(
             step,
             c.records[step.index()].as_ref(),
-            &c.options.default_relays,
+            c.options.defaults_for(step),
         );
         if passed_with_retired && repair.mode != OnboardingRelayRepairMode::RemovalOnly {
             return Err(onboarding_error());

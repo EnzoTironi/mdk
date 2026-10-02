@@ -1786,6 +1786,116 @@ async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signi
 }
 
 #[tokio::test]
+async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_restart() {
+    for inbox_relays in [vec!["wss://inbox-default.example".into()], Vec::new()] {
+        let directory = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let first = runtime(directory.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let expected_relay = inbox_relays
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "wss://default.example".into());
+        first
+            .accounts()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                OnboardingOptions {
+                    inbox_relays,
+                    ..options()
+                },
+            )
+            .await
+            .unwrap();
+        let source = signed(
+            &keys,
+            10050,
+            vec![
+                vec!["client".into(), "keep".into()],
+                vec!["relay".into(), "wss://relay.damus.io".into()],
+            ],
+            "opaque inbox content",
+            unix_now_seconds() - 1,
+        );
+        *network.events.lock().unwrap() = vec![source.clone()];
+        let manager = first.accounts();
+        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        checkpoint.set(OnboardingStep::Relays, OnboardingStatus::Passed, vec![]);
+        checkpoint.set(
+            OnboardingStep::InboxRelays,
+            OnboardingStatus::NeedsInput,
+            vec![],
+        );
+        checkpoint.records[OnboardingStep::InboxRelays.index()] = Some(source.clone());
+        manager.save_onboarding(&mut checkpoint).unwrap();
+        let preview = manager
+            .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        let repair = preview
+            .proposal
+            .as_ref()
+            .unwrap()
+            .relay_repair
+            .as_ref()
+            .unwrap();
+        assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalAndAdditive);
+        let expected_tags = vec![
+            source.tags[0].clone(),
+            vec!["relay".into(), expected_relay.clone()],
+        ];
+        assert_eq!(
+            repair
+                .after_tags
+                .iter()
+                .map(|tag| tag.fields.clone())
+                .collect::<Vec<_>>(),
+            expected_tags
+        );
+        assert_eq!(
+            preview.proposal.as_ref().unwrap().read_relays,
+            [expected_relay]
+        );
+        assert!(network.attempts.lock().unwrap().is_empty());
+        network.zero_acks.store(true, Ordering::SeqCst);
+        manager
+            .approve_onboarding_repair(&id, preview.revision)
+            .await
+            .unwrap();
+        let published = network.attempts.lock().unwrap()[0].clone();
+        assert_eq!(published.tags, expected_tags);
+        assert_eq!(published.content, source.content);
+        assert_eq!(
+            manager.onboarding_checkpoint(&id).unwrap().unwrap().version,
+            LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION
+        );
+        first.shutdown_and_close().await.unwrap();
+
+        let second = runtime(directory.path(), network.clone());
+        second
+            .accounts()
+            .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+            .await
+            .unwrap();
+        {
+            let attempts = network.attempts.lock().unwrap();
+            assert!(attempts.len() >= 2 && attempts.iter().all(|event| event == &published));
+        }
+        assert_eq!(
+            second
+                .accounts()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap()
+                .version,
+            LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION
+        );
+        second.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn minimal_relay_repair_rejects_changed_source_without_publication() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let source = signed(

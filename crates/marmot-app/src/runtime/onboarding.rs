@@ -2334,7 +2334,7 @@ impl AccountManager {
             let (expected, read_relays, write_relays) = self.minimal_relay_repair(
                 proposal.step,
                 c.records[proposal.step.index()].as_ref(),
-                &c.options.default_relays,
+                c.options.defaults_for(proposal.step),
             );
             if (repair.mode == OnboardingRelayRepairMode::RemovalOnly
                 && c.snapshot.steps[proposal.step.index()]
