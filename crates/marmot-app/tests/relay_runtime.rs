@@ -1055,6 +1055,18 @@ async fn deletion_rejecting_app(dir: &tempfile::TempDir) -> (LocalRelay, MarmotA
 struct MockBlossom {
     url: String,
     blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    ledger: Arc<BlossomLedger>,
+}
+
+/// Independent fixture counters; never infer HTTP activity from app progress.
+#[derive(Default)]
+struct BlossomLedger {
+    puts: AtomicUsize,
+    gets: AtomicUsize,
+    heads: AtomicUsize,
+    uploaded_bytes: AtomicUsize,
+    response_bytes: AtomicUsize,
+    deny_reads: AtomicBool,
 }
 
 struct CapturedAuditUpload {
@@ -1204,6 +1216,7 @@ impl MockBlossom {
     }
 }
 
+/// Serve encrypted generated fixtures with independent request and byte counters.
 async fn mock_blossom() -> MockBlossom {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1211,6 +1224,8 @@ async fn mock_blossom() -> MockBlossom {
     let blobs = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
     let server_blobs = blobs.clone();
     let server_url = url.clone();
+    let ledger = Arc::new(BlossomLedger::default());
+    let server_ledger = ledger.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _peer)) = listener.accept().await else {
@@ -1218,6 +1233,7 @@ async fn mock_blossom() -> MockBlossom {
             };
             let blobs = server_blobs.clone();
             let server_url = server_url.clone();
+            let ledger = server_ledger.clone();
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 4096];
@@ -1265,6 +1281,10 @@ async fn mock_blossom() -> MockBlossom {
                 let body = request[header_end..header_end + content_length].to_vec();
                 match (method.as_str(), path.as_str()) {
                     ("PUT", "/upload") => {
+                        ledger.puts.fetch_add(1, Ordering::SeqCst);
+                        ledger
+                            .uploaded_bytes
+                            .fetch_add(body.len(), Ordering::SeqCst);
                         assert!(
                             authorization
                                 .as_deref()
@@ -1293,6 +1313,11 @@ async fn mock_blossom() -> MockBlossom {
                         .await;
                     }
                     ("GET", blob_path) => {
+                        ledger.gets.fetch_add(1, Ordering::SeqCst);
+                        if ledger.deny_reads.load(Ordering::SeqCst) {
+                            write_http_response(&mut stream, 410, "text/plain", b"denied").await;
+                            return;
+                        }
                         let hash = blob_path
                             .trim_start_matches('/')
                             .split_once('.')
@@ -1300,6 +1325,9 @@ async fn mock_blossom() -> MockBlossom {
                             .unwrap_or_else(|| blob_path.trim_start_matches('/'));
                         let blob = blobs.lock().await.get(hash).cloned();
                         if let Some(blob) = blob {
+                            ledger
+                                .response_bytes
+                                .fetch_add(blob.len(), Ordering::SeqCst);
                             write_http_response(
                                 &mut stream,
                                 200,
@@ -1311,6 +1339,10 @@ async fn mock_blossom() -> MockBlossom {
                             write_http_response(&mut stream, 404, "text/plain", b"not found").await;
                         }
                     }
+                    ("HEAD", _) => {
+                        ledger.heads.fetch_add(1, Ordering::SeqCst);
+                        write_http_response(&mut stream, 410, "text/plain", b"denied").await;
+                    }
                     _ => {
                         write_http_response(&mut stream, 404, "text/plain", b"not found").await;
                     }
@@ -1318,7 +1350,7 @@ async fn mock_blossom() -> MockBlossom {
             });
         }
     });
-    MockBlossom { url, blobs }
+    MockBlossom { url, blobs, ledger }
 }
 
 async fn write_http_response(
@@ -16347,3 +16379,6 @@ async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
     bob.shutdown().await;
     carol.shutdown().await;
 }
+
+#[path = "relay_runtime/attachment_retention.rs"]
+mod attachment_retention;
