@@ -2,7 +2,19 @@
 
 ## Unreleased
 
+## 0.12.0 - 2026-10-02
+
+Account storage advances from migration 98 through 101 on first open; downgrade
+is unsupported.
+
 ### Added
+
+- Migration 0100 keeps a tapped attachment's explicit priority when its
+  history row is reprojected, and migration 0101
+  adds bounded outgoing-upload staging records, written after the blob upload
+  and before publication; confirmed sends later promote them to retained
+  attachment bytes.
+  (#2142)
 
 - `SqliteAccountStorage::poll_votes` pages each voter's effective selection for
   one visible poll (1..=100 per page, `(voted_at, voter)` cursor). The timeline
