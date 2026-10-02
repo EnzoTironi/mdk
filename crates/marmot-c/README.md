@@ -275,11 +275,12 @@ user's account key. Only the last identifies the MDK account.
    previous signer relays in place; other errors fail connection.
 3. Call `marmot_nip46_login` off the UI thread to create or reopen the external
    account. It signs real MLS identity proofs and KeyPackages through the signer.
-   Supply default messaging relays for lists that cannot be discovered. Set
+   Supply default messaging relays for lists the account has not published. Set
    `inbox_relays` separately, or pass `NULL, 0` to use the defaults for both lists. Login
-   may publish those defaults after directory failure, but preserves every signed
-   list already observed, including an explicit-empty declaration. The normal
-   local-key login path uses the same fallback policy.
+   publishes those defaults only for lists that discovery confirms absent. An
+   incomplete directory read fails login with a retryable error instead of
+   overwriting lists it could not see. Signed lists, including explicit-empty
+   declarations, are kept.
 4. Store `marmot_nip46_export` only in the host's encrypted vault. It contains the
    client secret, pinned user and signer keys, and current relay set, but not the
    consumed bunker/pairing secret. External database keys also use the configured

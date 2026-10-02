@@ -66,18 +66,6 @@ impl Error {
             Self::Unsupported => "remote signer does not support the method".into(),
         }
     }
-    fn ffi(self) -> MarmotKitError {
-        match self {
-            Self::Rejected | Self::Cancelled => MarmotKitError::ExternalSignerRejected,
-            Self::Mismatch => MarmotKitError::ExternalSignerMismatch,
-            Self::RelayPublish(detail) => {
-                MarmotKitError::ExternalSignerUnavailable { account: detail }
-            }
-            _ => MarmotKitError::ExternalSignerUnavailable {
-                account: self.detail().into(),
-            },
-        }
-    }
     fn status(self) -> MarmotStatus {
         set_last_error(self.detail().as_ref());
         match self {
@@ -190,7 +178,7 @@ fn checked_relays(owner: &Marmot, relays: Vec<String>) -> Result<Vec<RelayUrl>> 
 }
 
 impl Session {
-    fn new(owner: Arc<Marmot>, mut config: Config) -> Result<MarmotNip46Session> {
+    fn spawn(owner: Arc<Marmot>, mut config: Config) -> Result<MarmotNip46Session> {
         let keys = match config.client_secret.as_deref() {
             Some(secret) => Keys::new(SecretKey::from_hex(secret).map_err(|_| Error::Invalid)?),
             None => Keys::generate(),
@@ -361,6 +349,20 @@ impl Session {
     fn pinned_user(&self) -> Result<PublicKey> {
         lock(&self.credentials).user.ok_or(Error::Unavailable)
     }
+    /// `ExternalSignerUnavailable.account` is the account id, never a detail;
+    /// it stays empty before pairing pins a user.
+    fn signer_error(&self, error: Error) -> MarmotKitError {
+        match error {
+            Error::Rejected | Error::Cancelled => MarmotKitError::ExternalSignerRejected,
+            Error::Mismatch => MarmotKitError::ExternalSignerMismatch,
+            _ => MarmotKitError::ExternalSignerUnavailable {
+                account: self
+                    .pinned_user()
+                    .map(|user| user.to_hex())
+                    .unwrap_or_default(),
+            },
+        }
+    }
     fn export(&self) -> Result<String> {
         let data = lock(&self.credentials);
         let keys = data.keys.as_ref().ok_or(Error::LoggedOut)?;
@@ -386,31 +388,33 @@ impl Session {
     ) -> std::result::Result<String, MarmotKitError> {
         self.call(Operation::Rpc(method, params), REQUEST_TIMEOUT)
             .and_then(|value| value.as_str().map(ToOwned::to_owned).ok_or(Error::Invalid))
-            .map_err(Error::ffi)
+            .map_err(|error| self.signer_error(error))
     }
 }
 
 impl ExternalAccountSignerFfi for Session {
     fn public_key(&self) -> std::result::Result<String, MarmotKitError> {
         if *self.cancel.borrow() || lock(&self.credentials).keys.is_none() {
-            return Err(Error::Cancelled.ffi());
+            return Err(self.signer_error(Error::Cancelled));
         }
         // Identity lookup is offline: MDK compares this pinned user identity.
         // Worker activation can request a fresh proof; its first signing
         // operation re-verifies the user remotely on the independent transport.
         self.pinned_user()
             .map(|key| key.to_hex())
-            .map_err(Error::ffi)
+            .map_err(|error| self.signer_error(error))
     }
     fn sign_event(
         &self,
         unsigned_event_json: String,
     ) -> std::result::Result<String, MarmotKitError> {
-        let unsigned =
-            UnsignedEvent::from_json(&unsigned_event_json).map_err(|_| Error::Invalid.ffi())?;
-        let expected_user = self.pinned_user().map_err(Error::ffi)?;
+        let unsigned = UnsignedEvent::from_json(&unsigned_event_json)
+            .map_err(|_| self.signer_error(Error::Invalid))?;
+        let expected_user = self
+            .pinned_user()
+            .map_err(|error| self.signer_error(error))?;
         if unsigned.pubkey != expected_user {
-            return Err(Error::Mismatch.ffi());
+            return Err(self.signer_error(Error::Mismatch));
         }
         // NIP-46 sends only these fields. Keep the SDK's id and pinned pubkey
         // locally to verify that the returned event is exactly the requested one.
@@ -420,9 +424,10 @@ impl ExternalAccountSignerFfi for Session {
             tags: &unsigned.tags,
             created_at: unsigned.created_at,
         };
-        let payload = serde_json::to_string(&request).map_err(|_| Error::Invalid.ffi())?;
+        let payload =
+            serde_json::to_string(&request).map_err(|_| self.signer_error(Error::Invalid))?;
         let result = self.rpc_string("sign_event", vec![payload])?;
-        let event = Event::from_json(&result).map_err(|_| Error::Invalid.ffi())?;
+        let event = Event::from_json(&result).map_err(|_| self.signer_error(Error::Invalid))?;
         if event.pubkey != expected_user
             || event.kind != unsigned.kind
             || event.created_at != unsigned.created_at
@@ -430,9 +435,11 @@ impl ExternalAccountSignerFfi for Session {
             || event.tags != unsigned.tags
             || unsigned.id.is_some_and(|id| id != event.id)
         {
-            return Err(Error::Mismatch.ffi());
+            return Err(self.signer_error(Error::Mismatch));
         }
-        event.verify().map_err(|_| Error::Mismatch.ffi())?;
+        event
+            .verify()
+            .map_err(|_| self.signer_error(Error::Mismatch))?;
         Ok(result)
     }
     fn nip04_encrypt(
@@ -532,13 +539,14 @@ impl Transport {
             .tag(remote)
             .finalize(keys)
             .map_err(|_| Error::Invalid)?;
-        let output = self.client.send_event(&event).await.map_err(|error| {
-            Error::RelayPublish(format!("NIP-46 request relay publication failed: {error}"))
+        // Relay URLs and relay-supplied text stay out of error details.
+        let output = self.client.send_event(&event).await.map_err(|_| {
+            Error::RelayPublish("NIP-46 request relay publication failed".to_owned())
         })?;
         if output.success.is_empty() {
             return Err(Error::RelayPublish(format!(
-                "NIP-46 request rejected by relays: {:?}",
-                output.failed
+                "NIP-46 request rejected by {} relay(s)",
+                output.failed.len()
             )));
         }
         Ok(())
@@ -549,10 +557,10 @@ impl Transport {
         expected: Option<PublicKey>,
     ) -> Result<(PublicKey, Value)> {
         while let Some(notification) = self.notifications.next().await {
-            if let ClientNotification::Event { event, .. } = notification {
-                if let Some(payload) = validated_payload(&event, keys, expected) {
-                    return Ok((event.pubkey, payload));
-                }
+            if let ClientNotification::Event { event, .. } = notification
+                && let Some(payload) = validated_payload(&event, keys, expected)
+            {
+                return Ok((event.pubkey, payload));
             }
         }
         Err(Error::Unavailable)
@@ -857,7 +865,7 @@ pub unsafe extern "C" fn marmot_nip46_new(
             Ok(config) => config,
             Err(_) => return Error::Invalid.status(),
         };
-        match Session::new(client.marmot.clone(), config) {
+        match Session::spawn(client.marmot.clone(), config) {
             Ok(session) => {
                 unsafe { out.write(memory::boxed(session)) };
                 MarmotStatus::Ok

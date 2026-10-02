@@ -22,14 +22,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - NIP-46 signing requests contain only `kind`, `content`, `tags`, and `created_at`.
   SDK-only event IDs and public keys stay local for response verification.
-- Publication signing failures retain the event kind and underlying signer error.
-- NIP-46 request publication failures retain the failed relay URLs and rejection
-  messages instead of reporting only that the remote signer is unavailable.
+- Publication signing failures report the event kind. Signer error text stays
+  out of the message because it can carry relay URLs.
+- NIP-46 request publication failures report how many relays rejected the
+  request, without relay URLs or relay-supplied text.
 - Account onboarding can establish inbox-list absence from a completed read of
-  the advertised outboxes even when a discovery indexer is unavailable.
-- Imported and external-signer accounts can use caller-authorized defaults when
-  relay discovery fails. Observed signed lists, including explicit-empty lists,
-  are preserved.
+  freshly discovered outboxes even when a discovery indexer is unavailable.
 
 ## [0.12.0] - 2026-10-02
 

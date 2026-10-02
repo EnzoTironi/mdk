@@ -379,11 +379,6 @@ struct Fixture {
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
-enum DirectorySeed {
-    Outbox,
-    Absent,
-}
-
 fn wire(author: &Keys, recipient: PublicKey, payload: &Value) -> Result<Event> {
     let encrypted = nip44::encrypt(
         author.secret_key(),
@@ -415,7 +410,7 @@ async fn sdk(relay: &str) -> Result<Client> {
 }
 
 impl Fixture {
-    async fn start(relay: &str, next_relay: Option<&str>, seed: DirectorySeed) -> Result<Self> {
+    async fn start(relay: &str, next_relay: Option<&str>) -> Result<Self> {
         let bunker = Keys::generate();
         let user = Keys::generate();
         assert_ne!(bunker.public_key(), user.public_key());
@@ -436,11 +431,8 @@ impl Fixture {
             (Kind::InboxRelays, "relay"),
             (Kind::MlsKeyPackageRelays, "relay"),
         ] {
-            // Neither identity has an inbox list. One advertises an outbox;
-            // the other needs caller-authorized defaults after discovery fails.
-            if kind == Kind::InboxRelays
-                || (kind == Kind::RelayList && matches!(seed, DirectorySeed::Absent))
-            {
+            // Each identity advertises an outbox but has no inbox list.
+            if kind == Kind::InboxRelays {
                 continue;
             }
             let event = EventBuilder::new(kind, "")
@@ -694,23 +686,24 @@ async fn nip44_probe(relay: &str, descriptor: &Value, fixture: &Fixture) -> Resu
             break;
         }
     }
-    let evidence = fixture.controls.evidence.lock().expect("evidence mutex");
-    assert!(
-        evidence.peak_pending >= 2,
-        "fixture must observe interleaved in-flight requests"
-    );
-    let fast = evidence
-        .replies
-        .iter()
-        .position(|id| id == "smoke-fast")
-        .expect("fast response");
-    let slow = evidence
-        .replies
-        .iter()
-        .position(|id| id == "smoke-slow")
-        .expect("slow response");
-    assert!(fast < slow, "fixture must deliberately answer out of order");
-    drop(evidence);
+    {
+        let evidence = fixture.controls.evidence.lock().expect("evidence mutex");
+        assert!(
+            evidence.peak_pending >= 2,
+            "fixture must observe interleaved in-flight requests"
+        );
+        let fast = evidence
+            .replies
+            .iter()
+            .position(|id| id == "smoke-fast")
+            .expect("fast response");
+        let slow = evidence
+            .replies
+            .iter()
+            .position(|id| id == "smoke-slow")
+            .expect("slow response");
+        assert!(fast < slow, "fixture must deliberately answer out of order");
+    }
     client.shutdown().await;
     Ok(())
 }
@@ -797,12 +790,8 @@ fn main() -> Result<()> {
     );
     runtime.block_on(replacement.run())?;
     let replacement_url = runtime.block_on(replacement.url()).to_string();
-    let fixture_a = runtime.block_on(Fixture::start(
-        &relay_url,
-        Some(&replacement_url),
-        DirectorySeed::Outbox,
-    ))?;
-    let fixture_b = runtime.block_on(Fixture::start(&relay_url, None, DirectorySeed::Absent))?;
+    let fixture_a = runtime.block_on(Fixture::start(&relay_url, Some(&replacement_url)))?;
+    let fixture_b = runtime.block_on(Fixture::start(&relay_url, None))?;
     assert_ne!(fixture_a.bunker.public_key(), fixture_b.bunker.public_key());
     assert_ne!(fixture_a.user.public_key(), fixture_b.user.public_key());
     let root = tempfile::tempdir()?;
@@ -987,13 +976,12 @@ fn main() -> Result<()> {
                 .any(|event| event.kind == Kind::InboxRelays),
             "missing inbox must bootstrap through NIP46"
         );
-        assert_eq!(
-            evidence
+        assert!(
+            !evidence
                 .signed
                 .iter()
                 .any(|event| event.kind == Kind::RelayList),
-            fixture.user.public_key() == fixture_b.user.public_key(),
-            "fallback must publish an unknown outbox but preserve an observed signed outbox"
+            "an observed signed outbox must stay unchanged"
         );
         for event in &evidence.signed {
             event.verify()?;
@@ -1004,9 +992,7 @@ fn main() -> Result<()> {
     println!(
         "PASS incomplete indexer does not veto authoritative outbox absence and remote-signed inbox bootstrap"
     );
-    println!(
-        "PASS failed relay discovery bootstraps caller defaults without overwriting observed signed lists"
-    );
+    println!("PASS inbox bootstrap preserves the observed signed outbox");
 
     let export_a = session_a.export();
     let export_b = session_b.export();
@@ -1046,12 +1032,8 @@ fn main() -> Result<()> {
     *request_gate.0.lock().unwrap() = None;
     assert_ne!(rejected, MarmotStatus::Ok);
     assert!(
-        detail.contains("signer request denied by relay"),
-        "lost relay rejection: {detail}"
-    );
-    assert!(
-        detail.contains(&replacement_url),
-        "lost failed relay URL: {detail}"
+        !detail.contains("signer request denied by relay") && !detail.contains(&replacement_url),
+        "relay URLs and relay-supplied text must stay out of error details: {detail}"
     );
     check(
         client.profile(&account_a, "after-relay-rejection"),
@@ -1061,7 +1043,7 @@ fn main() -> Result<()> {
         client.profile(&account_b, "other-after-relay-rejection"),
         "other signer remains usable",
     );
-    println!("PASS relay rejection survives publication and the session recovers");
+    println!("PASS relay rejection stays privacy-safe and the session recovers");
 
     fixture_a.controls.approval.store(true, Ordering::SeqCst);
     std::thread::scope(|scope| -> Result<()> {
@@ -1204,10 +1186,15 @@ fn main() -> Result<()> {
     // No acknowledgement: local credentials must still be revoked, bounded by native timeout.
     fixture_a.controls.offline.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
-    let _courtesy_status = unsafe { marmot_nip46_logout(session_a.0) };
+    let courtesy_status = unsafe { marmot_nip46_logout(session_a.0) };
     assert!(
-        started.elapsed() < Duration::from_secs(40),
+        started.elapsed() < Duration::from_secs(10),
         "logout must be bounded without remote acknowledgement"
+    );
+    assert_eq!(
+        courtesy_status,
+        MarmotStatus::Timeout,
+        "offline signer cannot acknowledge logout"
     );
     assert_eq!(session_a.state()["state"], "logged_out");
     let mut rejected = ptr::null_mut();
