@@ -1127,9 +1127,19 @@ impl AccountHome {
         let live_dir = self.account_dir(&account.label);
         let tombstone = self.move_account_dir_to_tombstone(&account.label, &live_dir)?;
 
-        if account.external_signing {
-            self.secret_store
-                .remove_secret(&external_database_credential(&account))?;
+        // The wipe already committed. An early return would report a completed
+        // removal as failed and skip the secret scrub below, so warn and continue.
+        if account.external_signing
+            && self
+                .secret_store
+                .remove_secret(&external_database_credential(&account))
+                .is_err()
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "remove_account",
+                "failed to remove external database credential after wipe commit"
+            );
         }
 
         // Drop the signing secret unless a twin record still depends on a

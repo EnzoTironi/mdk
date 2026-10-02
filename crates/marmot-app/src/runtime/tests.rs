@@ -643,7 +643,7 @@ fn generated_account_birth_marks_cutover_scan_complete_before_session_open() {
 }
 
 #[tokio::test]
-async fn import_fallback_requires_optin() {
+async fn failed_import_relay_discovery_does_not_publish_default_lists() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
     let keys = nostr::prelude::Keys::generate();
@@ -664,7 +664,7 @@ async fn import_fallback_requires_optin() {
                 // A non-WebSocket bootstrap endpoint makes the bounded
                 // fallback discovery fail before any dial.
                 bootstrap_relays: vec![TransportEndpoint("https://directory.invalid".into())],
-                publish_missing_relay_lists: false,
+                publish_missing_relay_lists: true,
                 ..AccountSetupRequest::default()
             },
             true,
@@ -672,9 +672,9 @@ async fn import_fallback_requires_optin() {
             None,
         )
         .await
-        .expect_err("failed discovery must not publish defaults without caller authorization");
+        .expect_err("failed discovery must not become a write of request defaults");
 
-    // Without fallback authorization, the incomplete lookup remains an error.
+    // A failed lookup is retryable uncertainty, not confirmed missing lists.
     assert!(matches!(error, AppError::RelayDirectory(_)));
 }
 
