@@ -2,18 +2,131 @@
 
 ## Unreleased
 
+## 0.12.0 - 2026-10-02
+
 ### Added
 
+- `MarmotAppRuntime::group_app_component` and `update_app_component` read and
+  admin-update optional application-owned MLS group components (ids at or
+  above `0xf000`). Invalid ids, required components and oversized state fail
+  with `AppError::InvalidAppComponent`. (#1929)
+- `MarmotAppRuntime::request_explicit_attachment` joins or promotes attachment
+  demand to explicit priority without resetting retry budgets, backoff or
+  active deadlines. (#2142)
+
+- Hosts can declare a separate kind-10050 inbox relay list.
+  `AccountSetupRequest::inbox_relays`, `AccountRelayListBootstrap::inbox_relays`
+  (`with_inbox_relays`) and `OnboardingOptions::inbox_relays` set it for
+  generated-account bootstrap, missing-list publication on import or login,
+  and onboarding's recommended inbox relays. Empty keeps the previous
+  behavior: `default_relays` declare both the NIP-65 and the inbox list.
+  Persisted setup contexts and onboarding checkpoints without the field resume
+  unchanged.
 - `MarmotAppRuntime::poll_votes` pages each voter's effective poll selection
   (`PollVotePage` of `PollVote`) with the same rules as the timeline poll
   tally. (#2091)
+- `MarmotAppRuntime::send_tagged_text`, `send_tagged_media`, and
+  `react_with_media` add application tags (for example NIP-30 `emoji`) to a
+  kind-9 chat, a media chat, or a kind-7 reaction; the reaction emits its
+  attachments as `imeta`. `MediaUploadRequest::message_tags` does the same for
+  a sent upload. Tags are capped at 64 rows and 16 KiB of values, and `imeta`
+  rows are rejected.
+- `ConversationReaction::reaction_message_id_hex` names the earliest active
+  kind-7 carrying that emoji, so a NIP-30 reaction's image can be resolved.
+- Account-worker startup is observable stage by stage. Six runtime
+  operations, `account_startup_spawned`, `_open_queued`, `_account_state`,
+  `_session_open`, `_client_restore` and `_ready_handoff`, record one span
+  per stage a starting worker enters. A span stays in flight while the stage
+  runs, even after its worker was aborted, and ends as a timeout if the
+  ready-wait expired in that stage. An expired ready-wait now fails with
+  `account worker startup timed out at <stage>`; hosts that matched the old
+  message exactly should match its prefix. (#1911, #2098)
+
+### Changed
+
+- A durable chat mute suppresses ordinary notification traffic but still emits
+  a typed direct mention of the receiving account. Sender blocks still suppress
+  those mentions. Hosts using notification subscriptions apply their own
+  permission, channel, and foreground policy to emitted updates.
+  (marmot-protocol/whitenoise-android#2984)
+- A successful outgoing upload stages a private local copy before the message
+  is published. Once the send is confirmed, the staged bytes gain owners and
+  are promoted to retained attachment bytes, so the sender reopens the file
+  without reacquisition. Staging is best-effort and bounded; its failure never
+  blocks the send. (#2142)
 
 ### Fixed
 
+- v5 audit rows keep the engine's `pre_membership_event`,
+  `app_payload_retention_expired`, `peel_failed_no_snapshot` and
+  `quarantined_group_input_deferred` message reasons instead of writing them
+  as `unclassified`. Older v5 rows with an `unclassified` reason stay
+  ambiguous (#2120).
+- Import and external-signer onboarding now searches the built-in public
+  indexers alongside the host's discovery relays when checking an identity's
+  profile, follows, and kind-10002/10050 relay lists. Previously a host that
+  passed only its own messaging relays could see an existing identity's lists
+  as missing and be offered (or automatically approve) a defaults-only
+  replacement. A missing list is now concluded, and a repair approved, only
+  when every searched relay, indexers included, answers. Indexers are dialed
+  on top of the 16-relay inspection cap, so they neither displace the host's
+  or the account's declared relays nor get dropped themselves. Repairs still
+  publish only to the host's discovery relays and the account's declared
+  relays, not to the indexers. A host-selected set from
+  `set_onboarding_discovery_relays` is used as given, without indexers, so an
+  unreachable indexer can be bypassed. Loopback (development) routes are
+  unchanged, and the KeyPackage device check keeps its existing sources.
+- A route change, such as creating or leaving a group, no longer resets
+  history recovery for every route. Routes whose own window and required
+  relays are unchanged keep their certificates and quiet streak; only changed
+  and new routes are compared again. Before, each new DM restarted recovery
+  over every route, so on accounts with many chats it rarely finished
+  (#2110).
+- History recovery no longer retries forever when a required relay never
+  answers while another required relay answers. After six such comparisons
+  for an unchanged goal and required relays, the route counts toward parking
+  with the existing "history may be incomplete" notice. Offline passes and
+  routes skipped or timed out by the local deadline spend no parking budget
+  (#2110).
+- Creating a group no longer rebuilds the whole routing table. It installs only
+  the invitees' inbox routes, which the Welcome publish needs; `add_group`
+  already installs the new group's routes. The rebuild took about 13 ms per
+  create at 1000 chats, most of it a quadratic pass over deleted-group routes
+  (#2110).
+- Host catch-up (`catch_up_accounts`) and the catch-up after creating or
+  changing a group no longer run a recovery job while holding the account
+  worker. They drain live input and return; the worker's paced recovery job
+  serves any history debt. Sends, conversation opens and new DMs no longer
+  wait behind recovery, which grew with the number of chats (#2110). New
+  `just bench-create-direct-message` measures DM creation latency with 300
+  and 1000 existing chats.
+- The post-join maintenance sweep no longer decodes every transport fanout
+  once per group, which made it quadratic in the number of chats.
 - Messages are no longer withdrawn as undecryptable by a convergence pass that selected
   no branch, such as the pass that settles the device's own disband. That pass never tried
   them against the group's state; they now wait for a pass that selects a branch, or for
   the engine to try them against its live state.
+- A recovery comparison no longer fails when a group route, window or relay changes after
+  the comparison was requested, for example when a Welcome is admitted during startup.
+  Such a grant used to fail on every attempt until the next request. Each pass now compares
+  the recorded incremental-history debt rather than the live routing snapshot, so it
+  queries exactly the relays its settlement certifies. (#2100)
+- Attachments from a message whose epoch the group had already left no longer spin in
+  `RetryScheduled` forever. The receiver cached only the current epoch's encrypted-media
+  key, so a media message surfaced after a commit (common for agent sends) had no key.
+  The engine now captures the key for the message's source epoch while it authenticates
+  the message and carries it on `GroupEvent::MessageReceived::encrypted_media_secret`,
+  so projection caches it even when the same convergence pass advanced more than five
+  epochs and pruned that epoch's retained state. A media message that arrives late, after
+  the receiver left its epoch, gets the key from that epoch's retained state before the
+  pass merges further commits. Events without a carried key fall back to the engine's
+  retained epoch state (newest five epochs), and that fallback no longer gives up when
+  the live export fails.
+- Missing-key attachment deferrals back off and fail after about eight minutes instead of
+  repeating every 15 seconds forever, and a blob that every Blossom server reports as
+  404/410 fails without retrying. Retry and download-again derive a missing source-epoch
+  key from the engine's retained epoch state, so they recover attachments projected before
+  that key was cached.
 
 ## 0.11.0 - 2026-09-29
 

@@ -1,6 +1,6 @@
 # AGENTS.md - integrations/opencode/marmot
 
-Rust opencode harness for Marmot through the local `wn-agent` control socket.
+Rust OpenCode harness for Marmot through the local `wn-agent` control socket.
 Read `README.md`, `../../AGENTS.md`, and `../../terminal-harness/AGENTS.md` first.
 
 ## Scope
@@ -8,11 +8,13 @@ Read `README.md`, `../../AGENTS.md`, and `../../terminal-harness/AGENTS.md` firs
 - A dedicated **control-plane-only** harness. `wn-agent` owns the Marmot account, MLS state, Nostr transport, durable
   sends, and allowlist-backed invite handling; this crate only speaks `marmot.agent-control.v2` over the local Unix
   socket and runs `opencode`.
-- Every text-only message from an allowed sender is treated as a prompt. This is intentionally a pure harness, not a
-  gateway plugin with mention activation, backend attachment support, profile onboarding, or live previews. For a
-  non-empty attachment batch, the shared harness enforces its count/aggregate-byte limits and stages the complete
-  batch, then the default backend contract rejects the whole turn before OpenCode is spawned; accompanying text is
-  not forwarded.
+- Every message from an allowed sender is treated as a prompt. This is intentionally a pure harness, not a gateway
+  plugin with mention activation, profile onboarding, or live previews.
+- Attachment batches map to one `opencode run` with ordered `--file <absolute staged path>` pairs after all other
+  options, then `--`. `prepare_attachments` revalidates each staged copy and mirrors the OpenCode Read tool's
+  classification (`README.md#inbound-attachments`); any file OpenCode would not deliver as its own content fails the
+  whole turn before spawn. Re-check `run.ts`, `session/prompt.ts`, `tool/read.ts`, and `util/media.ts` when raising
+  the supported OpenCode version.
 - No QUIC, crypto, relay, or MLS logic here.
 - Split large opencode text events into byte-budgeted Marmot messages. Keep the default below the Marmot message cap:
   `WN_OPENCODE_MAX_REPLY_BYTES=30000`.
@@ -21,9 +23,10 @@ Read `README.md`, `../../AGENTS.md`, and `../../terminal-harness/AGENTS.md` firs
 
 ## Key Files
 
-- `src/main.rs` - binary entrypoint, CLI help, tracing setup.
+- `src/main.rs` - binary entrypoint, CLI help, tracing setup, and shared runtime wiring.
 - `src/opencode.rs` - `opencode run --format json` process execution and event parsing.
-- `src/config.rs` - OpenCode-specific environment configuration and shared runtime wiring.
+- `src/config.rs` - OpenCode-specific environment configuration, including the legacy `WN_OPENCODE_ADMIN_HEX`
+  sender alias.
 - `tests/e2e_connector.rs` - ignored process-level test using real `wn-agent` and a fake OpenCode executable.
 - `tests/test_installer.sh` - OpenCode entrypoint for the shared terminal-harness installer test suite.
 - `scripts/install-opencode-marmot.sh` - release-installer wrapper over the shared terminal-harness installer.

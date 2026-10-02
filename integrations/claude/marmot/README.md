@@ -17,6 +17,15 @@ text are ignored.
 For the current guided install, runtime chooser, and White Noise setup, use the
 canonical [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
 
+## Contents
+
+- [Install (Claude Code Already Installed)](#install-claude-code-already-installed)
+- [Manual Setup](#manual-setup)
+- [Chat Commands](#chat-commands)
+- [Configuration](#configuration)
+- [Security Notes](#security-notes)
+- [Development](#development)
+
 ## Install (Claude Code Already Installed)
 
 Prerequisites:
@@ -51,7 +60,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 install_verified "$base_url/install-claude-marmot.sh" \
   "$base_url/install-claude-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...

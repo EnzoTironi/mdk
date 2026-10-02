@@ -26,6 +26,8 @@ mod process_backend;
 mod process_io;
 pub(crate) mod process_relay;
 mod process_server;
+#[cfg(test)]
+mod strfry_process_scale;
 pub use crate::relay_fault_proxy::{RelayEventDeliveryV1, RelayTrafficV1};
 pub(crate) use process_backend::{HistoryRepairOutcome, history_repair_outcome};
 use process_backend::{ParticipantApp, ParticipantRuntime};
@@ -2751,6 +2753,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidKeyPackageEvent(_)
         | AppError::InvalidDirectorySearch(_)
         | AppError::InvalidGroupProfile(_)
+        | AppError::InvalidAppComponent(_)
         | AppError::InvalidNostrRouting(_)
         | AppError::InvalidGroupAvatarUrl(_)
         | AppError::InvalidAgentTextStreamPolicy(_)

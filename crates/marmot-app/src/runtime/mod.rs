@@ -89,7 +89,7 @@ pub use conversation_window::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
-mod attachment_controls;
+pub(crate) mod attachment_controls;
 pub(crate) mod attachment_permission;
 pub use attachment_controls::{
     AttachmentControl, AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
@@ -1227,6 +1227,10 @@ pub struct AccountSetupRequest {
     pub import_nsec: Option<Zeroizing<String>>,
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
+    /// Relays for a published kind-10050 inbox list. Empty uses
+    /// `default_relays`, which otherwise declare both the NIP-65 and the
+    /// inbox list.
+    pub inbox_relays: Vec<TransportEndpoint>,
     /// Public directory indexers. Existing accounts use them for reads;
     /// generated accounts also copy relay lists and kind-0 metadata to them.
     pub discovery_relays: Vec<TransportEndpoint>,
@@ -1247,6 +1251,7 @@ impl std::fmt::Debug for AccountSetupRequest {
             )
             .field("default_relays", &self.default_relays)
             .field("bootstrap_relays", &self.bootstrap_relays)
+            .field("inbox_relays", &self.inbox_relays)
             .field("discovery_relays", &self.discovery_relays)
             .field(
                 "publish_missing_relay_lists",
@@ -1271,6 +1276,7 @@ impl AccountSetupRequest {
             import_nsec: None,
             default_relays: self.default_relays.clone(),
             bootstrap_relays: self.bootstrap_relays.clone(),
+            inbox_relays: self.inbox_relays.clone(),
             discovery_relays: self.discovery_relays.clone(),
             publish_missing_relay_lists: self.publish_missing_relay_lists,
             publish_initial_key_package: self.publish_initial_key_package,
@@ -1305,6 +1311,9 @@ pub enum AccountSetupReadiness {
 struct GeneratedAccountSetupContext {
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
+    // Absent from contexts persisted before separate inbox relays existed.
+    #[serde(default)]
+    inbox_relays: Vec<String>,
     discovery_relays: Vec<String>,
     publish_missing_relay_lists: bool,
     publish_initial_key_package: bool,
@@ -1320,6 +1329,11 @@ impl GeneratedAccountSetupContext {
                 .collect(),
             bootstrap_relays: request
                 .bootstrap_relays
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect(),
+            inbox_relays: request
+                .inbox_relays
                 .iter()
                 .map(|endpoint| endpoint.0.clone())
                 .collect(),
@@ -1345,6 +1359,12 @@ impl GeneratedAccountSetupContext {
                 .collect(),
             bootstrap_relays: self
                 .bootstrap_relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            inbox_relays: self
+                .inbox_relays
                 .iter()
                 .cloned()
                 .map(TransportEndpoint)
@@ -2504,6 +2524,38 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Read application-owned state. None means absent; Some(empty) is
+    /// present. Refresh after group events, including convergence changes.
+    /// Ids below `APP_OWNED_APP_COMPONENT_ID_START` are protocol space.
+    pub async fn group_app_component(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: u16,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        self.accounts
+            .group_app_component(account_ref, group_id, component_id)
+            .await
+    }
+
+    /// Admin-only replacement of optional application-owned state. Ids below
+    /// `APP_OWNED_APP_COMPONENT_ID_START`, required components, and data over
+    /// `APP_COMPONENT_DATA_MAX_LEN` are rejected. Apps own their schema and id
+    /// allocation within the application range. Empty bytes are stored, not
+    /// removed. Normal commit publication and convergence apply, including
+    /// GroupChangeSuperseded notifications.
+    pub async fn update_app_component(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        component_id: u16,
+        data: Vec<u8>,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .update_app_component(account_ref, group_id, component_id, data)
+            .await
+    }
+
     pub async fn update_message_retention(
         &self,
         account_ref: &str,
@@ -2578,6 +2630,32 @@ impl MarmotAppRuntime {
         let summary = self
             .accounts
             .send_message(account_ref, group_id, payload)
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
+    }
+
+    /// Send kind-9 text that also carries application tags, such as NIP-30
+    /// `emoji` tags. `imeta` rows are rejected; attachments use
+    /// [`Self::send_tagged_media`].
+    pub async fn send_tagged_text(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        content: String,
+        tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::TaggedChat { content, tags },
+            )
             .await?;
         let _ = self.publish_chat_list_projection_refresh(
             account_ref,
@@ -3394,6 +3472,29 @@ impl MarmotAppRuntime {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
+        self.react_with_media(
+            account_ref,
+            group_id,
+            target_message_id,
+            emoji,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// React with a custom emoji: `attachments` are already-uploaded images
+    /// (emitted as `imeta`) and `tags` name them, e.g. NIP-30
+    /// `["emoji", shortcode, url]` for `emoji` == `:shortcode:`.
+    pub async fn react_with_media(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        target_message_id: &str,
+        emoji: &str,
+        tags: Vec<Vec<String>>,
+        attachments: Vec<MediaAttachmentReference>,
+    ) -> Result<SendSummary, AppError> {
         self.accounts
             .send_app_event(
                 account_ref,
@@ -3401,6 +3502,8 @@ impl MarmotAppRuntime {
                 AppMessageIntent::Reaction {
                     target_message_id: target_message_id.to_owned(),
                     emoji: emoji.to_owned(),
+                    tags,
+                    attachments,
                 },
             )
             .await
@@ -3511,23 +3614,8 @@ impl MarmotAppRuntime {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
-        let summary = self
-            .accounts
-            .send_app_event(
-                account_ref,
-                group_id,
-                AppMessageIntent::Media {
-                    attachments,
-                    caption,
-                },
-            )
-            .await?;
-        let _ = self.publish_chat_list_projection_refresh(
-            account_ref,
-            &hex::encode(group_id.as_slice()),
-            ChatListUpdateTrigger::NewLastMessage,
-        );
-        Ok(summary)
+        self.send_tagged_media(account_ref, group_id, attachments, caption, Vec::new())
+            .await
     }
 
     pub async fn upload_media(
@@ -3539,6 +3627,36 @@ impl MarmotAppRuntime {
         self.accounts
             .upload_media(account_ref, group_id, request)
             .await
+    }
+
+    /// Send already-uploaded attachments as one kind-9 chat that also carries
+    /// application tags, such as NIP-30 `emoji` tags naming those attachments.
+    pub async fn send_tagged_media(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        attachments: Vec<MediaAttachmentReference>,
+        caption: Option<String>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Media {
+                    message_tags,
+                    attachments,
+                    caption,
+                },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
     }
 
     /// Build an authenticated `imeta` tag for an optimistic host-side record
@@ -5388,7 +5506,8 @@ impl MarmotAppRuntime {
         let bootstrap = AccountRelayListBootstrap::new(
             effective_request.default_relays.clone(),
             effective_request.bootstrap_relays.clone(),
-        );
+        )
+        .with_inbox_relays(effective_request.inbox_relays.clone());
         if bootstrap.default_relays.is_empty() {
             return Err(AppError::MissingDefaultRelays);
         }
@@ -6724,7 +6843,8 @@ impl AccountManager {
                     }
                     let account_id = account.account_id_hex.clone();
                     let (ready_tx, ready_rx) = oneshot::channel();
-                    let startup_progress = AccountStartupProgress::default();
+                    let startup_progress =
+                        AccountStartupProgress::new(self.shared.app_performance_telemetry());
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
                     let handle = spawn_app_runtime_account_worker(
@@ -6794,17 +6914,12 @@ impl AccountManager {
                     Err(_) => {
                         // Name the pre-ready step the worker is blocked in
                         // (mdk#1911); the stage is the only context exported.
-                        let stage = startup_progress.stage();
+                        let stage = startup_progress.expire();
                         tracing::warn!(
                             target: "marmot_app::runtime",
                             method = "reconcile",
                             stage = stage.as_str(),
                             "account worker startup timed out"
-                        );
-                        self.shared.app_performance_telemetry().record_runtime(
-                            stage.timeout_operation(),
-                            account_open_elapsed,
-                            TelemetryOutcome::Timeout,
                         );
                         (
                             Err(AppError::BlockingTask(format!(
@@ -7806,6 +7921,7 @@ impl AccountManager {
             request.default_relays.clone(),
             request.bootstrap_relays.clone(),
         )
+        .with_inbox_relays(request.inbox_relays.clone())
         .with_indexer_relays(request.discovery_relays.clone());
         // Validate before advancing the durable publication phase. The
         // publisher validates again at its own action boundary because it is
@@ -7956,7 +8072,8 @@ impl AccountManager {
                 let bootstrap = AccountRelayListBootstrap::new(
                     request.default_relays.clone(),
                     request.bootstrap_relays.clone(),
-                );
+                )
+                .with_inbox_relays(request.inbox_relays.clone());
                 let current_status = if let Some(status) = recent_relay_lists {
                     status
                 } else {
@@ -8100,7 +8217,8 @@ impl AccountManager {
                 AccountRelayListBootstrap::new(
                     request.default_relays.clone(),
                     request.bootstrap_relays.clone(),
-                ),
+                )
+                .with_inbox_relays(request.inbox_relays.clone()),
             )
             .await
     }

@@ -273,7 +273,7 @@ async fn login_existing_identity_returns_duplicate_identity_error() {
     .expect("open marmot kit");
 
     assert!(matches!(
-        kit.login(nsec.to_string(), Vec::new(), Vec::new())
+        kit.login(nsec.to_string(), Vec::new(), Vec::new(), Vec::new())
             .await
             .expect_err("duplicate login should fail"),
         MarmotKitError::DuplicateIdentity { account } if account == existing.account_id_hex
@@ -555,6 +555,7 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
         thumbhash: None,
     };
     let request = MediaUploadRequestFfi {
+        message_tags: Vec::new(),
         attachments: vec![MediaUploadAttachmentRequestFfi {
             file_name: "note.txt".into(),
             media_type: "text/plain".into(),

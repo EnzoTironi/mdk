@@ -49,7 +49,7 @@ use crate::types::draft::{MarmotMessageDraft, MarmotMessageDraftSummaryList};
 use crate::types::group::{
     MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList, MarmotAppGroupMemberRecordList,
     MarmotAppGroupMlsState, MarmotAppGroupRecord, MarmotAppQuarantinedGroupList,
-    MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest,
+    MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest, MarmotGroupAppComponent,
     MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
     MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
     MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
@@ -581,19 +581,19 @@ c_cmd! {
     /// Create a brand-new Nostr identity, store its secret in the account
     /// secret store, and publish initial relay lists + key package. Free with
     /// `marmot_account_summary_free`.
-    async fn marmot_create_identity(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountSummary) = create_identity;
+    async fn marmot_create_identity(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, inbox_relays/inbox_relays_len: str_arr) -> rec(MarmotAccountSummary) = create_identity;
 
     /// Log in with an existing identity: an `nsec` (private key) for a
     /// local-signing account, or an `npub` to track a public identity.
     /// Free with `marmot_account_summary_free`.
-    async fn marmot_login(identity: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountSummary) = login;
+    async fn marmot_login(identity: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, inbox_relays/inbox_relays_len: str_arr) -> rec(MarmotAccountSummary) = login;
 
     /// Re-activate a non-destructively signed-out local account. Free
     /// with `marmot_account_summary_free`.
     async fn marmot_sign_in_account(account_ref: str) -> rec(MarmotAccountSummary) = sign_in_account;
 
     /// Publish NIP-65 + inbox relay lists for the account. Idempotent.
-    async fn marmot_publish_relay_lists(account_ref: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> unit = publish_relay_lists;
+    async fn marmot_publish_relay_lists(account_ref: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, inbox_relays/inbox_relays_len: str_arr) -> unit = publish_relay_lists;
 
     /// The account's NIP-65 relay list. Free with
     /// `marmot_string_list_free`.
@@ -712,6 +712,13 @@ c_cmd! {
     /// `disappearing_message_secs` of `0` disables expiry. Free with
     /// `marmot_send_summary_free`.
     async fn marmot_update_message_retention(account_ref: str, group_id_hex: str, disappearing_message_secs: val u64) -> rec(MarmotSendSummary) = update_message_retention;
+
+    /// Read application-owned local group state. An absent component writes
+    /// NULL to `*out` and still returns `MARMOT_STATUS_OK`; a written record
+    /// with zero `data_len` is present empty state. Ids below 0xf000 are
+    /// protocol space and are rejected. Refresh on group events. Free with
+    /// `marmot_group_app_component_free`.
+    async fn marmot_group_app_component(account_ref: str, group_id_hex: str, component_id: val u16) -> opt_rec(MarmotGroupAppComponent) = group_app_component;
 
     /// Query advisory membership health and pending rejoin offers.
     /// Free with `marmot_group_recovery_status_free`.
@@ -1019,7 +1026,7 @@ c_cmd! {
 
     /// Sign in and finish a setup that was interrupted partway. Free with
     /// `marmot_account_summary_free`.
-    async fn marmot_login_recovering_incomplete_setup(nsec: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, acknowledge_possible_key_package_orphan: flag) -> rec(MarmotAccountSummary) = login_recovering_incomplete_setup;
+    async fn marmot_login_recovering_incomplete_setup(nsec: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, acknowledge_possible_key_package_orphan: flag, inbox_relays/inbox_relays_len: str_arr) -> rec(MarmotAccountSummary) = login_recovering_incomplete_setup;
 
     /// Fetch a profile image by URL, refusing anything over `max_bytes`.
     /// Free the buffer with `marmot_bytes_free`.
@@ -1086,7 +1093,7 @@ c_cmd! {
 
     /// Create a fresh identity and publish a default profile in one
     /// step. Free with `marmot_identity_creation_result_free`.
-    async fn marmot_create_identity_with_profile(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotIdentityCreationResult) = create_identity_with_profile;
+    async fn marmot_create_identity_with_profile(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, inbox_relays/inbox_relays_len: str_arr) -> rec(MarmotIdentityCreationResult) = create_identity_with_profile;
 
     /// The existing one-to-one conversation with `peer_account_id`, or
     /// NULL with `MARMOT_STATUS_OK` when there is none. Check `reusable`
@@ -1584,6 +1591,103 @@ pub unsafe extern "C" fn marmot_send_media_attachments(
                     group_id_hex,
                     attachments,
                     caption,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Send previously uploaded attachments as one kind-9 message that also
+/// carries application `tags` (for example NIP-30 `emoji` tags), each row
+/// a `(char **, len)` pair. imeta tags are rejected. Free with
+/// `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `attachments` must
+/// point to `attachments_len` valid caller-owned structs; `tags` to
+/// `tags_len` valid rows (or NULL with length 0); `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_tagged_media(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    attachments: *const MarmotMediaAttachmentReference,
+    attachments_len: usize,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    caption: *const c_char,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let attachments =
+            try_arg!(unsafe { struct_array(attachments, attachments_len, |a| a.to_ffi()) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        let caption = try_arg!(unsafe { crate::memory::optional_str(caption) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_tagged_media(
+                    account_ref,
+                    group_id_hex,
+                    attachments,
+                    caption,
+                    tags,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// React with a custom emoji image. `attachments` (already uploaded)
+/// become `imeta` tags on the kind-7 and `tags` name them, e.g. NIP-30
+/// `["emoji", shortcode, url]` for `emoji` == `:shortcode:`. imeta rows
+/// in `tags` are rejected. Free with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `attachments` must
+/// point to `attachments_len` valid structs and `tags` to `tags_len`
+/// valid rows (each NULL with length 0 allowed); `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_react_with_media(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    target_message_id: *const c_char,
+    emoji: *const c_char,
+    attachments: *const MarmotMediaAttachmentReference,
+    attachments_len: usize,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let target_message_id = try_arg!(unsafe { required_str(target_message_id) });
+        let emoji = try_arg!(unsafe { required_str(emoji) });
+        let attachments =
+            try_arg!(unsafe { struct_array(attachments, attachments_len, |a| a.to_ffi()) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.react_with_media(
+                    account_ref,
+                    group_id_hex,
+                    target_message_id,
+                    emoji,
+                    tags,
+                    attachments,
                 )),
                 out,
             )
@@ -2328,6 +2432,47 @@ pub unsafe extern "C" fn marmot_build_media_imeta_tag(
     })
 }
 
+/// Send kind-9 text with additional application tags. `tags` is a flat
+/// array of `tags_len` tag rows, each row a `(char **, len)` pair of
+/// string values. Free with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `tags` must point to
+/// `tags_len` valid rows (or be NULL with length 0), each row's values
+/// pointer holding its stated length; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_tagged_text(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    content: *const c_char,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let content = try_arg!(unsafe { required_str(content) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_tagged_text(
+                    account_ref,
+                    group_id_hex,
+                    content,
+                    tags,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// Send a custom application event into the group. `tags` is a flat
 /// array of `tags_len` tag rows, each row a `(char **, len)` pair of
 /// string values. Free with `marmot_send_summary_free`.
@@ -2569,6 +2714,45 @@ pub unsafe extern "C" fn marmot_record_host_performance(
     })
 }
 
+/// Replace an optional application-owned component through an admin MLS commit.
+/// Rejects ids below 0xf000, required components, and `data_len` over 4096.
+/// Empty bytes are stored, not removed. The value is re-encoded into every
+/// later commit and Welcome, so keep it small.
+/// Free the returned summary with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be live; strings valid; `data` must hold `data_len` bytes
+/// (or be NULL with zero length); `out` must be writable. Inputs are borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_update_app_component(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    component_id: u16,
+    data: *const u8,
+    data_len: usize,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let data = try_arg!(unsafe { byte_array(data, data_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.update_app_component(
+                    account_ref,
+                    group_id_hex,
+                    component_id,
+                    data,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// Copy a borrowed `(ptr, len)` byte buffer. `(NULL, 0)` is empty; NULL
 /// with a nonzero length is an error.
 unsafe fn byte_array(ptr: *const u8, len: usize) -> Result<Vec<u8>, MarmotStatus> {
@@ -2629,6 +2813,8 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
     default_relays_len: usize,
     discovery_relays: *const *const c_char,
     discovery_relays_len: usize,
+    inbox_relays: *const *const c_char,
+    inbox_relays_len: usize,
     out: *mut *mut MarmotOnboardingSnapshot,
 ) -> MarmotStatus {
     ffi_guard(|| {
@@ -2638,9 +2824,11 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
         let default_relays = try_arg!(unsafe { str_array(default_relays, default_relays_len) });
         let discovery_relays =
             try_arg!(unsafe { str_array(discovery_relays, discovery_relays_len) });
+        let inbox_relays = try_arg!(unsafe { str_array(inbox_relays, inbox_relays_len) });
         let options = marmot_uniffi::OnboardingOptionsFfi {
             default_relays,
             discovery_relays,
+            inbox_relays,
         };
         unsafe {
             deliver(

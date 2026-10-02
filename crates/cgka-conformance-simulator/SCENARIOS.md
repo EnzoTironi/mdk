@@ -370,8 +370,9 @@ These are the scenarios another implementation should be able to load from JSON 
 ## Incident-Replay Vectors
 
 These vectors are synthesized from Goggles `agent-state.json` forensic exports by the `incident-replay` adapter, then
-verified against the simulator before they are committed. They live under `vectors/incidents/` and are not yet part of
-the top-level portable-vector test (Phase 5 wires the directory into CI).
+verified against the simulator before they are committed. They live under `vectors/incidents/`, and
+`canonical_vector_fixtures_match_generated_traces` in `tests/canonical_scenarios.rs` runs them alongside the top-level
+portable vectors.
 
 ### `fork-recovery-incident/v1`
 
@@ -871,18 +872,18 @@ exercises the retained-join pending-work condition. Generator tests compile the 
 executing the expensive large/xlarge cases. Run 32/64-member blocks in nightly isolated workers and keep
 128/200-member execution scheduled or manual until measured budgets justify wider promotion.
 
-A refused engine create, including the large-Welcome wrap refusal on case `8001/30` (`large-anchor-64` bulk
-application fanout), is a serializable subject-step failure. Default regressions inject that refusal through a
-test-only peeler wrapper in `subject::tests`. The real 64-member report/campaign boundary is ignored by default:
+A refused engine create remains a serializable subject-step failure. Default regressions inject that refusal through a
+test-only peeler wrapper in `subject::tests`. The real 64-member bulk case `8001/30` is an opt-in positive regression
+for extended NIP-44 wrapping:
 
 ```sh
 cargo test -p cgka-conformance-simulator --locked --bin cgka-conformance-campaign -- \
-  --ignored --exact tests::large_group_pressure_8001_30_reports_create_refusal
+  --ignored --exact tests::large_group_pressure_8001_30_passes_extended_nip44
 ```
 
 That fixture persists `GeneratedScenarioInputV1` first, then replays it with the campaign worker
-(`--worker --input FILE --storage file --out NEW_DIR`) and checks the report, fixture candidate, and portable
-`synthetic_shareable` capsule. Do not commit generated replay artifacts or checkpoints.
+(`--worker --input FILE --storage file --out NEW_DIR`) and checks the strict report and fixture candidate.
+Do not commit generated replay artifacts or checkpoints.
 
 ### `convergence-chaos/v1`
 

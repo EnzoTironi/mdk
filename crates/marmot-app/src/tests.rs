@@ -1500,7 +1500,7 @@ fn comparison_fetches_probe(
 }
 
 #[test]
-fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
+fn catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
     run_composed_app_runtime_test("explicit-catch-up-backfill", || async {
         let dir = tempfile::tempdir().unwrap();
         let alice = AccountHome::open(dir.path())
@@ -1549,7 +1549,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
         assert_eq!(sync.synced_subscriptions, sync.tracked_subscriptions);
         let unfloored_before = relay.unfloored_account_subscription_count();
 
-        // Hold explicit CatchUp once it owns the account client. The worker is
+        // Hold the CatchUp once it owns the account client. The worker is
         // now committed to the command path and cannot consume these queued
         // deliveries through its live receive arm instead.
         let pin = Arc::new(tokio::sync::Barrier::new(2));
@@ -1560,7 +1560,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
         let catch_up = tokio::spawn(async move { catch_up_runtime.catch_up_accounts().await });
         tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, pin.wait())
             .await
-            .expect("explicit catch-up must reach its hold");
+            .expect("catch-up must reach its hold");
 
         let above_floor = cursor;
         for arm in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
@@ -1575,9 +1575,8 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
             .await;
         }
 
-        // The caller drains these probes before its one job, so that job
-        // already compares the gap they reveal. An unbounded gap cannot
-        // certify, so its debt stays pending for the owner.
+        // The catch-up only drains these probes and arms the gap they reveal;
+        // it runs no job (mdk#2110). The debt stays pending for the owner.
         tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, pin.wait())
             .await
             .expect("the held catch-up should accept its release");
@@ -1599,8 +1598,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
         );
-        // The caller's job earned the account its next backoff; the owner
-        // waits it out.
+        // The owner waits out the account's current backoff.
         runtime
             .advance_recovery_clock_for_test("alice", Duration::from_millis(retry.delay_ms))
             .await;
@@ -1666,8 +1664,8 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .map(|row| row["event"]["seam"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["explicit_catch_up", "maintenance"],
-            "the caller's job, then the owner's; incremental grants emit no epoch rows"
+            ["maintenance"],
+            "only the owner's job runs; incremental grants emit no epoch rows"
         );
         for started in &started_rows {
             let terminal = failed_rows
@@ -1688,7 +1686,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
             .into_iter()
             .filter(|row| {
                 row["event"]["record_context"]["operation_ref"]
-                    == started_rows[1]["event"]["record_context"]["operation_ref"]
+                    == started_rows[0]["event"]["record_context"]["operation_ref"]
             })
             .collect();
         assert!(
@@ -2059,6 +2057,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 epoch: current,
                 payload: Vec::new(),
                 retention: None,
+                encrypted_media_secret: None,
             });
         client.observe_recovery_health(&effects).unwrap();
         assert!(
@@ -3854,6 +3853,7 @@ async fn media_send_epoch_pin_body() {
         .send_app_event(
             &group_id,
             AppMessageIntent::Media {
+                message_tags: Vec::new(),
                 attachments: vec![pinned_elsewhere],
                 caption: None,
             },
@@ -3912,6 +3912,7 @@ async fn media_send_epoch_pin_body() {
         .send_app_event(
             &group_id,
             AppMessageIntent::Media {
+                message_tags: Vec::new(),
                 attachments: vec![current],
                 caption: None,
             },
@@ -6018,6 +6019,7 @@ async fn confirmed_bootstrap_retry_republishes_public_indexer_copies() {
     let request = || AccountSetupRequest {
         default_relays: vec![TransportEndpoint("wss://relay.example".into())],
         bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
@@ -6139,6 +6141,7 @@ async fn stalled_indexer_does_not_delay_generated_account_network_readiness() {
         runtime.create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
@@ -6175,6 +6178,7 @@ async fn runtime_shutdown_cancels_pending_indexer_copies() {
         .create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
             publish_initial_key_package: false,
             ..AccountSetupRequest::default()
@@ -6221,6 +6225,7 @@ async fn account_removal_cancels_pending_indexer_copies() {
         .create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
             publish_initial_key_package: false,
             ..AccountSetupRequest::default()
@@ -13466,6 +13471,8 @@ fn reaction_intent_builds_kind_seven_with_e_tag() {
     let event = build(AppMessageIntent::Reaction {
         target_message_id: "abc123".to_owned(),
         emoji: "🔥".to_owned(),
+        tags: Vec::new(),
+        attachments: Vec::new(),
     });
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_REACTION);
     assert_eq!(event.content, "🔥");
@@ -13478,6 +13485,8 @@ fn reaction_intent_rejects_empty_emoji() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: "  ".to_owned(),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13492,6 +13501,8 @@ fn reaction_intent_rejects_padded_content() {
             &AppMessageIntent::Reaction {
                 target_message_id: "target-message".to_owned(),
                 emoji: emoji.to_owned(),
+                tags: Vec::new(),
+                attachments: Vec::new(),
             },
             SENDER_HEX,
             1,
@@ -13508,6 +13519,8 @@ fn reaction_intent_rejects_control_characters_and_oversized_content() {
             &AppMessageIntent::Reaction {
                 target_message_id: "abc123".to_owned(),
                 emoji: emoji.to_owned(),
+                tags: Vec::new(),
+                attachments: Vec::new(),
             },
             SENDER_HEX,
             1,
@@ -13519,6 +13532,8 @@ fn reaction_intent_rejects_control_characters_and_oversized_content() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: "👍".repeat(65),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13532,6 +13547,8 @@ fn reaction_intent_accepts_bounded_multi_scalar_emoji() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: "👨‍👩‍👧‍👦".to_owned(),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13547,6 +13564,8 @@ fn reaction_intent_accepts_exact_maximum_scalar_count() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: emoji.clone(),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13593,6 +13612,7 @@ fn reply_intent_builds_kind_nine_with_e_and_q_tags() {
 #[test]
 fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
     let event = build(AppMessageIntent::Media {
+        message_tags: Vec::new(),
         attachments: vec![
             MediaAttachmentReference {
                 locators: vec![MediaLocator {
@@ -13970,6 +13990,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
     // keeps a structurally well-formed media reference regardless of locator
     // policy; fetchability is decided later at download time.
     let event = build(AppMessageIntent::Media {
+        message_tags: Vec::new(),
         attachments: vec![MediaAttachmentReference {
             // A locator kind that is not the default `blossom-v1` and would be
             // out of a blossom-only policy.
@@ -14007,6 +14028,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
 
 fn malformed_media_message(version: &str) -> Vec<u8> {
     let mut event = build(AppMessageIntent::Media {
+        message_tags: Vec::new(),
         attachments: vec![MediaAttachmentReference {
             locators: vec![MediaLocator {
                 kind: "blossom-v1".to_owned(),
@@ -17371,6 +17393,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
             epoch: reopened.runtime.group_record(&group_id).unwrap().epoch,
             payload: fresh_payload,
             retention: None,
+            encrypted_media_secret: None,
         }],
         ..Default::default()
     };
@@ -17479,6 +17502,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             epoch,
             payload: historical_payload,
             retention: None,
+            encrypted_media_secret: None,
         };
         let fresh_event = cgka_traits::engine::GroupEvent::MessageReceived {
             authority: None,
@@ -17488,6 +17512,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             epoch,
             payload: fresh_payload,
             retention: None,
+            encrypted_media_secret: None,
         };
         let effects = marmot_account::AccountDeviceEffects {
             events: if fresh_first {
@@ -17564,6 +17589,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
+        encrypted_media_secret: None,
     };
     let storage = app.account_storage("alice").unwrap();
     storage.put_pending_application_event(&event).unwrap();
@@ -17647,6 +17673,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
+        encrypted_media_secret: None,
     };
     let storage = app.account_storage("alice").unwrap();
     storage.put_pending_application_event(&event).unwrap();
@@ -20978,6 +21005,176 @@ fn encrypted_media_warm_skips_authoritative_rechecks_at_an_unchanged_epoch() {
             "an authoritative REQUIRED answer must evict the stale confirmed-negative"
         );
     });
+}
+
+/// A convergence pass merges every commit it adopts before the applications
+/// replayed between them are drained, and a delayed message is read from
+/// retained past-epoch secrets, so a media message can be projected after its
+/// source epoch ended. Its attachments stay keyed to that epoch, which must be
+/// cached for background acquisition; caching the then-current epoch instead
+/// left the download deferred forever.
+#[test]
+fn received_media_from_a_left_epoch_caches_its_source_epoch_secret() {
+    run_composed_app_runtime_test("received-media-left-epoch", || {
+        check_received_media_source_epoch_secret(false)
+    });
+}
+
+/// A pass that advances past the anchor horizon prunes the source epoch's
+/// retained anchor before its applications are projected, so the secret the
+/// engine captured while authenticating the message is the only one left.
+#[test]
+fn received_media_past_the_anchor_horizon_caches_its_carried_secret() {
+    run_composed_app_runtime_test("received-media-carried-secret", || {
+        check_received_media_source_epoch_secret(true)
+    });
+}
+
+async fn check_received_media_source_epoch_secret(carried_secret: bool) {
+    use cgka_traits::app_components::{
+        GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("left epoch media", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
+    let storage = app.account_storage("alice").unwrap();
+
+    // Group creation warms its founding epoch, so the media message comes
+    // from a later epoch that no warm pass ever saw as current. Raw engine
+    // commits advance it without the app's subscription-refresh warm.
+    let founding_epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let (source_epoch, source_secret) = client
+        .runtime
+        .exporter_secret_with_epoch(&group_id, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
+        .unwrap();
+    assert!(source_epoch > founding_epoch);
+    let reference = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x66_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x66_u8; 32]),
+        plaintext_sha256: hex::encode([0x14_u8; 32]),
+        nonce_hex: hex::encode([0x25_u8; 12]),
+        file_name: "report.pdf".to_owned(),
+        media_type: "application/pdf".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: source_epoch.0,
+        dim: None,
+        thumbhash: None,
+    };
+    let payload = crate::messages::encode_inner_event(
+        &build_inner_event(
+            &AppMessageIntent::Media {
+                attachments: vec![reference.clone()],
+                caption: None,
+                message_tags: Vec::new(),
+            },
+            &sender_hex,
+            unix_now_seconds(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sent = client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: payload.clone(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(sent.failures.is_empty());
+
+    // The commits that end the source epoch land before the message is
+    // projected, as they do inside one convergence pass. Six of them
+    // carry the tip past the source epoch's retained anchor.
+    for _ in 0..if carried_secret { 6 } else { 1 } {
+        client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > source_epoch.0);
+    assert_eq!(
+        client
+            .runtime
+            .retained_encrypted_media_exporter_secret(&group_id, source_epoch)
+            .unwrap()
+            .is_none(),
+        carried_secret,
+        "precondition: the source anchor is pruned exactly when the secret is carried"
+    );
+    assert_eq!(
+        storage
+            .encrypted_media_epoch_secret(
+                &group_id_hex,
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                source_epoch.0,
+            )
+            .unwrap(),
+        None,
+        "precondition: the source epoch was never cached while current"
+    );
+
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
+            group_id: group_id.clone(),
+            message_id: sent.reports[0].message_id.clone(),
+            sender: MemberId::new(hex::decode(&sender_hex).unwrap()),
+            epoch: source_epoch,
+            payload,
+            retention: None,
+            encrypted_media_secret: carried_secret
+                .then(|| cgka_traits::EncryptedMediaSecret::new(source_secret.clone())),
+        }],
+        ..Default::default()
+    };
+    let summary = client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    assert_eq!(summary.messages.len(), 1);
+
+    assert_eq!(
+        storage
+            .encrypted_media_epoch_secret(
+                &group_id_hex,
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                source_epoch.0,
+            )
+            .unwrap()
+            .as_deref(),
+        Some(source_secret.as_ref()),
+        "the cached key must be the source epoch's exporter secret"
+    );
+    assert!(
+        client
+            .prepare_background_attachment_download(&group_id, reference, 1024 * 1024)
+            .unwrap()
+            .is_some(),
+        "background acquisition must find the source epoch's key"
+    );
 }
 
 #[test]

@@ -46,7 +46,7 @@ use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
     BlossomHttpTransport, DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
     download_encrypted_media_with_transport, fetch_group_image_with_transport,
-    is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media,
+    is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media_retaining,
     upload_group_image, upload_prepared_group_image,
 };
 use crate::messages::{
@@ -80,6 +80,8 @@ mod receipts;
 pub(crate) mod recovery;
 mod retention;
 mod sync;
+#[cfg(test)]
+mod upload_cleanup_tests;
 
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
@@ -91,7 +93,7 @@ pub(crate) use sync::TestComparisonActivityWitness;
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
     ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob, ConvergenceScheduleState,
-    EpochBackfillRunOutcome, PendingRecoverySelection,
+    EpochBackfillRunOutcome, PendingRecoverySelection, SyncMode,
 };
 
 #[cfg(test)]
@@ -152,11 +154,14 @@ pub(crate) struct EncryptedMediaUploadHttp {
     allowed_locator_kinds: Vec<String>,
     allow_loopback_http: bool,
     transport: BlossomHttpTransport,
+    retention_app: MarmotApp,
+    retention_account: String,
+    retention_group: GroupId,
 }
 
 impl EncryptedMediaUploadHttp {
-    pub(crate) async fn run(self) -> Result<MediaUploadResult, AppError> {
-        upload_encrypted_media(
+    pub(crate) async fn run(self) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
+        let (result, plaintext) = upload_encrypted_media_retaining(
             self.request,
             self.source_epoch,
             self.media_secret.as_ref(),
@@ -169,7 +174,27 @@ impl EncryptedMediaUploadHttp {
             },
             &self.transport,
         )
+        .await?;
+        let descriptors = result.clone();
+        let upload_tokens = tokio::task::spawn_blocking(move || {
+            stage_uploaded_media(
+                &self.retention_app,
+                &self.retention_account,
+                &self.retention_group,
+                self.source_epoch,
+                &descriptors,
+                &plaintext,
+            )
+        })
         .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| {
+            tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_stage",
+                "optional outgoing retention unavailable");
+            Vec::new()
+        });
+        Ok((result, upload_tokens))
     }
 }
 
@@ -179,6 +204,85 @@ pub(crate) struct EncryptedMediaUploadFinish {
     media_secret: SecretBytes,
     should_send: bool,
     caption: Option<String>,
+    message_tags: Vec<Vec<String>>,
+}
+
+/// Preserve the primary upload/admission failure when orphan cleanup also fails.
+/// Cleanup diagnostics contain no error text, identities or attachment data;
+/// the bounded orphan sweep can retry cleanup after storage becomes available.
+pub(crate) fn preserve_encrypted_media_upload_error(
+    error: AppError,
+    cleanup: Result<(), AppError>,
+) -> AppError {
+    if cleanup.is_err() {
+        tracing::warn!(
+            target: "marmot_app::media",
+            method = "outgoing_attachment_cleanup",
+            "failed upload staging cleanup deferred"
+        );
+    }
+    error
+}
+
+/// Stage and bind one successful HTTP batch atomically. Refusal affects
+/// local retention only; publication and upload completion remain independent.
+fn stage_uploaded_media(
+    app: &MarmotApp,
+    account: &str,
+    group: &GroupId,
+    source_epoch: u64,
+    result: &MediaUploadResult,
+    plaintext: &[SecretBytes],
+) -> Result<Vec<Vec<u8>>, AppError> {
+    let storage = app.account_storage(account)?;
+    let now = crate::unix_now_seconds();
+    if storage.prune_attachment_uploads(now, 64).is_err() {
+        tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_prune",
+                "optional outgoing retention cleanup deferred");
+    }
+    if plaintext.len() != result.attachments.len() {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention buffer unavailable".into(),
+        ));
+    }
+    let policy = storage.attachment_download_policy(
+        &crate::runtime::attachment_controls::default_policy(&app.config),
+    )?;
+    let bytes = plaintext
+        .iter()
+        .map(|bytes| bytes.as_slice())
+        .collect::<Vec<_>>();
+    let total = bytes.iter().map(|b| b.len() as u64).sum::<u64>();
+    if fs4::available_space(app.account_dir(account)).unwrap_or(0)
+        < policy.disk_reserve.saturating_add(total.saturating_mul(4))
+    {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention disk reserve unavailable".into(),
+        ));
+    }
+    let slots = result
+        .attachments
+        .iter()
+        .map(|a| {
+            Ok((
+                serde_json::to_value(a.reference.imeta_tag()).map_err(|_| {
+                    AppError::InvalidEncryptedMedia("invalid upload descriptor".into())
+                })?,
+                crate::media::media_hash_from_reference(&a.reference)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+        let tokens = storage.stage_attachment_uploads(
+            &hex::encode(group.as_slice()),
+            source_epoch,
+            &bytes,
+            now,
+            policy.retained_bytes,
+        )?;
+        storage.bind_attachment_uploads(&tokens, &slots)?;
+        Ok::<_, AppError>(tokens)
+    })
 }
 
 pub(crate) struct EncryptedMediaDownloadHttp {
@@ -788,6 +892,32 @@ fn record_app_performance(
     }
 }
 
+/// Admit only ids in the application range, and only payloads small enough
+/// to ride in every later commit and Welcome.
+///
+/// The range test is deliberately not "any private-use id the registry has
+/// not taken yet": the registry allocates upward from 0x8001, so such an id
+/// can be assigned later, which would both break the app's own writes and
+/// start applying protocol format validation to bytes already committed in
+/// live groups.
+fn validate_app_component(component_id: u16, data: &[u8]) -> Result<(), AppError> {
+    use cgka_traits::app_components::{
+        APP_COMPONENT_DATA_MAX_LEN, APP_OWNED_APP_COMPONENT_ID_START,
+    };
+    if component_id < APP_OWNED_APP_COMPONENT_ID_START {
+        return Err(AppError::InvalidAppComponent(format!(
+            "component id {component_id:#06x} is protocol space; applications allocate at or above {APP_OWNED_APP_COMPONENT_ID_START:#06x}"
+        )));
+    }
+    if data.len() > APP_COMPONENT_DATA_MAX_LEN {
+        return Err(AppError::InvalidAppComponent(format!(
+            "component data is {} bytes, over the {APP_COMPONENT_DATA_MAX_LEN}-byte maximum",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
 impl AppClient {
     /// Persist the exact first KeyPackage and signed publication artifact
     /// without activating transport or contacting a relay.
@@ -1198,8 +1328,15 @@ impl AppClient {
                     continue;
                 }
             };
-            let status = match self.runtime.maintenance_status(&group_id) {
-                Ok(status) => status,
+            // Only the group's obligations: the full status also decodes every
+            // transport fanout in the account, which made this loop quadratic
+            // in the number of groups (mdk#2110).
+            let obligations = match self
+                .runtime
+                .session()
+                .maintenance_obligations_for_group(&group_id)
+            {
+                Ok(obligations) => obligations,
                 Err(_error) => {
                     tracing::warn!(
                         target: "marmot_app::maintenance",
@@ -1210,7 +1347,7 @@ impl AppClient {
                     continue;
                 }
             };
-            let prerequisite = status.obligations.iter().find(|obligation| {
+            let prerequisite = obligations.iter().find(|obligation| {
                 obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
                     && matches!(
                         obligation.phase,
@@ -1722,7 +1859,11 @@ impl AppClient {
                 key_package_event_id: member.source.as_ref().map(|source| source.event_id.clone()),
             });
         }
-        self.refresh_routing()?;
+        self.refresh_member_inbox_routes(
+            founding_selections
+                .iter()
+                .map(|selection| selection.recipient_hex.as_str()),
+        )?;
         let constructable = self.runtime.constructable_capabilities(&members)?;
         require_initial_group_component_support(&constructable, &request.app_components)?;
         let uploads_inline_image =
@@ -3464,6 +3605,69 @@ impl AppClient {
         Ok(send_summary_from_effects(&effects))
     }
 
+    /// Read opaque application-owned group state. Absent and empty differ.
+    pub fn group_app_component(
+        &self,
+        group_id: &GroupId,
+        component_id: u16,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        validate_app_component(component_id, &[])?;
+        self.ensure_group(group_id)?;
+        Ok(self.runtime.app_component(group_id, component_id)?)
+    }
+
+    /// Replace optional application-owned state through an admin MLS commit.
+    pub async fn update_app_component(
+        &mut self,
+        group_id: &GroupId,
+        component_id: u16,
+        data: Vec<u8>,
+    ) -> Result<SendSummary, AppError> {
+        validate_app_component(component_id, &data)?;
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        // `required_capabilities` is read out of the MLS GroupContext, not
+        // from local config, so any admin in the group can mark an
+        // application component required — including a peer on another
+        // implementation. No MDK binding produces that state, which is why
+        // the sync above matters: the requirement can arrive from the network
+        // between two local calls.
+        if self
+            .runtime
+            .group_record(group_id)?
+            .required_capabilities
+            .app_components
+            .contains(component_id)
+        {
+            return Err(AppError::InvalidAppComponent(
+                "component is required by the group".into(),
+            ));
+        }
+        let audit_context = Self::local_human_action_context(
+            "update_app_component",
+            vec!["app_component"],
+            vec![component_id],
+            None,
+        );
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![AppComponentData { component_id, data }],
+                },
+                audit_context.clone(),
+            )
+            .await?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.queue_own_group_system_projection_updates(&effects);
+        Ok(send_summary_from_effects(&effects))
+    }
+
     pub async fn update_message_retention(
         &mut self,
         group_id: &GroupId,
@@ -3726,7 +3930,9 @@ impl AppClient {
             AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
                 (Family::MessageAction, "custom")
             }
-            AppMessageIntent::Chat { .. } => (Family::MessageAction, "text"),
+            AppMessageIntent::Chat { .. } | AppMessageIntent::TaggedChat { .. } => {
+                (Family::MessageAction, "text")
+            }
             AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
             AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
             AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
@@ -4383,8 +4589,15 @@ impl AppClient {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
-        self.react_to_message_with_local_projection(group_id, target_message_id, emoji, |_| {})
-            .await
+        self.react_to_message_with_local_projection(
+            group_id,
+            target_message_id,
+            emoji,
+            Vec::new(),
+            Vec::new(),
+            |_| {},
+        )
+        .await
     }
 
     pub(crate) async fn react_to_message_with_local_projection<F>(
@@ -4392,6 +4605,8 @@ impl AppClient {
         group_id: &GroupId,
         target_message_id: &str,
         emoji: &str,
+        tags: Vec<Vec<String>>,
+        attachments: Vec<MediaAttachmentReference>,
         on_local_projection: F,
     ) -> Result<SendSummary, AppError>
     where
@@ -4399,6 +4614,10 @@ impl AppClient {
     {
         self.ensure_group_application_messages_allowed(group_id)?;
         crate::messages::validate_reaction_content(emoji)?;
+        if !attachments.is_empty() {
+            self.sync_runtime_groups().await?;
+            self.validate_draft_media_references(group_id, &attachments)?;
+        }
         let sender = self
             .app
             .account_home()
@@ -4411,6 +4630,8 @@ impl AppClient {
                     Self::message_human_action_context(&AppMessageIntent::Reaction {
                         target_message_id: target_message_id.to_owned(),
                         emoji: emoji.to_owned(),
+                        tags: Vec::new(),
+                        attachments: Vec::new(),
                     })
                 {
                     self.record_human_action_noop_succeeded(
@@ -4439,6 +4660,8 @@ impl AppClient {
                 AppMessageIntent::Reaction {
                     target_message_id: target_message_id.to_owned(),
                     emoji: emoji.to_owned(),
+                    tags,
+                    attachments,
                 },
                 on_local_projection,
             )
@@ -4622,6 +4845,7 @@ impl AppClient {
             self.validate_draft_media_references(group, &attachments)?;
             (
                 AppMessageIntent::Media {
+                    message_tags: Vec::new(),
                     attachments,
                     caption: Some(draft.content),
                 },
@@ -4683,6 +4907,19 @@ impl AppClient {
         attachments: Vec<MediaAttachmentReference>,
         caption: Option<String>,
     ) -> Result<SendSummary, AppError> {
+        self.send_tagged_media(group_id, attachments, caption, Vec::new())
+            .await
+    }
+
+    /// Send already-uploaded attachments as one kind-9 chat that also carries
+    /// application tags, such as NIP-30 `emoji` tags naming those attachments.
+    pub async fn send_tagged_media(
+        &mut self,
+        group_id: &GroupId,
+        attachments: Vec<MediaAttachmentReference>,
+        caption: Option<String>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         self.validate_draft_media_references(group_id, &attachments)?;
@@ -4690,6 +4927,7 @@ impl AppClient {
             .send_app_event(
                 group_id,
                 AppMessageIntent::Media {
+                    message_tags,
                     attachments,
                     caption,
                 },
@@ -4718,6 +4956,8 @@ impl AppClient {
         )
     }
 
+    /// Upload independently of optional retention; local staging happens only
+    /// after PUT succeeds and cannot reject a send under quota or disk pressure.
     pub async fn upload_media(
         &mut self,
         group_id: &GroupId,
@@ -4726,8 +4966,9 @@ impl AppClient {
         let (http, finish) = self
             .prepare_encrypted_media_upload(group_id, request)
             .await?;
-        let result = http.run().await?;
-        self.finish_encrypted_media_upload(finish, result).await
+        let (result, upload_tokens) = http.run().await?;
+        self.finish_encrypted_media_upload(finish, result, upload_tokens)
+            .await
     }
 
     /// Cheap exclusive-client setup for an encrypted-media upload. The returned
@@ -4785,8 +5026,11 @@ impl AppClient {
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
+        crate::messages::validate_message_tags(&request.message_tags)?;
+        let message_tags = request.message_tags.clone();
         let should_send = request.send;
         let caption = request.caption.clone();
+        crate::media::validate_media_upload_batch(&request.attachments)?;
         Ok((
             EncryptedMediaUploadHttp {
                 request,
@@ -4798,6 +5042,9 @@ impl AppClient {
                 allowed_locator_kinds: policy.allowed_locator_kinds,
                 allow_loopback_http: allow_loopback,
                 transport: self.blossom_http_transport.clone(),
+                retention_app: self.app.clone(),
+                retention_account: self.state.label.clone(),
+                retention_group: group_id.clone(),
             },
             EncryptedMediaUploadFinish {
                 group_id: group_id.clone(),
@@ -4805,14 +5052,17 @@ impl AppClient {
                 media_secret,
                 should_send,
                 caption,
+                message_tags,
             },
         ))
     }
 
+    /// Complete successful HTTP independently of best-effort local retention.
     pub(crate) async fn finish_encrypted_media_upload(
         &mut self,
         finish: EncryptedMediaUploadFinish,
         mut result: MediaUploadResult,
+        upload_tokens: Vec<Vec<u8>>,
     ) -> Result<MediaUploadResult, AppError> {
         if !finish.should_send {
             return Ok(result);
@@ -4822,9 +5072,32 @@ impl AppClient {
             .iter()
             .map(|attachment| attachment.reference.clone())
             .collect();
-        let summary = self
-            .send_media_attachments(&finish.group_id, attachments, finish.caption)
-            .await?;
+        let summary = match self
+            .send_tagged_media(
+                &finish.group_id,
+                attachments,
+                finish.caption.clone(),
+                finish.message_tags.clone(),
+            )
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                // Committed pending/canonical sources protect staging even if optional
+                // owner protection failed. The storage
+                // fence preserves accepted sends even if their host wait fails.
+                return Err(preserve_encrypted_media_upload_error(
+                    error,
+                    self.app
+                        .account_storage(&self.state.label)
+                        .and_then(|storage| {
+                            storage
+                                .abandon_attachment_uploads(&upload_tokens)
+                                .map_err(AppError::from)
+                        }),
+                ));
+            }
+        };
         // The post-publish projection now durably references this source
         // epoch. Persist again so a prior final-reference retirement cannot
         // suppress the secret needed by the newly retained message.
@@ -4861,8 +5134,10 @@ impl AppClient {
             .await
     }
 
-    /// Storage-only preparation for automatic work. Secret warming belongs to
-    /// sync; missing/retired epoch material cannot trigger engine hydration here.
+    /// Storage-only preparation for automatic work. Received-message projection
+    /// caches each message's source-epoch secret and sync warms current epochs;
+    /// missing/retired epoch material cannot trigger engine hydration here.
+    /// Queued explicit work first calls `cache_attachment_source_epoch_secret`.
     pub(crate) fn prepare_background_attachment_download(
         &self,
         group_id: &GroupId,
@@ -4904,6 +5179,22 @@ impl AppClient {
                 .clone()
                 .with_download_limit(max_bytes),
         }))
+    }
+
+    /// Cache `reference`'s source-epoch secret, exported live or derived from
+    /// the epoch's retained anchor, as the `DownloadMedia` command does. Queued
+    /// explicit work (Retry, download again) needs this for references projected
+    /// before their source epoch was cached. Reads live engine state only: an
+    /// unhydrated group errors instead of hydrating.
+    pub(crate) fn cache_attachment_source_epoch_secret(
+        &self,
+        group_id: &GroupId,
+        reference: &MediaAttachmentReference,
+    ) -> Result<(), AppError> {
+        self.ensure_group(group_id)?;
+        let component_id = EncryptedMediaVersion::parse(&reference.version)?.component_id();
+        self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch, component_id)?;
+        Ok(())
     }
 
     pub(crate) async fn prepare_encrypted_media_download(
@@ -5527,7 +5818,7 @@ impl AppClient {
     }
 
     fn encrypted_media_secret_for_epoch(
-        &mut self,
+        &self,
         group_id: &GroupId,
         source_epoch: u64,
         component_id: u16,
@@ -5547,16 +5838,11 @@ impl AppClient {
         {
             return Ok(SecretBytes::new(secret));
         }
-        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
-            group_id,
-            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
-            32,
-        )?;
-        if epoch.0 == source_epoch {
+        if let Some(secret) = self.exportable_encrypted_media_secret(group_id, source_epoch)? {
             self.remember_encrypted_media_epoch_secret_for_component(
                 group_id,
                 component_id,
-                epoch.0,
+                source_epoch,
                 secret.as_ref(),
             )?;
             if let Some(secret) =
@@ -5589,6 +5875,105 @@ impl AppClient {
             32,
         )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())
+    }
+
+    /// Cache the exporter secret a received media message's attachments are
+    /// keyed to. The message names its source epoch, which the group may have
+    /// left before the message is projected: a convergence pass merges the
+    /// commits it adopts before its replayed applications are drained, and a
+    /// delayed message is read from retained past-epoch secrets. Caching the
+    /// then-current epoch instead leaves every such attachment unreadable.
+    /// The engine captures the secret while it authenticates the message at
+    /// its source epoch (`carried_secret`), because a pass advancing past the
+    /// anchor horizon prunes that epoch's anchor before this runs; deriving it
+    /// here is only the fallback for events that carry none.
+    fn remember_received_encrypted_media_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+        tags: &[Vec<String>],
+        carried_secret: Option<&cgka_traits::EncryptedMediaSecret>,
+    ) -> Result<(), AppError> {
+        let allow_loopback = self.app.allow_loopback_blob_endpoints();
+        let mut component_ids = Vec::new();
+        for tag in tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        {
+            let Ok(reference) = crate::media::media_attachment_from_imeta_tag(
+                tag,
+                Some(source_epoch),
+                allow_loopback,
+            ) else {
+                continue;
+            };
+            let Ok(version) = EncryptedMediaVersion::parse(&reference.version) else {
+                continue;
+            };
+            let component_id = version.component_id();
+            if !component_ids.contains(&component_id)
+                && self
+                    .cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
+                    .is_none()
+            {
+                component_ids.push(component_id);
+            }
+        }
+        if component_ids.is_empty() {
+            return Ok(());
+        }
+        let derived;
+        let secret: &[u8] = match carried_secret {
+            Some(secret) => secret.as_bytes(),
+            None => {
+                derived = self
+                    .exportable_encrypted_media_secret(group_id, source_epoch)?
+                    .ok_or_else(|| {
+                        AppError::InvalidEncryptedMedia(format!(
+                            "encrypted media secret unavailable for epoch {source_epoch}"
+                        ))
+                    })?;
+                derived.as_slice()
+            }
+        };
+        for component_id in component_ids {
+            self.remember_encrypted_media_epoch_secret_for_component(
+                group_id,
+                component_id,
+                source_epoch,
+                secret,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The group's encrypted-media exporter secret at `source_epoch`: exported
+    /// live while that epoch is current, otherwise derived from the epoch's
+    /// retained anchor. `None` once the epoch has left the anchor horizon.
+    /// A failed live export still consults the anchor; its error surfaces only
+    /// when the anchor yields no secret either.
+    fn exportable_encrypted_media_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+    ) -> Result<Option<SecretBytes>, AppError> {
+        let live_error = match self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
+            32,
+        ) {
+            Ok((epoch, secret)) if epoch.0 == source_epoch => return Ok(Some(secret)),
+            Ok(_) => None,
+            Err(error) => Some(error),
+        };
+        let retained = self
+            .runtime
+            .retained_encrypted_media_exporter_secret(group_id, cgka_traits::EpochId(source_epoch));
+        match (retained, live_error) {
+            (Ok(Some(secret)), _) => Ok(Some(secret)),
+            (_, Some(live_error)) => Err(live_error.into()),
+            (retained, None) => Ok(retained?),
+        }
     }
 }
 
@@ -5852,6 +6237,23 @@ impl AppClient {
             .group_routes
             .retain(|route| !group_is_terminal(&self.runtime, &route.group_id));
         self.routing.replace(snapshot);
+        Ok(())
+    }
+
+    /// Install the inbox routes of the given members, which a Welcome publish
+    /// needs. Key-package resolution has just stored their relay lists, and
+    /// nothing else in the table can have changed, so this replaces a
+    /// `refresh_routing` rebuild whose cost grows with the account's chats
+    /// (mdk#2110). The new group's own routes are installed by `add_group`.
+    fn refresh_member_inbox_routes<'a>(
+        &self,
+        members: impl Iterator<Item = &'a str>,
+    ) -> Result<(), AppError> {
+        for member in members {
+            let route = self.app.member_inbox_route(member)?;
+            self.routing
+                .replace_inbox_route(cgka_traits::MemberId::new(hex::decode(member)?), route);
+        }
         Ok(())
     }
 
@@ -6707,6 +7109,54 @@ mod post_canonical_create_tests {
         });
 
         assert_eq!(collect_bounded_ordered(work, 2).await, Err("first"));
+    }
+}
+
+#[cfg(test)]
+mod app_component_gate_tests {
+    use super::validate_app_component;
+    use crate::AppError;
+    use cgka_traits::app_components::{
+        APP_COMPONENT_DATA_MAX_LEN, APP_OWNED_APP_COMPONENT_ID_START,
+        MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID, PROTOCOL_OWNED_APP_COMPONENT_IDS,
+    };
+
+    fn rejected(component_id: u16, data: &[u8]) -> bool {
+        matches!(
+            validate_app_component(component_id, data),
+            Err(AppError::InvalidAppComponent(_))
+        )
+    }
+
+    #[test]
+    fn only_the_application_range_is_writable() {
+        for id in PROTOCOL_OWNED_APP_COMPONENT_IDS
+            .iter()
+            .copied()
+            .chain([0, 1, 2, 0x7fff, 0x8000])
+        {
+            assert!(rejected(id, &[]), "{id:#06x} must be refused");
+        }
+        for id in [APP_OWNED_APP_COMPONENT_ID_START, 0xf301, 0xffff] {
+            assert!(validate_app_component(id, &[1, 2, 3]).is_ok());
+        }
+    }
+
+    #[test]
+    fn registry_draft_and_unassigned_protocol_ids_are_refused() {
+        // 0x800a is assigned to marmot.authorization.multi-device-join.v1 and
+        // 0x800d is the registry's next id. Both were writable while the gate
+        // admitted "private-use minus today's protocol list".
+        assert!(rejected(MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID, &[]));
+        assert!(rejected(0x800a, &[]));
+        assert!(rejected(0x800d, &[]));
+    }
+
+    #[test]
+    fn payload_length_is_bounded() {
+        let id = APP_OWNED_APP_COMPONENT_ID_START;
+        assert!(validate_app_component(id, &vec![0u8; APP_COMPONENT_DATA_MAX_LEN]).is_ok());
+        assert!(rejected(id, &vec![0u8; APP_COMPONENT_DATA_MAX_LEN + 1]));
     }
 }
 

@@ -177,6 +177,7 @@ enum MarmotStatus
    * A signed-out account cannot grant automatic network permission.
    */
   MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94,
+  MARMOT_STATUS_INVALID_APP_COMPONENT = 95,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -2074,6 +2075,15 @@ typedef struct MarmotSendSummary {
 } MarmotSendSummary;
 
 /**
+ * Opaque application-owned group state. Empty data is distinct from absence.
+ */
+typedef struct MarmotGroupAppComponent {
+  uint16_t component_id;
+  uint8_t *data;
+  uintptr_t data_len;
+} MarmotGroupAppComponent;
+
+/**
  * Embedded replacement offer; show the authenticated inviter before confirmation.
  */
 typedef struct MarmotGroupRejoinInvitation {
@@ -3605,6 +3615,16 @@ typedef struct MarmotAuditOtlpConfigV5 {
 } MarmotAuditOtlpConfigV5;
 
 /**
+ * One borrowed row of a string matrix (e.g. one Nostr tag's values in
+ * `marmot_send_custom_event`). Borrowed input only: never freed or
+ * retained. `(NULL, 0)` is an empty row.
+ */
+typedef struct MarmotStringArray {
+  const char *const *values;
+  uintptr_t values_len;
+} MarmotStringArray;
+
+/**
  * One attachment to encrypt and upload. Borrowed input only: the
  * plaintext bytes are copied, never retained or freed.
  */
@@ -3642,6 +3662,12 @@ typedef struct MarmotMediaUploadRequest {
    * Override Blossom server URL. Nullable.
    */
   const char *blossom_server;
+  /**
+   * Extra tags on the sent kind-9 (e.g. NIP-30 `emoji`), each row a
+   * `(char **, len)` pair; NULL with length 0 for none. `imeta` is rejected.
+   */
+  const struct MarmotStringArray *message_tags;
+  uintptr_t message_tags_len;
 } MarmotMediaUploadRequest;
 
 /**
@@ -4043,16 +4069,6 @@ typedef struct MarmotCreateGroupOptions {
    */
   uint64_t disappearing_message_secs;
 } MarmotCreateGroupOptions;
-
-/**
- * One borrowed row of a string matrix (e.g. one Nostr tag's values in
- * `marmot_send_custom_event`). Borrowed input only: never freed or
- * retained. `(NULL, 0)` is an empty row.
- */
-typedef struct MarmotStringArray {
-  const char *const *values;
-  uintptr_t values_len;
-} MarmotStringArray;
 
 /**
  * One voter's effective (latest valid) poll selection; a poll's list
@@ -5210,6 +5226,7 @@ typedef struct MarmotConversationReaction {
   char **reactors;
   uintptr_t reactors_len;
   bool viewer_reacted;
+  char *reaction_message_id_hex;
 } MarmotConversationReaction;
 
 typedef struct MarmotConversationReactions {
@@ -5876,6 +5893,8 @@ MarmotStatus marmot_create_identity(const struct MarmotClient *client,
                                     uintptr_t default_relays_len,
                                     const char *const *bootstrap_relays,
                                     uintptr_t bootstrap_relays_len,
+                                    const char *const *inbox_relays,
+                                    uintptr_t inbox_relays_len,
                                     struct MarmotAccountSummary **out);
 
 /**
@@ -5895,6 +5914,8 @@ MarmotStatus marmot_login(const struct MarmotClient *client,
                           uintptr_t default_relays_len,
                           const char *const *bootstrap_relays,
                           uintptr_t bootstrap_relays_len,
+                          const char *const *inbox_relays,
+                          uintptr_t inbox_relays_len,
                           struct MarmotAccountSummary **out);
 
 /**
@@ -5925,7 +5946,9 @@ MarmotStatus marmot_publish_relay_lists(const struct MarmotClient *client,
                                         const char *const *default_relays,
                                         uintptr_t default_relays_len,
                                         const char *const *bootstrap_relays,
-                                        uintptr_t bootstrap_relays_len);
+                                        uintptr_t bootstrap_relays_len,
+                                        const char *const *inbox_relays,
+                                        uintptr_t inbox_relays_len);
 
 /**
  * The account's NIP-65 relay list. Free with
@@ -6331,6 +6354,25 @@ MarmotStatus marmot_update_message_retention(const struct MarmotClient *client,
                                              const char *group_id_hex,
                                              uint64_t disappearing_message_secs,
                                              struct MarmotSendSummary **out);
+
+/**
+ * Read application-owned local group state. An absent component writes
+ * NULL to `*out` and still returns `MARMOT_STATUS_OK`; a written record
+ * with zero `data_len` is present empty state. Ids below 0xf000 are
+ * protocol space and are rejected. Refresh on group events. Free with
+ * `marmot_group_app_component_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_group_app_component(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        uint16_t component_id,
+                                        struct MarmotGroupAppComponent **out);
 
 /**
  * Query advisory membership health and pending rejoin offers.
@@ -7522,6 +7564,8 @@ MarmotStatus marmot_login_recovering_incomplete_setup(const struct MarmotClient 
                                                       const char *const *bootstrap_relays,
                                                       uintptr_t bootstrap_relays_len,
                                                       uint8_t acknowledge_possible_key_package_orphan,
+                                                      const char *const *inbox_relays,
+                                                      uintptr_t inbox_relays_len,
                                                       struct MarmotAccountSummary **out);
 
 /**
@@ -7764,6 +7808,8 @@ MarmotStatus marmot_create_identity_with_profile(const struct MarmotClient *clie
                                                  uintptr_t default_relays_len,
                                                  const char *const *bootstrap_relays,
                                                  uintptr_t bootstrap_relays_len,
+                                                 const char *const *inbox_relays,
+                                                 uintptr_t inbox_relays_len,
                                                  struct MarmotIdentityCreationResult **out);
 
 /**
@@ -8275,6 +8321,49 @@ MarmotStatus marmot_send_media_attachments(const struct MarmotClient *client,
                                            struct MarmotSendSummary **out);
 
 /**
+ * Send previously uploaded attachments as one kind-9 message that also
+ * carries application `tags` (for example NIP-30 `emoji` tags), each row
+ * a `(char **, len)` pair. imeta tags are rejected. Free with
+ * `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `attachments` must
+ * point to `attachments_len` valid caller-owned structs; `tags` to
+ * `tags_len` valid rows (or NULL with length 0); `out` valid.
+ */
+MarmotStatus marmot_send_tagged_media(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      const struct MarmotMediaAttachmentReference *attachments,
+                                      uintptr_t attachments_len,
+                                      const struct MarmotStringArray *tags,
+                                      uintptr_t tags_len,
+                                      const char *caption,
+                                      struct MarmotSendSummary **out);
+
+/**
+ * React with a custom emoji image. `attachments` (already uploaded)
+ * become `imeta` tags on the kind-7 and `tags` name them, e.g. NIP-30
+ * `["emoji", shortcode, url]` for `emoji` == `:shortcode:`. imeta rows
+ * in `tags` are rejected. Free with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `attachments` must
+ * point to `attachments_len` valid structs and `tags` to `tags_len`
+ * valid rows (each NULL with length 0 allowed); `out` valid.
+ */
+MarmotStatus marmot_react_with_media(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     const char *target_message_id,
+                                     const char *emoji,
+                                     const struct MarmotMediaAttachmentReference *attachments,
+                                     uintptr_t attachments_len,
+                                     const struct MarmotStringArray *tags,
+                                     uintptr_t tags_len,
+                                     struct MarmotSendSummary **out);
+
+/**
  * Send one previously uploaded attachment as a message. Free with
  * `marmot_send_summary_free`.
  *
@@ -8596,6 +8685,24 @@ MarmotStatus marmot_build_media_imeta_tag(const struct MarmotClient *client,
                                           struct MarmotMessageTag **out);
 
 /**
+ * Send kind-9 text with additional application tags. `tags` is a flat
+ * array of `tags_len` tag rows, each row a `(char **, len)` pair of
+ * string values. Free with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `tags` must point to
+ * `tags_len` valid rows (or be NULL with length 0), each row's values
+ * pointer holding its stated length; `out` valid.
+ */
+MarmotStatus marmot_send_tagged_text(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     const struct MarmotStringArray *tags,
+                                     uintptr_t tags_len,
+                                     const char *content,
+                                     struct MarmotSendSummary **out);
+
+/**
  * Send a custom application event into the group. `tags` is a flat
  * array of `tags_len` tag rows, each row a `(char **, len)` pair of
  * string values. Free with `marmot_send_summary_free`.
@@ -8713,6 +8820,25 @@ MarmotStatus marmot_record_host_performance(const struct MarmotClient *client,
                                             uint32_t outcome);
 
 /**
+ * Replace an optional application-owned component through an admin MLS commit.
+ * Rejects ids below 0xf000, required components, and `data_len` over 4096.
+ * Empty bytes are stored, not removed. The value is re-encoded into every
+ * later commit and Welcome, so keep it small.
+ * Free the returned summary with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be live; strings valid; `data` must hold `data_len` bytes
+ * (or be NULL with zero length); `out` must be writable. Inputs are borrowed.
+ */
+MarmotStatus marmot_update_app_component(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex,
+                                         uint16_t component_id,
+                                         const uint8_t *data,
+                                         uintptr_t data_len,
+                                         struct MarmotSendSummary **out);
+
+/**
  * Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
@@ -8724,6 +8850,8 @@ MarmotStatus marmot_begin_onboarding(const struct MarmotClient *client,
                                      uintptr_t default_relays_len,
                                      const char *const *discovery_relays,
                                      uintptr_t discovery_relays_len,
+                                     const char *const *inbox_relays,
+                                     uintptr_t inbox_relays_len,
                                      struct MarmotOnboardingSnapshot **out);
 
 /**
@@ -10676,6 +10804,16 @@ void marmot_message_draft_summary_list_free(struct MarmotMessageDraftSummaryList
 void marmot_event_free(struct MarmotEvent *event);
 
 /**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_group_app_component_free(struct MarmotGroupAppComponent *ptr);
+
+/**
  * Free a disband request returned by `marmot_disband_group`. NULL is a
  * no-op. (Embedded copies inside a chat row are released by the row.)
  *
@@ -11437,6 +11575,18 @@ MarmotStatus marmot_control_attachment(const struct MarmotClient *client,
                                        const char *reference,
                                        uint32_t control,
                                        bool *out);
+
+/**
+ * Join/promote the current slot without resetting retry budgets or backoff.
+ * Cancellation/removal require separate recovery; NULL result is unavailable.
+ * # Safety
+ * Client, strings and target must be live; out writable. Free returned string with marmot_string_free.
+ */
+MarmotStatus marmot_request_explicit_attachment(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *group_id_hex,
+                                                const struct MarmotAttachmentLocalTarget *target,
+                                                char **out);
 
 /**
  * Explicitly request the current slot, including after cancellation/removal. NULL result is unavailable.
