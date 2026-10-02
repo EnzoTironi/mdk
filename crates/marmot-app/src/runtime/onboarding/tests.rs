@@ -1332,6 +1332,42 @@ async fn cancel_removal_only_cleanup_preserves_readiness() {
 }
 
 #[tokio::test]
+async fn typed_relay_preview_preserves_another_steps_pending_proposal() {
+    let (_directory, runtime, network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    checkpoint.set(
+        OnboardingStep::Follows,
+        OnboardingStatus::NeedsInput,
+        vec![],
+    );
+    checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    let original = manager
+        .propose_onboarding_follows(&id, vec![])
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+            .await
+            .is_err()
+    );
+    let after = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    assert_eq!(after.proposal, original.proposal);
+    assert_eq!(after.revision, original.revision);
+    assert_eq!(after.steps, original.steps);
+    assert!(network.attempts.lock().unwrap().is_empty());
+    let canceled = manager.cancel_onboarding_repair(&id).await.unwrap();
+    assert_eq!(
+        canceled.steps[OnboardingStep::Follows.index()].status,
+        OnboardingStatus::NeedsInput
+    );
+    assert!(canceled.proposal.is_none());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn cancel_required_relay_repair_remains_pending() {
     let (_directory, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;

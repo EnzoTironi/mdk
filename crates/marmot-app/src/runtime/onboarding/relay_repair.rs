@@ -313,6 +313,10 @@ impl AccountManager {
                 .any(|finding| finding.issue == OnboardingIssue::RetiredRelay);
         if !step.relay()
             || c.approved
+            || c.snapshot
+                .proposal
+                .as_ref()
+                .is_some_and(|proposal| proposal.step != step)
             || (state.status != OnboardingStatus::NeedsInput && !passed_with_retired)
         {
             return Err(onboarding_error());

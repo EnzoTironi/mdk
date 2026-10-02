@@ -2257,8 +2257,13 @@ impl AccountManager {
             return Err(onboarding_error());
         }
         let proposal = c.snapshot.proposal.take().ok_or_else(onboarding_error)?;
-        // A preview changes the actions, not the retained inspection result.
-        let status = c.snapshot.steps[proposal.step.index()].status;
+        // A typed preview changes actions, not the retained inspection result.
+        // Preserve the existing cancellation contract for other proposal kinds.
+        let status = if proposal.relay_repair.is_some() {
+            c.snapshot.steps[proposal.step.index()].status
+        } else {
+            OnboardingStatus::NeedsInput
+        };
         let findings = c.snapshot.steps[proposal.step.index()].findings.clone();
         c.set(proposal.step, status, findings);
         self.save_onboarding(&mut c)?;
