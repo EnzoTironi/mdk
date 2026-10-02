@@ -1234,6 +1234,9 @@ pub struct AccountSetupRequest {
     /// Public directory indexers. Existing accounts use them for reads;
     /// generated accounts also copy relay lists and kind-0 metadata to them.
     pub discovery_relays: Vec<TransportEndpoint>,
+    /// Authorize default publication for missing lists, including when directory
+    /// discovery fails. Observed signed lists and explicit-empty declarations
+    /// remain unchanged.
     pub publish_missing_relay_lists: bool,
     pub publish_initial_key_package: bool,
 }
@@ -8077,7 +8080,7 @@ impl AccountManager {
                 let current_status = if let Some(status) = recent_relay_lists {
                     status
                 } else {
-                    match bounded_advisory_step(
+                    let discovered = bounded_advisory_step(
                         &self.shared.app_performance_telemetry(),
                         ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                         "import_relay_list_status",
@@ -8087,27 +8090,33 @@ impl AccountManager {
                         ),
                     )
                     .await
-                    {
-                        Some(Ok(status)) => status,
-                        Some(Err(error)) => {
-                            tracing::debug!(
-                                target: "marmot_app::runtime",
-                                method = "setup_relay_lists_for_account",
-                                error_kind = error.privacy_safe_kind(),
-                                "import relay-list discovery failed; refusing to publish defaults"
-                            );
-                            return self
-                                .complete_cached_relay_list_status(&account.label)
-                                .or(Err(error));
-                        }
-                        None => {
-                            return self
-                                .complete_cached_relay_list_status(&account.label)
-                                .map_err(|_| {
-                                    AppError::RelayDirectory(
-                                        "relay-list discovery timed out".to_owned(),
-                                    )
-                                });
+                    .unwrap_or_else(|| {
+                        Err(AppError::RelayDirectory(
+                            "relay-list discovery timed out".to_owned(),
+                        ))
+                    });
+                    match discovered {
+                        Ok(status) => status,
+                        Err(error) => {
+                            let cached = self.app.account_relay_list_status(&account.label)?;
+                            if cached.complete {
+                                cached
+                            } else if matches!(error, AppError::RelayDirectory(_))
+                                && request.publish_missing_relay_lists
+                                && !request.default_relays.is_empty()
+                            {
+                                // The caller authorizes fallback publication. Keep every
+                                // signed list found, including an intentional empty list.
+                                if (cached.nip65.created_at > 0 && cached.nip65.relays.is_empty())
+                                    || (cached.inbox.created_at > 0
+                                        && cached.inbox.relays.is_empty())
+                                {
+                                    return Err(AppError::MissingRelayLists(cached.missing));
+                                }
+                                cached
+                            } else {
+                                return Err(error);
+                            }
                         }
                     }
                 };
@@ -8186,18 +8195,6 @@ impl AccountManager {
                 .set_account_setup_phase(label, AccountSetupPhase::BootstrapPublicationConfirmed)?;
         }
         Ok(())
-    }
-
-    fn complete_cached_relay_list_status(
-        &self,
-        label: &str,
-    ) -> Result<AccountRelayListStatus, AppError> {
-        let status = self.app.account_relay_list_status(label)?;
-        if status.complete {
-            Ok(status)
-        } else {
-            Err(AppError::MissingRelayLists(status.missing))
-        }
     }
 
     async fn publish_relay_lists_for_new_account(

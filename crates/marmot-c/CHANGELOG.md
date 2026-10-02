@@ -7,6 +7,30 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Per-account NIP-46 sessions for bunker links and client-initiated pairing,
+  with identity pinning, approval URLs, relay switching, cancellation and logout.
+  Local-key accounts and separate remote signers can run in the same client.
+
+### Changed
+
+- External account SQLCipher keys use the configured host secret store. Existing
+  plaintext key files migrate only after a verified secret-store write.
+
+### Fixed
+
+- NIP-46 signing requests contain only `kind`, `content`, `tags`, and `created_at`.
+  SDK-only event IDs and public keys stay local for response verification.
+- Publication signing failures retain the event kind and underlying signer error.
+- NIP-46 request publication failures retain the failed relay URLs and rejection
+  messages instead of reporting only that the remote signer is unavailable.
+- Account onboarding can establish inbox-list absence from a completed read of
+  the advertised outboxes even when a discovery indexer is unavailable.
+- Imported and external-signer accounts can use caller-authorized defaults when
+  relay discovery fails. Observed signed lists, including explicit-empty lists,
+  are preserved.
+
 ## [0.12.0] - 2026-10-02
 
 Recompile against the matching `marmot.h` and library: several signatures and
@@ -51,7 +75,6 @@ record layouts changed. See the [client upgrade guide](../../docs/integration/0.
   stays silent and blocked senders remain suppressed; C hosts still apply
   their own notification permission, channel, and foreground policy. No C ABI
   layout changes. (marmot-protocol/whitenoise-android#2984)
-
 
 ## [0.11.0] - 2026-09-29
 

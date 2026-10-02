@@ -3083,7 +3083,12 @@ async fn event_for_publish_with_signer(
         .custom_created_at(NostrTimestamp::from_secs(event.created_at))
         .finalize_async(signer)
         .await
-        .map_err(|_| TransportAdapterError::Publish("sign event failed".to_owned()))
+        .map_err(|error| {
+            TransportAdapterError::Publish(format!(
+                "sign event failed for kind {}: {error}",
+                event.kind
+            ))
+        })
 }
 
 fn parse_endpoints(

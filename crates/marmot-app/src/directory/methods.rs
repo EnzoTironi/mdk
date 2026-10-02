@@ -266,7 +266,10 @@ impl MarmotApp {
                 .await
             {
                 Ok(second) => {
-                    complete &= second.complete;
+                    // Once signed NIP-65 metadata identifies the account's
+                    // outboxes, their completed read establishes inbox absence.
+                    // An unavailable discovery indexer cannot veto that read.
+                    complete = second.complete;
                     records.extend(second.records);
                 }
                 Err(_) => complete = false,
