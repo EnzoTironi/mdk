@@ -8068,7 +8068,7 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
         .expect_err("an empty outbox cannot prove absence after discovery failed");
 
     assert!(
-        matches!(error, AppError::RelayDirectory(_)),
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("not authoritatively established")),
         "unknown discovery must remain retryable instead of becoming a missing-route verdict: {error:?}"
     );
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -8077,6 +8077,58 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
             .iter()
             .any(|endpoint| endpoint.0 == outbox)
     }));
+}
+
+#[tokio::test]
+/// A found inbox list naming only retired relays is named in the error, which
+/// still reports the incomplete outbox hop rather than a final verdict.
+async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_MARMOT_INBOX_RELAY_LIST {
+            event.tags = vec![vec!["relay".into(), "wss://relay.nostr.band".into()]];
+        }
+    }
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
+
+    let error = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("a member with no usable inbox cannot be invited");
+
+    assert!(
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("no usable relays") && message.contains("refresh did not complete")),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+/// A cached retired-only inbox list stays retryable when the refresh fails,
+/// and a completed refresh replaces it with the member's newer usable list.
+async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    remember_test_member_inbox(&app, &account_id, "wss://relay.nostr.band");
+    fetcher
+        .fail_all
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let error = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("a failed refresh cannot use a retired-only cached inbox");
+    assert!(
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("refresh did not complete")),
+        "{error:?}"
+    );
+
+    fetcher
+        .fail_all
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    app.resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect("a completed refresh finds the newer usable inbox without republication");
 }
 
 #[tokio::test]

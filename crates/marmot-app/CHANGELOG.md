@@ -2,7 +2,21 @@
 
 ## Unreleased
 
+### Changed
+
+- `relay.damus.io` is no longer on the retired-relay denylist; the relay is
+  still operating. `retired_relay_hosts()` now returns only
+  `relay.nostr.band`. Members whose kind-10050 inbox list names only
+  `relay.damus.io` can be invited again.
+
 ### Fixed
+
+- When a member lookup does not complete and the member's known inbox relay
+  list has no usable relays, the invite now fails with "known member inbox
+  relay list has no usable relays and its refresh did not complete" instead
+  of "relay-list absence was not authoritatively established". The error is
+  still retryable. A completed lookup still returns
+  `AppError::MissingMemberInboxRoute`.
 
 - A sent message the engine queued while the group was converging is no longer
   marked failed when an unrelated publish in the same batch fails, and a sent
