@@ -586,3 +586,42 @@ async fn invite_discovery_classifies_hex_legacy_evidence_without_admitting_it() 
         .unwrap_err();
     assert!(matches!(error, AppError::ObsoleteKeyPackage(ref id) if id == &account.account_id_hex));
 }
+
+#[tokio::test]
+async fn invite_discovery_defers_batch_legacy_probes_until_single_member_searches() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    let account = &accounts[0];
+    let legacy = fresh_key_package_for_account(&app, account, true).await;
+    let mut event = member_resolution_key_package_event(account, legacy);
+    event.kind = 443;
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    fetcher.events.lock().unwrap().push(event);
+    let error = app
+        .resolve_member_key_packages(
+            &accounts
+                .iter()
+                .map(|account| account.account_id_hex.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::ObsoleteKeyPackage(ref id) if id == &account.account_id_hex));
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.queries.iter().any(|query| query.kind == 443))
+    );
+    assert!(
+        requests
+            .iter()
+            .flat_map(|request| &request.queries)
+            .filter(|query| query.kind == 443)
+            .all(|query| query.authors.len() == 1),
+        "optional legacy probes must not spend a batch's per-member fallback budget"
+    );
+}

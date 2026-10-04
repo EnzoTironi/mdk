@@ -66,13 +66,15 @@ pub(super) async fn fetch_member_directory(
         .filter(|(queries, _)| !queries.is_empty())
         .collect::<Vec<_>>();
     for (queries, required) in query_groups {
-        // Current publications already supply either a usable key or a typed
-        // validation verdict. Avoid optional probes delaying those results.
+        // Batch misses still need per-member current-key fallbacks. Defer
+        // diagnostic work until those searches instead of spending their deadline.
+        // Current publications already provide a key or a typed validation verdict.
         if !required
-            && result
-                .records
-                .iter()
-                .any(|record| record.event.kind == KIND_MARMOT_KEY_PACKAGE)
+            && (queries.iter().any(|query| query.authors.len() != 1)
+                || result
+                    .records
+                    .iter()
+                    .any(|record| record.event.kind == KIND_MARMOT_KEY_PACKAGE))
         {
             break;
         }
