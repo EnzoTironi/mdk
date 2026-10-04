@@ -287,14 +287,33 @@ impl PreparedDirectory {
 /// complete authorized path (or deepest complete existing ancestor) with
 /// `O_NOFOLLOW_ANY`, then operate descriptor-relative below that anchor. This
 /// avoids independently opening sandbox-managed ancestors such as `/private`
-/// and `/private/var` on physical iOS. Android anchors below the ancestors its
-/// app sandbox refuses to open, including `/`. Other Unix platforms retain the
-/// component-by-component descriptor walk from `/` or `.`.
+/// and `/private/var` on physical iOS. Android uses traversal-only handles for
+/// existing ancestors, including `/`, and a readable handle only for the leaf.
+/// Other Unix platforms retain the component-by-component descriptor walk from
+/// `/` or `.`.
 #[cfg(unix)]
 pub fn prepare_directory_path(
     path: &Path,
     mode: u32,
     policy: ExistingDirectoryMode,
+) -> io::Result<PreparedDirectory> {
+    prepare_directory_path_impl(
+        path,
+        mode,
+        policy,
+        #[cfg(any(target_os = "android", all(target_os = "linux", test)))]
+        cfg!(target_os = "android"),
+    )
+}
+
+/// Prepare a directory using the platform walk; Linux tests can exercise the
+/// Android walk against real traversal-only filesystem permissions.
+#[cfg(unix)]
+fn prepare_directory_path_impl(
+    path: &Path,
+    mode: u32,
+    policy: ExistingDirectoryMode,
+    #[cfg(any(target_os = "android", all(target_os = "linux", test)))] android_walk: bool,
 ) -> io::Result<PreparedDirectory> {
     use std::ffi::{CString, OsString};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -365,44 +384,43 @@ pub fn prepare_directory_path(
 
     #[cfg(target_vendor = "apple")]
     let (mut current, components, mut current_path) = open_apple_authorized_ancestor(path)?;
-    // An Android app domain is denied opening `/` and the private root's
-    // system-owned parents, so the walk has to anchor deeper.
-    #[cfg(target_os = "android")]
+    #[cfg(not(target_vendor = "apple"))]
     let (mut current, mut current_path): (OwnedFd, PathBuf) = {
         let start = if path.is_absolute() {
             Path::new("/")
         } else {
             Path::new(".")
         };
-        let mut options = OpenOptions::new();
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        let (depth, directory, anchor) =
-            open_walk_anchor(start, &components, |prefix| options.open(prefix)).map_err(
-                |error| io_context("locate openable directory-walk anchor", path, error),
-            )?;
-        components.drain(..depth);
-        (directory.into(), anchor)
-    };
-    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
-    let (mut current, mut current_path): (OwnedFd, PathBuf) = {
-        let start = if path.is_absolute() {
-            Path::new("/")
+        #[cfg(any(target_os = "android", all(target_os = "linux", test)))]
+        let android_anchor = if android_walk {
+            Some(
+                open_android_walk_anchor(start, &components).map_err(|error| {
+                    io_context("open traversal-only directory-walk anchor", path, error)
+                })?,
+            )
         } else {
-            Path::new(".")
+            None
         };
-        let mut options = OpenOptions::new();
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        let directory = options
-            .open(start)
-            .map(Into::into)
-            .map_err(|error| io_context("open directory-walk anchor", start, error))?;
-        (directory, start.to_owned())
+        #[cfg(not(any(target_os = "android", all(target_os = "linux", test))))]
+        let android_anchor: Option<(usize, OwnedFd, PathBuf)> = None;
+        match android_anchor {
+            Some((depth, directory, anchor)) => {
+                components.drain(..depth);
+                (directory, anchor)
+            }
+            None => {
+                let mut options = OpenOptions::new();
+                use std::os::unix::fs::OpenOptionsExt;
+                options
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                let directory = options
+                    .open(start)
+                    .map(Into::into)
+                    .map_err(|error| io_context("open directory-walk anchor", start, error))?;
+                (directory, start.to_owned())
+            }
+        }
     };
     let mut leaf_created = false;
 
@@ -552,53 +570,81 @@ pub fn prepare_directory_path(
     Ok(prepared)
 }
 
-/// Pick the descriptor-walk anchor among the prefixes of `root` joined with
-/// `components`: the shallowest prefix `open` accepts below the deepest one it
-/// denies, as its component depth, opened value, and path.
-///
-/// Probing continues past denied prefixes and stops at the first missing one.
-/// Every other rejection fails the lookup instead of descending: `O_NOFOLLOW`
-/// only guards a path's final component, so skipping a symlinked prefix would
-/// let the next, deeper probe resolve through that symlink and anchor outside
-/// the intended tree.
-#[cfg(all(unix, any(target_os = "android", test)))]
-fn open_walk_anchor<T>(
+/// Walk existing Android ancestors without requesting directory-read access.
+/// Every component is opened relative to its already-verified parent with
+/// `O_PATH | O_DIRECTORY | O_NOFOLLOW`; symlinks and search denials fail closed.
+/// Return the first missing ancestor's parent, or the final leaf's parent, to
+/// the private creation loop. That loop read-opens the leaf without requiring
+/// search permission on the leaf itself, preserving mode-repair behavior.
+#[cfg(any(target_os = "android", all(target_os = "linux", test)))]
+fn open_android_walk_anchor(
     root: &Path,
     components: &[std::ffi::OsString],
-    mut open: impl FnMut(&Path) -> io::Result<T>,
-) -> io::Result<(usize, T, PathBuf)> {
-    let mut prefix = root.to_owned();
-    let mut anchor: Option<(usize, T, PathBuf)> = None;
-    for depth in 0..=components.len() {
-        if depth > 0 {
-            prefix.push(&components[depth - 1]);
-        }
-        match open(&prefix) {
-            Ok(opened) if anchor.is_none() => {
-                anchor = Some((depth, opened, prefix.clone()));
+) -> io::Result<(usize, std::os::fd::OwnedFd, PathBuf)> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut directory: std::os::fd::OwnedFd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?
+        .into();
+    let mut path = root.to_owned();
+    let ancestors = &components[..components.len().saturating_sub(1)];
+    for (index, component) in ancestors.iter().enumerate() {
+        let name = CString::new(component.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory component contains a NUL byte",
+            )
+        })?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok((index, directory, path));
             }
-            Ok(_) => {}
-            // A denied ancestor is the only obstacle this anchor exists for,
-            // so keep descending but drop the candidates above it.
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => anchor = None,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            // A symlinked prefix reports ELOOP or ENOTDIR depending on the
-            // platform, and a non-directory prefix is unusable either way.
-            Err(error) => {
-                return Err(io_context(
-                    "open directory-walk anchor candidate",
-                    &prefix,
-                    error,
-                ));
-            }
+            return Err(io_context(
+                "open traversal-only directory component",
+                &path.join(component),
+                error,
+            ));
         }
+        directory = unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) };
+        path.push(component);
     }
-    anchor.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "every candidate prefix was denied",
+    if !components.is_empty() {
+        return Ok((ancestors.len(), directory, path));
+    }
+    // A root/current-directory request has no separate leaf component. Return
+    // an ordinary descriptor, as the public preparation contract requires.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
-    })
+    };
+    if descriptor < 0 {
+        return Err(io_context(
+            "open prepared directory leaf",
+            &path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok((
+        0,
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) },
+        path,
+    ))
 }
 
 /// Ids whose writes a private artifact path already trusts because they outrank
@@ -1428,160 +1474,235 @@ mod unix_tests {
         assert_eq!(mode_of(&target), 0o755);
     }
 
-    fn walk_anchor(root: &Path, components: &[&str]) -> io::Result<(usize, PathBuf)> {
-        walk_anchor_probing(root, components).0
-    }
+    #[cfg(target_os = "linux")]
+    mod android_walk {
+        use super::*;
+        use std::os::fd::AsRawFd;
 
-    /// The anchor lookup plus every prefix it probed, in order.
-    fn walk_anchor_probing(
-        root: &Path,
-        components: &[&str],
-    ) -> (io::Result<(usize, PathBuf)>, Vec<PathBuf>) {
-        use std::os::unix::fs::OpenOptionsExt;
+        fn prepare(path: &Path, policy: ExistingDirectoryMode) -> io::Result<PreparedDirectory> {
+            prepare_directory_path_impl(path, PRIVATE_DIR_MODE, policy, true)
+        }
 
-        let owned: Vec<std::ffi::OsString> =
-            components.iter().map(std::ffi::OsString::from).collect();
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        let mut probed = Vec::new();
-        let anchor = open_walk_anchor(root, &owned, |prefix| {
-            probed.push(prefix.to_owned());
-            options.open(prefix)
-        })
-        .map(|(depth, _directory, path)| (depth, path));
-        (anchor, probed)
+        #[test]
+        fn existing_leaf_below_traverse_only_ancestor_preserves_and_enforces_mode() {
+            if effectively_root() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let blocked = dir.path().join("blocked");
+            let leaf = blocked.join("leaf");
+            std::fs::create_dir_all(&leaf).unwrap();
+            std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o111)).unwrap();
+            assert_eq!(
+                std::fs::File::open(&blocked).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            let preserved = prepare(&leaf, ExistingDirectoryMode::Preserve).unwrap();
+            assert!(!preserved.was_created());
+            assert_eq!(preserved.mode(), 0o755);
+            let enforced = prepare(&leaf, ExistingDirectoryMode::Enforce).unwrap();
+            assert_eq!(enforced.mode(), PRIVATE_DIR_MODE);
+            assert_eq!(mode_of(&blocked), 0o111);
+            // The returned leaf is an ordinary descriptor, and the runtime
+            // lease still creates a private file relative to that descriptor.
+            assert_eq!(
+                unsafe { libc::fcntl(enforced.directory.as_raw_fd(), libc::F_GETFL) }
+                    & libc::O_PATH,
+                0
+            );
+            let lease = enforced
+                .try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new("lease"))
+                .unwrap();
+            assert_eq!(mode_of(&leaf.join("lease")), PRIVATE_FILE_MODE);
+            drop(lease);
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        #[test]
+        fn readable_leaf_without_search_permission_can_be_preserved_or_repaired() {
+            if effectively_root() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let leaf = dir.path().join("leaf");
+            std::fs::create_dir(&leaf).unwrap();
+            std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let preserved = prepare(&leaf, ExistingDirectoryMode::Preserve).unwrap();
+            assert!(!preserved.was_created());
+            assert_eq!(preserved.mode(), 0o600);
+            assert_eq!(mode_of(&leaf), 0o600);
+            assert_eq!(
+                unsafe { libc::fcntl(preserved.directory.as_raw_fd(), libc::F_GETFL) }
+                    & libc::O_PATH,
+                0
+            );
+            let enforced = prepare(&leaf, ExistingDirectoryMode::Enforce).unwrap();
+            assert_eq!(enforced.mode(), PRIVATE_DIR_MODE);
+            assert_eq!(mode_of(&leaf), PRIVATE_DIR_MODE);
+        }
+
+        #[test]
+        fn creates_missing_private_components_below_traverse_only_ancestor() {
+            if effectively_root() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let blocked = dir.path().join("blocked");
+            let inner = blocked.join("inner");
+            std::fs::create_dir_all(&inner).unwrap();
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o111)).unwrap();
+            let leaf = inner.join("new").join("leaf");
+            let prepared = prepare(&leaf, ExistingDirectoryMode::Preserve).unwrap();
+            assert!(prepared.was_created());
+            assert_eq!(prepared.mode(), PRIVATE_DIR_MODE);
+            assert_eq!(mode_of(&inner.join("new")), PRIVATE_DIR_MODE);
+            assert_eq!(mode_of(&leaf), PRIVATE_DIR_MODE);
+            assert_eq!(mode_of(&blocked), 0o111);
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        #[test]
+        fn denied_search_permission_is_not_bypassed() {
+            if effectively_root() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let blocked = dir.path().join("blocked");
+            std::fs::create_dir_all(blocked.join("inner").join("leaf")).unwrap();
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let result = prepare(
+                &blocked.join("inner").join("leaf"),
+                ExistingDirectoryMode::Enforce,
+            );
+            let components = [
+                std::ffi::OsString::from("blocked"),
+                std::ffi::OsString::from("inner"),
+                std::ffi::OsString::from("leaf"),
+            ];
+            let walk_result = open_android_walk_anchor(dir.path(), &components);
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                walk_result.unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+
+        #[test]
+        fn descriptor_walk_refuses_symlink_at_every_component() {
+            use std::os::unix::fs::symlink;
+            let dir = tempfile::tempdir().unwrap();
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(outside.join("leaf")).unwrap();
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+            symlink(&outside, dir.path().join("link")).unwrap();
+            for names in [vec!["link"], vec!["link", "leaf"], vec!["link", "new"]] {
+                let components = names
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>();
+                if names.len() > 1 {
+                    let error = open_android_walk_anchor(dir.path(), &components).unwrap_err();
+                    assert_ne!(error.kind(), io::ErrorKind::PermissionDenied);
+                    assert_ne!(error.kind(), io::ErrorKind::NotFound);
+                }
+                let path = names
+                    .iter()
+                    .fold(dir.path().to_owned(), |path, name| path.join(name));
+                assert!(prepare(&path, ExistingDirectoryMode::Enforce).is_err());
+            }
+            assert!(!outside.join("new").exists());
+            assert_eq!(mode_of(&outside), 0o755);
+        }
+
+        #[test]
+        fn symlink_below_traverse_only_ancestor_is_rejected() {
+            use std::os::unix::fs::symlink;
+            if effectively_root() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let blocked = dir.path().join("blocked");
+            let outside = dir.path().join("outside");
+            std::fs::create_dir(&blocked).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+            symlink(&outside, blocked.join("link")).unwrap();
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o111)).unwrap();
+            let components = ["blocked", "link", "new"].map(std::ffi::OsString::from);
+            let result = open_android_walk_anchor(dir.path(), &components);
+            let prepared = prepare(
+                &blocked.join("link").join("new"),
+                ExistingDirectoryMode::Enforce,
+            );
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let error = result.unwrap_err();
+            assert_ne!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_ne!(error.kind(), io::ErrorKind::NotFound);
+            assert!(prepared.is_err());
+            assert!(!outside.join("new").exists());
+            assert_eq!(mode_of(&outside), 0o755);
+        }
+
+        #[test]
+        fn returns_traversal_only_parent_at_first_missing_component() {
+            let dir = tempfile::tempdir().unwrap();
+            let components = [
+                std::ffi::OsString::from("missing"),
+                std::ffi::OsString::from("deeper"),
+            ];
+            let (depth, parent, path) = open_android_walk_anchor(dir.path(), &components).unwrap();
+            assert_eq!(depth, 0);
+            assert_eq!(path, dir.path());
+            assert_ne!(
+                unsafe { libc::fcntl(parent.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
+                0
+            );
+        }
+
+        #[test]
+        fn relative_paths_and_current_directory_work_without_changing_ancestors() {
+            let dir = tempfile::tempdir_in(".").unwrap();
+            let leaf = dir.path().join("new").join("leaf");
+            let prepared = prepare(&leaf, ExistingDirectoryMode::Enforce).unwrap();
+            assert!(prepared.was_created());
+            assert_eq!(prepared.mode(), PRIVATE_DIR_MODE);
+            let before = mode_of(Path::new("."));
+            prepare(Path::new("."), ExistingDirectoryMode::Preserve).unwrap();
+            assert_eq!(mode_of(Path::new(".")), before);
+            assert_eq!(
+                prepare(Path::new("."), ExistingDirectoryMode::Enforce)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                prepare(Path::new("/"), ExistingDirectoryMode::Enforce)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            prepare(Path::new("/"), ExistingDirectoryMode::Preserve).unwrap();
+        }
+
+        #[test]
+        fn parent_traversal_is_rejected_before_creating_anything() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("new").join("..").join("other");
+            assert_eq!(
+                prepare(&path, ExistingDirectoryMode::Enforce)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert!(!dir.path().join("new").exists());
+            assert!(!dir.path().join("other").exists());
+        }
     }
 
     fn effectively_root() -> bool {
         (unsafe { libc::geteuid() }) == 0
-    }
-
-    #[test]
-    fn open_walk_anchor_descends_past_a_traverse_only_ancestor() {
-        if effectively_root() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let blocked = dir.path().join("blocked");
-        let inner = blocked.join("inner");
-        std::fs::create_dir_all(inner.join("leaf")).unwrap();
-        // Traversal without read, as Android grants on `/data`.
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o111)).unwrap();
-
-        let anchor = walk_anchor(dir.path(), &["blocked", "inner", "leaf"]);
-
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(
-            anchor.expect("anchor below the traverse-only ancestor"),
-            (2, inner)
-        );
-    }
-
-    #[test]
-    fn open_walk_anchor_discards_candidates_above_a_blocked_ancestor() {
-        if effectively_root() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let blocked = dir.path().join("readable").join("blocked");
-        let inner = blocked.join("inner");
-        std::fs::create_dir_all(&inner).unwrap();
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o111)).unwrap();
-
-        let anchor = walk_anchor(dir.path(), &["readable", "blocked", "inner"]);
-
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(
-            anchor.expect("anchor below the blocked ancestor"),
-            (3, inner)
-        );
-    }
-
-    #[test]
-    fn open_walk_anchor_keeps_the_root_when_no_ancestor_is_blocked() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("first").join("second")).unwrap();
-        assert_eq!(
-            walk_anchor(dir.path(), &["first", "second"]).expect("anchor at the root"),
-            (0, dir.path().to_owned())
-        );
-    }
-
-    #[test]
-    fn open_walk_anchor_stops_at_the_first_missing_component() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            walk_anchor(dir.path(), &["missing", "deeper"]).expect("anchor at the root"),
-            (0, dir.path().to_owned())
-        );
-    }
-
-    #[test]
-    fn open_walk_anchor_reports_no_anchor_when_nothing_opens() {
-        let components: Vec<std::ffi::OsString> =
-            ["a", "b"].iter().map(std::ffi::OsString::from).collect();
-        let error = open_walk_anchor(Path::new("/"), &components, |_| {
-            Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied))
-        })
-        .map(|(depth, _directory, path)| (depth, path))
-        .expect_err("no openable prefix");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn open_walk_anchor_rejects_a_symlinked_prefix_component() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let outside = dir.path().join("outside");
-        std::fs::create_dir_all(outside.join("leaf")).unwrap();
-        let inside = dir.path().join("inside");
-        std::fs::create_dir(&inside).unwrap();
-        symlink(&outside, inside.join("link")).unwrap();
-
-        let (anchor, probed) = walk_anchor_probing(dir.path(), &["inside", "link", "leaf"]);
-
-        let error = anchor.expect_err("symlinked prefix component");
-        assert_ne!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_ne!(error.kind(), io::ErrorKind::NotFound);
-        // Probing must stop at the symlink: the next prefix would have resolved
-        // through it and anchored under `outside`.
-        assert_eq!(
-            probed,
-            vec![dir.path().to_owned(), inside.clone(), inside.join("link")]
-        );
-        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn open_walk_anchor_rejects_a_symlink_below_a_denied_ancestor() {
-        use std::os::unix::fs::symlink;
-
-        if effectively_root() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let outside = dir.path().join("outside");
-        std::fs::create_dir_all(outside.join("leaf")).unwrap();
-        let blocked = dir.path().join("blocked");
-        std::fs::create_dir(&blocked).unwrap();
-        symlink(&outside, blocked.join("link")).unwrap();
-        // Traversal without read, as Android grants on `/data`.
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o111)).unwrap();
-
-        let (anchor, probed) = walk_anchor_probing(dir.path(), &["blocked", "link", "leaf"]);
-
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = anchor.expect_err("symlink below a denied ancestor");
-        // The denial is forgiven, the symlink below it is not.
-        assert_ne!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            probed,
-            vec![dir.path().to_owned(), blocked.clone(), blocked.join("link")]
-        );
-        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
     }
 
     /// Trusted ids for the Android app-namespace shape: superuser plus the
