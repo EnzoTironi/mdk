@@ -170,3 +170,11 @@ fn nostr_uri_renders_as_anchor() {
     let html = render(&parse(&md));
     assert!(html.contains(&format!("href=\"nostr:npub1{body}\"")));
 }
+
+#[test]
+fn bare_domain_renders_original_label_with_https_destination() {
+    check(
+        "See example.chat/path.",
+        "<p>See <a href=\"https://example.chat/path\">example.chat/path</a>.</p>\n",
+    );
+}

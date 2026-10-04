@@ -12,7 +12,8 @@ engine behavior.
   references (`Inline::NostrUri`), and classifies private-key destinations as sensitive.
 - Does not parse general HTML. Tag-like sequences stay literal text; only autolinks and the `<details>` extension get
   structured treatment.
-- Keeps dependencies minimal (`serde` only in normal builds).
+- Uses `serde` for the AST and the workspace `url` implementation for URL/IDNA normalization,
+  and Unicode categories for hostname boundaries.
 
 ```rust
 use marmot_markdown::{Block, parse};
@@ -21,10 +22,35 @@ let doc = parse("# Hi *there*");
 assert!(matches!(doc.blocks.as_slice(), [Block::Heading { level: 1, .. }]));
 ```
 
+## Scheme-less web domains
+
+A bare domain such as `example.chat` produces an ordinary `Inline::Link` with
+that display text and an HTTPS destination. Optional ports, paths, queries and
+fragments are retained; URL normalization applies to the destination, including
+IDNA conversion of international hostnames. No DNS queries or TLD allowlist are
+used. Domain labels and hostnames follow DNS length/syntax bounds; the final
+label must be alphabetic (at least two characters) or a valid IDN A-label.
+
+Explicit URI and `www.` autolinks keep their existing representation. Existing
+Markdown link/image labels, code and math are not reinterpreted. Bare emails,
+credential-shaped tokens, explicit filesystem paths, numeric endings and malformed
+hosts stay literal. A standalone filename such as `example.rs` is indistinguishable
+from a valid domain. Prose joined to a hostname without punctuation or whitespace
+can be equally ambiguous. Use separators or code formatting for literal text.
+Escaped domains stay literal. In unmatched bracket prose, a path split by Markdown
+formatting stays inert instead of becoming a link to a truncated destination;
+recovery is skipped when escapes or decoded entities obscure the original spelling.
+As with existing `www.` autolinks, a recognized raw URL tail retains its original
+spelling (including ampersands and Markdown-looking path characters).
+International labels are validated as a complete hostname, never shortened at a
+script transition. Renderers retain their confirmation policy for IDN destinations.
+Failed probes use bounded host scans and cached tail stops, so repeated candidates
+cannot repeatedly scan a long rejected path.
+
 ## Renderer security contract
 
-Message Markdown and every link destination are untrusted. The parser preserves destinations instead of deleting or
-rewriting them, and annotates links, images, and autolinks with `LinkDestinationKind`. That classification is context
+Message Markdown and every link destination are untrusted. The parser preserves explicit destinations and supplies normalized HTTPS
+destinations for recognized bare domains, and annotates links, images, and autolinks with `LinkDestinationKind`. That classification is context
 for client policy; it is not authorization to navigate or fetch.
 
 Renderers **must inspect `classification` before making a destination actionable**. In particular:

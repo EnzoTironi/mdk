@@ -132,3 +132,8 @@ fn x() { 1 + 1 }
 ";
     roundtrip(md);
 }
+
+#[test]
+fn roundtrip_bare_domains_with_display_text_and_https_destination() {
+    roundtrip("See **example.chat** and bücher.de/a?q=1#part.");
+}

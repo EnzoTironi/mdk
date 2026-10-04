@@ -615,6 +615,38 @@ mod tests {
     }
 
     #[test]
+    fn bridges_bare_domain_as_launchable_link_with_original_label() {
+        for (label, destination) in [
+            (
+                "example.chat:8443/path?q=1#part",
+                "https://example.chat:8443/path?q=1#part",
+            ),
+            ("bücher.de", "https://xn--bcher-kva.de/"),
+        ] {
+            let document = parse_markdown_document(&format!("See {label}."));
+            let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+                panic!("expected paragraph");
+            };
+            let MarkdownInlineFfi::Link {
+                dest,
+                title,
+                children,
+                classification,
+            } = &inlines[1]
+            else {
+                panic!("expected link");
+            };
+            assert_eq!(dest, destination);
+            assert!(title.is_none());
+            assert_eq!(*classification, MarkdownLinkDestinationKindFfi::Web);
+            assert!(
+                matches!(children.as_slice(), [MarkdownInlineFfi::Text { content }] if content == label)
+            );
+            assert!(matches!(&inlines[2], MarkdownInlineFfi::Text { content } if content == "."));
+        }
+    }
+
+    #[test]
     fn bridges_www_autolink_kind() {
         let document = parse_markdown_document("See www.example.com/path.");
         let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {

@@ -1,12 +1,13 @@
-//! `marmot-markdown` — a hand-written, near-zero-dependency CommonMark parser
+//! `marmot-markdown` — a hand-written CommonMark parser
 //! that emits an abstract syntax tree.
 //!
 //! ## Goals
 //!
 //! 1. **Simplicity.** Straight-line parsing, no clever abstractions, no
 //!    speculative generality.
-//! 2. **Near-zero dependencies.** The only library dependency is `serde`
-//!    for AST (de)serialization.
+//! 2. **Focused dependencies.** `serde` owns AST (de)serialization; the
+//!    workspace URL/IDNA implementation and Unicode categories validate bare
+//!    web hosts instead of duplicating those standards in the parser.
 //! 3. **First-class nostr.** Two extra inline node types —
 //!    [`Inline::NostrMention`] for bare `@npub1…` handles, and
 //!    [`Inline::NostrUri`] for explicit `nostr:<hrp>1…` references —
@@ -37,7 +38,8 @@
 //!
 //! ## Untrusted destinations
 //!
-//! Link, image, and autolink destinations are preserved and classified with
+//! Explicit link, image and autolink destinations are preserved; recognized
+//! bare domains receive normalized HTTPS destinations. They are classified with
 //! [`LinkDestinationKind`]. Classification is descriptive, not permission to
 //! navigate or fetch. Renderers must inspect it before binding a destination
 //! to a WebView, OS opener, deep-link handler, or image loader. Dangerous and
@@ -59,6 +61,7 @@
 //! All AST types implement `Serialize` and `Deserialize` unconditionally.
 
 pub mod ast;
+mod bare_domains;
 mod block;
 mod destination;
 mod details;
@@ -95,6 +98,11 @@ pub use destination::classify_link_destination;
 ///   (`.,;:!?*_~` and unbalanced `)`) is excluded from the matched URL. Opaque
 ///   app-scheme forms like `marmot:foo` and `whitenoise:foo` (no `//`) stay
 ///   literal.
+/// - Scheme-less web domains with syntactically valid domain endings. These
+///   use [`Inline::Link`] with the original display text and a normalized HTTPS
+///   destination, including optional port/path/query/fragment. IDNs use IDNA
+///   normalization; recognition never queries DNS or a TLD registry. Explicit
+///   link labels, code, math, email addresses and filesystem paths stay intact.
 /// - Math: inline `$…$` and block `$$ … $$` (content is opaque — recognized
 ///   but never parsed as LaTeX).
 /// - Bounded `<details>` / `<summary>` disclosure blocks. The opener and

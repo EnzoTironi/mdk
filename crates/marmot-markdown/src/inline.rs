@@ -250,6 +250,8 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
     let mut open_bracket_delims = 0usize;
     let mut i = 0;
     let mut inline_math_closer_exhausted = false;
+    let mut domain_tails = crate::bare_domains::TailScanner::default();
+    let mut decoded_entity = false;
 
     // Try a "consume an Inline or fall back to a literal byte" recognizer.
     // Used for the recognizers whose only failure mode is "didn't match —
@@ -272,6 +274,32 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
 
     while i < bytes.len() {
         let c = bytes[i];
+        // Let existing URI/www recognizers win. Probe ordinary word starts
+        // outside bracket labels before emphasis can consume URL path bytes.
+        let after_format_opener = delims.last().is_some_and(|d| {
+            matches!(d.kind, b'*' | b'_' | b'~')
+                && d.can_open
+                && d.input_pos + d.orig_len == i
+                && crate::bare_domains::left_boundary(raw[..d.input_pos].chars().next_back())
+        });
+        if open_bracket_delims == 0
+            && !looks_like_bare_url_start(bytes, i)
+            && (crate::bare_domains::candidate_start(raw, i)
+                || (after_format_opener
+                    && raw[i..].chars().next().is_some_and(char::is_alphanumeric)))
+            && let Some((dest, end)) =
+                crate::bare_domains::try_domain(raw, i, &mut domain_tails, false)
+        {
+            flush_text(&mut out, &mut buf, &delims);
+            out.push(Inline::Link {
+                classification: classify_link_destination(&dest),
+                dest,
+                title: None,
+                children: vec![Inline::Text(raw[i..end].to_owned())],
+            });
+            i = end;
+            continue;
+        }
         match c {
             b'\\' => {
                 if i + 1 < bytes.len() {
@@ -332,6 +360,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                 Some((decoded, end)) => {
                     // Entities decode straight into the text buffer (no
                     // flush) so adjacent literal bytes stay coalesced.
+                    decoded_entity = true;
                     buf.push_str(&decoded);
                     i = end;
                 }
@@ -505,6 +534,10 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                         if cc >= 0x80 {
                             break;
                         }
+                        if open_bracket_delims == 0 && crate::bare_domains::candidate_start(raw, i)
+                        {
+                            break;
+                        }
                         if INLINE_SPECIAL[cc as usize] {
                             // `n` is in INLINE_SPECIAL only as a tripwire for
                             // the `nostr:` URI scheme and bare `npub1…`
@@ -550,6 +583,11 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
     // `![` placeholder Text nodes stay literal, but they no longer block
     // coalescing.
     coalesce_text_runs(&mut out);
+    // Unmatched brackets were literal text, not explicit link labels. Recover
+    // domains in that text without creating nested links or linking code/math.
+    if raw.contains('[') && !raw.contains('\\') && !decoded_entity {
+        crate::bare_domains::link_domains(&mut out, 0, true, false);
+    }
     out
 }
 

@@ -370,3 +370,440 @@ fn malformed_bare_nostr_stays_text() {
     // back to a generic bare-URL autolink — it stays literal.
     assert_eq!(parse_inlines("nostr:foo"), vec![t("nostr:foo")]);
 }
+
+fn domain(label: &str, dest: &str) -> Inline {
+    Inline::Link {
+        dest: dest.to_owned(),
+        title: None,
+        children: vec![t(label)],
+        classification: LinkDestinationKind::Web,
+    }
+}
+
+#[test]
+fn bare_domains_support_any_syntactic_ending() {
+    for host in [
+        "example.com",
+        "example.chat",
+        "example.network",
+        "example.co.uk",
+        "example.photography",
+        "example.futureending",
+        "example.rs",
+        "example.md",
+        "example.zip",
+        "EXAMPLE.CHAT",
+    ] {
+        assert_eq!(
+            parse_inlines(host),
+            vec![domain(
+                host,
+                &format!("https://{}/", host.to_ascii_lowercase())
+            )],
+            "{host}"
+        );
+    }
+}
+
+#[test]
+fn bare_domains_preserve_label_and_include_url_components() {
+    let label = "sub.example.chat:8443/a_b?q=hello&other=2#part";
+    assert_eq!(
+        parse_inlines(&format!("See {label}.")),
+        vec![
+            t("See "),
+            domain(label, &format!("https://{label}")),
+            t(".")
+        ]
+    );
+    assert_eq!(
+        parse_inlines("(example.chat/wiki/Foo_(bar))."),
+        vec![
+            t("("),
+            domain(
+                "example.chat/wiki/Foo_(bar)",
+                "https://example.chat/wiki/Foo_(bar)"
+            ),
+            t(").")
+        ]
+    );
+    assert_eq!(
+        parse_inlines("“example.chat”"),
+        vec![
+            t("“"),
+            domain("example.chat", "https://example.chat/"),
+            t("”")
+        ]
+    );
+}
+
+#[test]
+fn bare_domains_normalize_international_hosts_without_changing_display() {
+    for (label, dest) in [
+        ("bücher.de", "https://xn--bcher-kva.de/"),
+        ("例子.中国", "https://xn--fsqu00a.xn--fiqs8s/"),
+        ("xn--bcher-kva.de", "https://xn--bcher-kva.de/"),
+    ] {
+        assert_eq!(parse_inlines(label), vec![domain(label, dest)]);
+    }
+}
+
+#[test]
+fn bare_domains_stay_inside_emphasis_but_outside_explicit_link_labels() {
+    assert_eq!(
+        parse_inlines("**example.chat**"),
+        vec![Inline::Strong(vec![domain(
+            "example.chat",
+            "https://example.chat/"
+        )])]
+    );
+    assert_eq!(
+        parse_inlines("[example.chat](https://other.org)"),
+        vec![domain("example.chat", "https://other.org")]
+    );
+    assert_eq!(
+        parse_inlines("`example.chat`"),
+        vec![Inline::Code("example.chat".into())]
+    );
+    assert_eq!(
+        parse_inlines("$example.chat$"),
+        vec![Inline::Math("example.chat".into())]
+    );
+}
+
+#[test]
+fn bare_domains_do_not_rescue_emails_paths_schemes_or_invalid_hosts() {
+    for input in [
+        "user@example.chat",
+        "user.name@example.chat",
+        "user:pass@example.chat",
+        "user.name:pass@example.chat",
+        "javascript:example.chat",
+        "data:example.chat",
+        "file://example.chat",
+        "ftp://example.chat",
+        "./example.chat",
+        "src/example.chat",
+        "example.chat\\file",
+        "foo..example.chat",
+        "-example.chat",
+        "example-.chat",
+        "example.c",
+        "example.123",
+        "1.2.3",
+        "192.168.0.1",
+        "example.chat_bad",
+        "example.chat:abc",
+        "example.chat:65536",
+    ] {
+        assert_eq!(parse_inlines(input), vec![t(input)], "{input}");
+    }
+}
+
+#[test]
+fn bare_domains_reject_oversized_hostnames_without_rescuing_suffixes() {
+    let input = format!("{}.chat", "a".repeat(64));
+    assert_eq!(parse_inlines(&input), vec![t(&input)]);
+    let input = format!("{}.chat", "a".repeat(100_000));
+    assert_eq!(parse_inlines(&input), vec![t(&input)]);
+}
+
+#[test]
+fn bare_domain_paths_are_not_split_by_emphasis_delimiters() {
+    assert_eq!(
+        parse_inlines("*example.chat/a*b*c*"),
+        vec![Inline::Emph(vec![domain(
+            "example.chat/a*b*c",
+            "https://example.chat/a*b*c"
+        )])]
+    );
+    assert_eq!(
+        parse_inlines("[example.chat]"),
+        vec![
+            t("["),
+            domain("example.chat", "https://example.chat/"),
+            t("]")
+        ]
+    );
+}
+
+#[test]
+fn bare_domains_keep_multiple_sentence_links_separate() {
+    assert_eq!(
+        parse_inlines("example.chat,example.network"),
+        vec![
+            domain("example.chat", "https://example.chat/"),
+            t(","),
+            domain("example.network", "https://example.network/")
+        ]
+    );
+}
+
+#[test]
+fn bare_domains_do_not_absorb_unicode_sentence_punctuation_or_emoji() {
+    for tail in ["🎉", "—it works", "，谢谢", "！", "…"] {
+        assert_eq!(
+            parse_inlines(&format!("example.chat{tail}")),
+            vec![domain("example.chat", "https://example.chat/"), t(tail)]
+        );
+    }
+    for (open, close) in [("「", "」"), ("《", "》"), ("«", "»")] {
+        assert_eq!(
+            parse_inlines(&format!("{open}example.chat{close}")),
+            vec![
+                t(open),
+                domain("example.chat", "https://example.chat/"),
+                t(close)
+            ]
+        );
+    }
+    assert_eq!(
+        parse_inlines("网站：example.chat"),
+        vec![t("网站："), domain("example.chat", "https://example.chat/")]
+    );
+}
+
+#[test]
+fn bare_domains_accept_mixed_ascii_unicode_registered_idn_endings() {
+    assert_eq!(
+        parse_inlines("example.vermögensberatung"),
+        vec![domain(
+            "example.vermögensberatung",
+            "https://example.xn--vermgensberatung-pwb/"
+        )]
+    );
+}
+
+#[test]
+fn bare_domains_allow_formatting_around_ports_and_reject_intraword_openers() {
+    assert_eq!(
+        parse_inlines("**example.chat:8443**"),
+        vec![Inline::Strong(vec![domain(
+            "example.chat:8443",
+            "https://example.chat:8443/"
+        )])]
+    );
+    assert_eq!(
+        parse_inlines("foo*example.chat"),
+        vec![t("foo*example.chat")]
+    );
+    assert_eq!(parse_inlines("2*a.bc"), vec![t("2*a.bc")]);
+}
+
+#[test]
+fn bare_domains_respect_escapes_and_do_not_link_truncated_unmatched_bracket_paths() {
+    assert_eq!(parse_inlines(r"example\.chat"), vec![t("example.chat")]);
+    assert_eq!(
+        parse_inlines(r"example.chat\:8080"),
+        vec![t("example.chat:8080")]
+    );
+    assert_eq!(
+        parse_inlines("[ example.chat/a*b*c"),
+        vec![t("[ example.chat/a"), Inline::Emph(vec![t("b")]), t("c")]
+    );
+}
+
+#[test]
+fn bare_domain_scanning_keeps_multibyte_boundaries_through_markdown() {
+    for prefix in [
+        "é ", "漢字 ", "🦀 ", "\\é ", "[é ", "&amp;é ", "`é` ", "é* ",
+    ] {
+        for suffix in [" 漢字", "🎉", "—tail", "\\é", "`漢字`", "*漢字*"] {
+            // Slicing must remain valid after escapes, entities and multibyte text.
+            let doc = marmot_markdown::parse(&format!("{prefix}bücher.de/a?q=1{suffix}"));
+            serde_json::to_string(&doc).expect("serialize mixed UTF-8 source");
+        }
+    }
+}
+
+#[test]
+fn bare_domains_bound_dns_length_after_idna_conversion() {
+    let label = format!("{}.cn", vec!["中".repeat(12); 8].join("."));
+    let host = format!("{}.cn", ["xn--fiqaaaaaaaaaaa"; 8].join("."));
+    assert_eq!(
+        parse_inlines(&label),
+        vec![domain(&label, &format!("https://{host}/"))]
+    );
+    assert_eq!(
+        parse_inlines("bu\u{308}cher.de"),
+        vec![domain("bu\u{308}cher.de", "https://xn--bcher-kva.de/")]
+    );
+}
+
+#[test]
+fn bare_domain_paths_keep_unicode_symbols_and_slugs() {
+    for (label, dest) in [
+        ("example.chat/🦀", "https://example.chat/%F0%9F%A6%80"),
+        (
+            "example.chat/hello—world",
+            "https://example.chat/hello%E2%80%94world",
+        ),
+    ] {
+        assert_eq!(parse_inlines(label), vec![domain(label, dest)]);
+    }
+    assert_eq!(
+        parse_inlines("example.chat\u{200b}evil"),
+        vec![t("example.chat\u{200b}evil")]
+    );
+}
+
+#[test]
+fn bare_domains_keep_valid_apostrophes_and_balanced_brackets_in_url_tails() {
+    for (label, dest) in [
+        ("example.chat/it's", "https://example.chat/it's"),
+        ("example.chat/?q[]=value", "https://example.chat/?q[]=value"),
+        ("example.chat/path[part]", "https://example.chat/path[part]"),
+    ] {
+        assert_eq!(parse_inlines(label), vec![domain(label, dest)]);
+    }
+    assert_eq!(
+        parse_inlines("'example.chat/it's'"),
+        vec![
+            t("'"),
+            domain("example.chat/it's", "https://example.chat/it's"),
+            t("'")
+        ]
+    );
+    assert_eq!(
+        parse_inlines("[example.chat/path]"),
+        vec![
+            t("["),
+            domain("example.chat/path", "https://example.chat/path"),
+            t("]")
+        ]
+    );
+    assert_eq!(
+        parse_inlines("<example.chat/path>"),
+        vec![
+            t("<"),
+            domain("example.chat/path", "https://example.chat/path"),
+            t(">")
+        ]
+    );
+}
+
+#[test]
+fn bare_domain_paths_with_backslashes_are_not_linked_to_truncated_destinations() {
+    assert_eq!(
+        parse_inlines(r"example.chat/path\file"),
+        vec![t(r"example.chat/path\file")]
+    );
+    assert_eq!(
+        parse_inlines(r"example.chat/foo\_bar"),
+        vec![t("example.chat/foo_bar")]
+    );
+}
+
+#[test]
+fn bare_domain_paths_leave_unicode_sentence_punctuation_outside_link() {
+    for ending in ["。", "…", "：", "؟", "،", "।", "．", "｡"] {
+        assert_eq!(
+            parse_inlines(&format!("example.chat/docs{ending}")),
+            vec![
+                domain("example.chat/docs", "https://example.chat/docs"),
+                t(ending)
+            ]
+        );
+    }
+}
+
+#[test]
+fn bare_domains_work_inside_underscore_emphasis_without_partial_hosts() {
+    assert_eq!(
+        parse_inlines("_example.chat_"),
+        vec![Inline::Emph(vec![domain(
+            "example.chat",
+            "https://example.chat/"
+        )])]
+    );
+    assert_eq!(
+        parse_inlines("__example.chat__"),
+        vec![Inline::Strong(vec![domain(
+            "example.chat",
+            "https://example.chat/"
+        )])]
+    );
+    assert_eq!(
+        parse_inlines("example.chat_bad"),
+        vec![t("example.chat_bad")]
+    );
+}
+
+#[test]
+fn unmatched_bracket_fallback_preserves_word_and_non_text_boundaries() {
+    assert_eq!(
+        parse_inlines("[ foo*example.chat*"),
+        vec![t("[ foo"), Inline::Emph(vec![t("example.chat")])]
+    );
+    assert_eq!(
+        parse_inlines("[ `x`example.chat"),
+        vec![t("[ "), Inline::Code("x".into()), t("example.chat")]
+    );
+    assert_eq!(
+        parse_inlines("[ example.chat/a`b`"),
+        vec![t("[ example.chat/a"), Inline::Code("b".into())]
+    );
+}
+
+#[test]
+fn repeated_failed_url_tails_remain_literal() {
+    let direct = format!("{}\\", "a.bc/(".repeat(16_000));
+    assert_eq!(parse_inlines(&direct), vec![t(&direct)]);
+    let fallback = format!("[ {}*x*", "a.bc/,".repeat(16_000));
+    assert_eq!(
+        parse_inlines(&fallback),
+        vec![
+            t(&format!("[ {}", "a.bc/,".repeat(16_000))),
+            Inline::Emph(vec![t("x")])
+        ]
+    );
+}
+
+#[test]
+fn unmatched_bracket_format_containers_do_not_invent_shortened_paths() {
+    for input in [
+        "[ *example.chat/a*b* c",
+        "[ **example.chat/a**b",
+        "[ ~~example.chat/a~~b",
+    ] {
+        let doc = marmot_markdown::parse(input);
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(!json.contains("https://example.chat/a"), "{input}: {json}");
+    }
+}
+
+#[test]
+fn entity_encoded_domains_are_not_reinterpreted_by_bracket_recovery() {
+    for (input, plain) in [
+        ("example&#46;chat", "example.chat"),
+        ("[ example&#46;chat", "[ example.chat"),
+        ("[ example.chat&#47;x", "[ example.chat/x"),
+    ] {
+        assert_eq!(parse_inlines(input), vec![t(plain)]);
+    }
+}
+
+#[test]
+fn international_labels_are_not_shortened_at_script_transitions() {
+    assert_eq!(
+        parse_inlines("中文example.com"),
+        vec![domain(
+            "中文example.com",
+            "https://xn--example-f43kr94o.com/"
+        )]
+    );
+    assert_eq!(
+        parse_inlines("example.com中文"),
+        vec![domain(
+            "example.com中文",
+            "https://example.xn--com-x68do18h/"
+        )]
+    );
+    assert_eq!(
+        parse_inlines("中文abc.中国"),
+        vec![domain(
+            "中文abc.中国",
+            "https://xn--abc-u68do18h.xn--fiqs8s/"
+        )]
+    );
+}

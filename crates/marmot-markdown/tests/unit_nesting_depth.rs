@@ -323,3 +323,15 @@ fn nesting_just_under_cap_is_preserved() {
     assert!(d >= 2, "modest nesting should still produce nested nodes");
     assert!(d <= DEPTH_CEILING);
 }
+
+#[test]
+fn bare_domain_links_do_not_exceed_the_inline_depth_cap() {
+    for input in [
+        format!("{}example.chat{}", "*".repeat(400), "*".repeat(400)),
+        format!("[ {}example.chat{}", "*".repeat(400), "*".repeat(400)),
+    ] {
+        let doc = parse(&input);
+        assert!(max_inline_depth(&doc) <= DEPTH_CEILING);
+        serde_json::to_string(&doc).expect("serialize bounded domain links");
+    }
+}

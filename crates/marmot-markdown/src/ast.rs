@@ -105,8 +105,9 @@ pub enum Inline {
         dest: String,
         title: Option<String>,
         children: Vec<Inline>,
-        /// Renderer-facing classification. The original destination is
-        /// preserved; clients decide whether it should be actionable.
+        /// Renderer-facing classification. Explicit destinations are preserved;
+        /// bare domains use normalized HTTPS while children preserve display text.
+        /// Clients decide whether a destination should be actionable.
         classification: LinkDestinationKind,
     },
     Image {
