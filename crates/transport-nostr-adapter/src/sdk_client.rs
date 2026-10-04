@@ -156,6 +156,10 @@ pub struct NostrReconciliationSummary {
     pub incomplete_endpoints: Vec<TransportEndpoint>,
     pub remote_items: usize,
     pub received_items: usize,
+    /// Every remote-only ID the completed comparisons named, returned by this
+    /// pass or not. The caller holds the group's epoch until each one is
+    /// durably admitted. Account-private: never log them.
+    pub remote_ids: Vec<[u8; 32]>,
 }
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
@@ -1032,6 +1036,8 @@ impl NostrSdkRelayClient {
         // the same affordable prefix when a later event exceeds the budget.
         // The durable cursor rotates refused and oversized IDs on later passes.
         let remote_item_count = remote.len();
+        let mut named_remote_ids = remote.iter().map(|id| id.to_bytes()).collect::<Vec<_>>();
+        named_remote_ids.sort_unstable();
         let remote_ids = select_reconciliation_remote_ids(&remote, progress)?;
         drop(remote);
         let mut sdk_events = Vec::new();
@@ -1281,6 +1287,7 @@ impl NostrSdkRelayClient {
             incomplete_endpoints: sorted(&incomplete_endpoints),
             remote_items: remote_item_count,
             received_items: remote_events.len(),
+            remote_ids: named_remote_ids,
         };
         Ok((summary, remote_events))
     }

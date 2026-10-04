@@ -51,6 +51,14 @@ struct AdmissionRoute {
     fetched: usize,
     /// What the relays returned, for the attempt's audit row only.
     acquisition: super::super::audit_recovery::RouteAcquisition,
+    /// The group whose epoch this route holds while events the comparison
+    /// named are not yet durably admitted.
+    acquisition_hold: Option<AcquisitionHold>,
+}
+
+struct AcquisitionHold {
+    group_id: cgka_traits::GroupId,
+    transport_group_id: [u8; 32],
 }
 
 fn comparison_failure(error: AppError) -> ClassifiedSyncFailure {
@@ -464,6 +472,7 @@ impl AppClient {
             );
             let mut acquisition = super::super::audit_recovery::RouteAcquisition::default();
             let mut reached_endpoints = Vec::new();
+            let mut acquisition_hold = None;
             let (outcome, certified, answered, events) = match route.result {
                 ComparisonRouteWorkResult::Skipped => {
                     (Outcome::ServicedPartial, false, false, Vec::new())
@@ -506,6 +515,28 @@ impl AppClient {
                         .map_or((Outcome::TransientFailure, false, false), |inventory| {
                             inventory.judge(&summary)
                         });
+                    if let (
+                        Some(super::TransportReconciliationWork::Group(group)),
+                        TransportReconciliationRoute::Group(transport_group_id),
+                    ) = (inventory.map(|inventory| &inventory.work), &route.route)
+                    {
+                        // Hold before admitting anything: a commit in this
+                        // batch must not carry the epoch past a message the
+                        // comparison named and this account does not hold
+                        // yet (mdk#2086). The hold waits for those exact
+                        // events, whichever relay named them.
+                        self.app
+                            .account_storage(&self.state.label)?
+                            .hold_history_acquisition(
+                                &group.group_id,
+                                transport_group_id,
+                                &summary.remote_ids,
+                            )?;
+                        acquisition_hold = Some(AcquisitionHold {
+                            group_id: group.group_id.clone(),
+                            transport_group_id: *transport_group_id,
+                        });
+                    }
                     (outcome, certified, answered, events)
                 }
             };
@@ -523,6 +554,7 @@ impl AppClient {
                 admitted,
                 fetched: 0,
                 acquisition,
+                acquisition_hold,
             });
         }
         Ok(Some(admission))
@@ -849,6 +881,32 @@ impl AppClient {
         }
     }
 
+    /// Settle one compared route's hold. Returns whether named events are
+    /// still missing, and reschedules the group's convergence once nothing
+    /// holds it.
+    fn settle_history_acquisition_hold(
+        &mut self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        hold: &AcquisitionHold,
+        reached: bool,
+    ) -> Result<bool, AppError> {
+        use storage_sqlite::HistoryAcquisitionSettlement as Settlement;
+        let (outstanding, group_unheld) = match storage.settle_history_acquisition_route(
+            &hold.group_id,
+            &hold.transport_group_id,
+            reached,
+        )? {
+            Settlement::Unheld => (false, false),
+            Settlement::Complete { group_unheld } => (false, group_unheld),
+            Settlement::Outstanding { group_unheld } => (true, group_unheld),
+        };
+        if group_unheld {
+            self.pending_convergence_groups
+                .insert(hold.group_id.clone());
+        }
+        Ok(outstanding)
+    }
+
     async fn checkpoint_comparison_admission(
         &mut self,
         grant: &AttemptGrant,
@@ -868,6 +926,19 @@ impl AppClient {
                     .advance_transport_reconciliation_replay_cursor(&route.route, route.cursor)
                     .map_err(|error| comparison_failure(error.into()))?;
             }
+            // A named event this account still lacks is debt, whichever relay
+            // named it: the route must not certify, or settlement would
+            // satisfy the obligation and release the hold before it arrives.
+            let debt_outstanding = match &route.acquisition_hold {
+                Some(hold) => self
+                    .settle_history_acquisition_hold(
+                        &storage,
+                        hold,
+                        !route.reached_endpoints.is_empty(),
+                    )
+                    .map_err(comparison_failure)?,
+                None => false,
+            };
             outcomes.push(super::RouteComparison {
                 route: route.route,
                 outcome: if route.admitted {
@@ -875,7 +946,7 @@ impl AppClient {
                 } else {
                     Outcome::TransientFailure
                 },
-                certified: route.certified && route.admitted,
+                certified: route.certified && route.admitted && !debt_outstanding,
                 fetched: route.fetched,
                 // Incomplete admission withholds the certificate and retries
                 // the route, but the relays still answered.
@@ -884,14 +955,20 @@ impl AppClient {
                 acquisition: route.acquisition,
             });
         }
-        self.settle_recovery_grant(
-            grant,
-            &mut execution.counts,
-            &mut execution.tally,
-            outcomes,
-            admission.summary,
-        )
-        .await
+        let settled = self
+            .settle_recovery_grant(
+                grant,
+                &mut execution.counts,
+                &mut execution.tally,
+                outcomes,
+                admission.summary,
+            )
+            .await?;
+        // Settlement is where an obligation parks, completes or is retired.
+        // A parked one already raised its "history may be incomplete" notice.
+        self.release_unowed_history_acquisition_holds(&storage)
+            .map_err(comparison_failure)?;
+        Ok(settled)
     }
 }
 

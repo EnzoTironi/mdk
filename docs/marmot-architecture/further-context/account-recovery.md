@@ -197,6 +197,37 @@ Every cause runs the same job:
    the tier rules, using the existing revision checks. Old attempts still cannot clear newer
    demand.
 
+**The epoch waits for known history (mdk#2086).** A pass fetches at most 16 events per
+relay, chosen by event id, not time. So a large backlog can deliver every commit before
+some older messages. If the group applied those commits, it would move more than the
+retained-epoch window (5) past those messages, which could then never be decrypted.
+
+- **Debt.** Before admitting a pass's batch, the job records every remote-only event id
+  the comparison named on a group route (`remote_ids`), returned by this pass or not,
+  except ids already admitted. Recording an event as durably admitted removes it from the
+  debt in the same transaction, whatever path admitted it. While a route has debt it does
+  not certify, so settlement cannot satisfy its obligation before the named history
+  arrives, whichever relay named it. A relay that is merely down names nothing and blocks
+  nothing.
+- **Hold.** A route with debt holds its group's epoch: a durable row the engine reads at
+  convergence, next to the deferred-peel barrier. Commits buffer, and the group's own
+  changes (commits, disbands, maintenance commits) queue. Application messages seal under
+  the current epoch and still go out.
+- **Release.** The admission that removes a hold's last debt ends the hold and reschedules
+  the group's convergence, whether the event came live or through recovery and whether or
+  not another comparison pass follows. Any settlement or account open also removes holds
+  and debt on routes that no runnable obligation owes, which covers recovery giving up
+  with its "history may be incomplete" notice.
+- **Backstop.** After 6 settled passes in a row that reached one of the route's relays but
+  admitted none of its debt, the hold stops blocking the epoch. Passes that reach no relay,
+  such as offline ones, never count. Its debt is then abandoned: the group may already be
+  past the epoch a late event needs, so a later admission no longer clears it. The route
+  stays uncertified until recovery parks with its notice, so a scheduler fault costs a
+  notice, never a frozen group or a silent loss.
+
+A pass that admits debt counts as progress, so the hold lasts as long as the download of
+the backlog.
+
 The worker loop never awaits the network. There is one recovery job per account, and
 every cause and every caller runs it:
 
@@ -480,6 +511,9 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   account load after the upgrade stamps each retained route in `account_groups` that has
   none, and persists the stamp in the same step
   (`stamp_unrecorded_prior_route_switches`).
+- Migration 0102 adds `cgka_history_acquisition_holds` (one row per held group and route,
+  with the stall count) and `cgka_history_acquisition_debt` (the exact event ids each
+  hold waits for). Both are removed with the group (mdk#2086).
 - Tables that no code reads any more are dropped in a later migration, once their rows have
   been converted.
 
