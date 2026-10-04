@@ -541,6 +541,7 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     reject_multi_author: std::sync::atomic::AtomicBool,
+    reject_legacy_queries: std::sync::atomic::AtomicBool,
     key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
     key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
     reject_multi_author_incomplete: std::sync::atomic::AtomicBool,
@@ -584,6 +585,13 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         request: crate::relay_plane::DirectoryFetchRequest,
     ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
         self.requests.lock().unwrap().push(request.clone());
+        if self
+            .reject_legacy_queries
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && request.queries.iter().any(|query| query.kind == 443)
+        {
+            return Err("CLOSED: unsupported legacy kind".into());
+        }
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
             if request
@@ -8959,7 +8967,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
             .iter()
             .all(|query| query.authors.len() == 8)
     );
-    assert_eq!(requests[2].queries.len(), 2);
+    assert_eq!(requests[2].queries.len(), 1);
     let package_query = requests[2]
         .queries
         .iter()
@@ -8969,10 +8977,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(package_query.authors.len(), 8);
     assert_eq!(package_query.limit, 8 * 12);
     assert!(
-        requests[2]
-            .queries
-            .iter()
-            .any(|query| query.kind == 443 && query.evidence_only)
+        requests[2].queries.iter().all(|query| query.kind != 443),
+        "a usable current batch must not trigger optional legacy probes"
     );
     drop(requests);
 

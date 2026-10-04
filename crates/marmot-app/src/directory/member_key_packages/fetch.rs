@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::MarmotApp;
 use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
+use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 
 // Search beyond one operational route without unbounded work from an untrusted relay list.
 pub(super) const MAX_DISCOVERY_RELAYS: usize = 64;
@@ -53,56 +54,79 @@ pub(super) async fn fetch_member_directory(
         complete: !endpoints.is_empty() && !budget_exceeded,
         ..Default::default()
     };
-    // Per-endpoint completion lets fast relays release capacity while slow/dead relays
-    // remain bounded. Each request still passes through the operational safety chokepoint.
-    let mut requests = stream::iter(endpoints.into_iter().take(max_relays).map(|endpoint| {
-        let queries = queries.clone();
-        async move {
-            // Draining ready receivers must not start the next queued relay
-            // after the shared deadline. Already-started futures keep their
-            // timeout wrapper, which polls a ready result before its timer.
-            if tokio::time::Instant::now() >= network_deadline {
-                return None;
-            }
-            Some(
-                tokio::time::timeout_at(network_deadline, async move {
-                    app.relay_plane
-                        .fetch_directory_events_with_completion(vec![endpoint], queries)
-                        .await
-                })
-                .await,
-            )
+    // Optional diagnostics use separate REQs: a relay rejecting kind443 must
+    // neither hide a current package nor invalidate a completed current search.
+    let (required_queries, evidence_queries): (Vec<_>, Vec<_>) = queries
+        .iter()
+        .cloned()
+        .partition(|query| !query.evidence_only);
+    result.complete &= !required_queries.is_empty();
+    let query_groups = [(required_queries, true), (evidence_queries, false)]
+        .into_iter()
+        .filter(|(queries, _)| !queries.is_empty())
+        .collect::<Vec<_>>();
+    for (queries, required) in query_groups {
+        // Current publications already supply either a usable key or a typed
+        // validation verdict. Avoid optional probes delaying those results.
+        if !required
+            && result
+                .records
+                .iter()
+                .any(|record| record.event.kind == KIND_MARMOT_KEY_PACKAGE)
+        {
+            break;
         }
-    }))
-    .buffer_unordered(CONCURRENT_RELAY_REQUESTS);
-    loop {
-        match requests.next().await {
-            Some(Some(Ok(Ok(outcome)))) => {
-                // EOSE with a saturated bounded query cannot establish absence or a complete version inventory.
-                let saturated = queries
-                    .iter()
-                    .filter(|query| !query.evidence_only)
-                    .any(|query| {
-                        let mut by_endpoint = BTreeMap::<_, BTreeSet<_>>::new();
-                        for record in outcome
-                            .records
+        let mut requests =
+            stream::iter(endpoints.iter().take(max_relays).cloned().map(|endpoint| {
+                let queries = queries.clone();
+                async move {
+                    // Retain completed receivers without starting queued work after cutoff.
+                    if tokio::time::Instant::now() >= network_deadline {
+                        return None;
+                    }
+                    Some(
+                        tokio::time::timeout_at(network_deadline, async move {
+                            app.relay_plane
+                                .fetch_directory_events_with_completion(vec![endpoint], queries)
+                                .await
+                        })
+                        .await,
+                    )
+                }
+            }))
+            .buffer_unordered(CONCURRENT_RELAY_REQUESTS);
+        loop {
+            match requests.next().await {
+                Some(Some(Ok(Ok(outcome)))) => {
+                    let saturated =
+                        queries
                             .iter()
-                            .filter(|record| record.event.kind == query.kind)
-                        {
-                            for endpoint in &record.endpoints {
-                                by_endpoint
-                                    .entry(endpoint)
-                                    .or_default()
-                                    .insert(&record.event.id);
-                            }
-                        }
-                        by_endpoint.values().any(|ids| ids.len() >= query.limit)
-                    });
-                result.complete &= outcome.complete && !saturated;
-                result.records.extend(outcome.records);
+                            .filter(|query| !query.evidence_only)
+                            .any(|query| {
+                                let mut by_endpoint = BTreeMap::<_, BTreeSet<_>>::new();
+                                for record in outcome
+                                    .records
+                                    .iter()
+                                    .filter(|record| record.event.kind == query.kind)
+                                {
+                                    for endpoint in &record.endpoints {
+                                        by_endpoint
+                                            .entry(endpoint)
+                                            .or_default()
+                                            .insert(&record.event.id);
+                                    }
+                                }
+                                by_endpoint.values().any(|ids| ids.len() >= query.limit)
+                            });
+                    if required {
+                        result.complete &= outcome.complete && !saturated;
+                    }
+                    result.records.extend(outcome.records);
+                }
+                Some(_) if required => result.complete = false,
+                Some(_) => {}
+                None => break,
             }
-            Some(_) => result.complete = false,
-            None => break,
         }
     }
     result
@@ -206,5 +230,20 @@ mod tests {
         assert!(outcome.records.is_empty());
         assert!(tokio::time::Instant::now() >= deadline);
         assert!(tokio::time::Instant::now() <= deadline + Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod metadata_failure_tests {
+    #[test]
+    fn member_directory_invalid_metadata_keeps_a_typed_recipient_failure() {
+        let (result, outcome) = super::super::validate_current_member_key_package(
+            "synthetic-member",
+            crate::KeyPackage::new(vec![0]),
+        );
+        assert_eq!(outcome, "invalid");
+        assert!(
+            matches!(result, Err(crate::AppError::MemberInvalidKeyPackage(ref account)) if account == "synthetic-member")
+        );
     }
 }

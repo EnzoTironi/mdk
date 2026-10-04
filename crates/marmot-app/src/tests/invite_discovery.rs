@@ -497,3 +497,92 @@ async fn invite_discovery_saturated_legacy_history_does_not_obscure_a_completed_
         .unwrap_err();
     assert!(matches!(error, AppError::ObsoleteKeyPackage(_)));
 }
+
+#[tokio::test]
+async fn invite_discovery_legacy_probe_rejection_cannot_hide_current_keys_or_absence() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    fetcher
+        .reject_legacy_queries
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    app.resolve_member_key_packages(&[account.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let requests = fetcher.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.queries.iter().all(|q| q.kind != 443))
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| !(r.queries.iter().any(|q| q.kind == 443)
+                && r.queries.iter().any(|q| q.kind == KIND_MARMOT_KEY_PACKAGE)))
+    );
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    let error = app
+        .resolve_member_key_packages(&[account.account_id_hex.as_str()])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::MissingKeyPackage(ref id) if id == &account.account_id_hex));
+    assert!(
+        fetcher
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.queries.iter().any(|q| q.kind == 443))
+    );
+}
+
+#[tokio::test]
+async fn invite_discovery_future_legacy_evidence_cannot_downgrade_current_absence() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let legacy = fresh_key_package_for_account(&app, account, true).await;
+    let mut event = member_resolution_key_package_event(account, legacy);
+    event.kind = 443;
+    event.created_at += 86400;
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    fetcher.events.lock().unwrap().push(event);
+    let error = app
+        .resolve_member_key_packages(&[account.account_id_hex.as_str()])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::MissingKeyPackage(ref id) if id == &account.account_id_hex));
+}
+
+#[tokio::test]
+async fn invite_discovery_classifies_hex_legacy_evidence_without_admitting_it() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let legacy = fresh_key_package_for_account(&app, account, true).await;
+    let content = hex::encode(legacy.bytes());
+    let mut event = member_resolution_key_package_event(account, legacy);
+    event.kind = 443;
+    event.content = content;
+    event
+        .tags
+        .retain(|tag| tag.first().map(String::as_str) != Some("encoding"));
+    event.tags.push(vec!["encoding".into(), "hex".into()]);
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    fetcher.events.lock().unwrap().push(event);
+    let error = app
+        .resolve_member_key_packages(&[account.account_id_hex.as_str()])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::ObsoleteKeyPackage(ref id) if id == &account.account_id_hex));
+}

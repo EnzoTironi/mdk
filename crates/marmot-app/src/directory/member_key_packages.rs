@@ -63,7 +63,7 @@ fn records_have_future_packages(
 ) -> bool {
     records.iter().any(|record| {
         record.event.pubkey == account
-            && matches!(record.event.kind, KIND_MARMOT_KEY_PACKAGE | 443)
+            && record.event.kind == KIND_MARMOT_KEY_PACKAGE
             && !freshness.accepts(record)
     })
 }
@@ -1239,7 +1239,7 @@ fn validate_current_member_key_package(
                     cgka_traits::EngineError::InvalidKeyPackageLifetime { .. } => {
                         AppError::MemberInvalidKeyPackageLifetime(account_id_hex.to_owned())
                     }
-                    error => AppError::InvalidKeyPackageEvent(error.to_string()),
+                    _ => AppError::MemberInvalidKeyPackage(account_id_hex.to_owned()),
                 }),
                 "invalid",
             );

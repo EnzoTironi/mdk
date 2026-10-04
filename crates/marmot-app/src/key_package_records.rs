@@ -302,7 +302,12 @@ pub(crate) fn obsolete_key_package_observed(
         if record.event.kind != 443 {
             return false;
         }
-        let Ok(bytes) = BASE64_STANDARD.decode(record.event.content.as_bytes()) else {
+        let bytes = match record.event.tag_value("encoding") {
+            Some("hex") => hex::decode(&record.event.content).ok(),
+            None | Some("base64") => BASE64_STANDARD.decode(record.event.content.as_bytes()).ok(),
+            _ => None,
+        };
+        let Some(bytes) = bytes else {
             return false;
         };
         let package = KeyPackage::new(bytes).with_protocol_profile(ProtocolProfile::Legacy);

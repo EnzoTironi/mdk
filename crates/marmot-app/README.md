@@ -194,7 +194,9 @@ the MLS add.
 - Invitation failures distinguish completed missing/current-version searches, verified obsolete-only packages,
   incomplete discovery, exhausted relay budgets, invalid or incompatible packages, invalid lifetimes, and missing
   inbox routes. Hosts should localize these typed failures; incomplete acquisition is not proof of absence, and legacy
-  packages are diagnostic evidence only. The 50-second total deadline reserves two seconds after network acquisition
+  packages are diagnostic evidence only. Optional legacy probes use separate requests after current searches and are
+  skipped when a current publication is available; rejection or future-dated legacy evidence cannot downgrade a
+  completed current-package search. The 50-second total deadline reserves two seconds after network acquisition
   for validation and classification while preserving completed positive results.
 - Directory diagnostics (such as `wn keys check` / `keys fetch`) may still describe cached public packages. Their availability
   result is advisory and does not guarantee a fresh relay lookup or acceptance by the create/invite admission policy.
