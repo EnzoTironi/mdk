@@ -1183,6 +1183,20 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::Sqlite(_) => "read_marker_failed:sqlite",
         AppError::Hex(_) => "read_marker_failed:hex",
         AppError::MissingKeyPackage(_) => "read_marker_failed:missing_key_package",
+        AppError::ObsoleteKeyPackage(_) => "read_marker_failed:obsolete_key_package",
+        AppError::MemberDiscoveryIncomplete(_) => "read_marker_failed:member_discovery_incomplete",
+        AppError::MemberRelayBudgetExceeded(_) => "read_marker_failed:member_relay_budget_exceeded",
+        AppError::MemberNoUsableDiscoveryRelays(_) => {
+            "read_marker_failed:member_no_usable_discovery_relays"
+        }
+        AppError::MemberInvalidKeyPackage(_) => "read_marker_failed:member_invalid_key_package",
+        AppError::MemberInvalidKeyPackageLifetime(_) => {
+            "read_marker_failed:member_invalid_key_package_lifetime"
+        }
+        AppError::MemberIncompatibleKeyPackage(_) => {
+            "read_marker_failed:member_incompatible_key_package"
+        }
+        AppError::MemberDiscoveryTimeout => "read_marker_failed:member_discovery_timeout",
         AppError::MissingMemberInboxRoute(_) => "read_marker_failed:missing_member_inbox_route",
         AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",

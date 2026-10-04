@@ -7,6 +7,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Invitation-discovery status codes 96–103 distinguish obsolete packages,
+  incomplete searches, relay budgets, unusable discovery routes, invalid
+  packages and lifetimes, incompatible capabilities, and timeouts. Existing
+  status values remain unchanged; use the matching generated header and library.
+
 ## [0.12.0] - 2026-10-02
 
 Recompile against the matching `marmot.h` and library: several signatures and

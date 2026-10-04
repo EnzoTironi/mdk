@@ -244,7 +244,8 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
             .count();
         assert_eq!(
             single_author_lookups,
-            if reject_batch || truncate_batch { 2 } else { 0 }
+            if reject_batch || truncate_batch { 4 } else { 0 },
+            "each fallback author searches the configured and advertised endpoint"
         );
         assert_eq!(
             actual
@@ -361,14 +362,11 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
                 .err()
                 .expect("unusable batch material must not become a fallback");
             match batch_case {
-                "absent" => assert!(matches!(error, AppError::RelayDirectory(_))),
-                "malformed" => assert!(matches!(error, AppError::InvalidKeyPackageEvent(_))),
-                "incompatible" => assert!(matches!(
-                    error,
-                    AppError::Session(cgka_session::SessionError::Engine(
-                        cgka_traits::EngineError::MissingRequiredCapabilities { .. }
-                    ))
-                )),
+                "absent" => assert!(matches!(error, AppError::MemberDiscoveryIncomplete(_))),
+                "malformed" => assert!(matches!(error, AppError::MemberInvalidKeyPackage(_))),
+                "incompatible" => {
+                    assert!(matches!(error, AppError::MemberIncompatibleKeyPackage(_)))
+                }
                 _ => unreachable!(),
             }
         }

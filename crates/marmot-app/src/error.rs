@@ -224,6 +224,27 @@ pub enum AppError {
     ExternalSignerMismatch,
     #[error("external signer request was rejected or cancelled by the user")]
     ExternalSignerRejected,
+    /// A cryptographically validated legacy package was observed, but no current package
+    /// was found in the completed bounded acquisition. Never admits legacy bytes to a new group.
+    #[error("member has only obsolete KeyPackages on the searched relays")]
+    ObsoleteKeyPackage(String),
+    /// Negative discovery is unproven: a timeout, CLOSED, saturation or transport failure
+    /// prevented completion. The account id supports recipient-specific host guidance.
+    #[error("member discovery did not complete")]
+    MemberDiscoveryIncomplete(String),
+    /// Positive packages remain usable even when an untrusted relay list exceeds the work budget.
+    #[error("member relay list exceeds the bounded discovery budget")]
+    MemberRelayBudgetExceeded(String),
+    #[error("member has no usable discovery relay and no configured fallback")]
+    MemberNoUsableDiscoveryRelays(String),
+    #[error("member published package failed validation")]
+    MemberInvalidKeyPackage(String),
+    #[error("member package lifetime is invalid")]
+    MemberInvalidKeyPackageLifetime(String),
+    #[error("member package lacks required group capabilities")]
+    MemberIncompatibleKeyPackage(String),
+    #[error("member discovery timed out before group mutation")]
+    MemberDiscoveryTimeout,
     #[error("invalid Marmot KeyPackage event: {0}")]
     InvalidKeyPackageEvent(String),
     #[error("no directory entry for account")]
@@ -462,6 +483,14 @@ impl AppError {
             Self::ExternalSignerUnavailable(_) => "external_signer_unavailable",
             Self::ExternalSignerMismatch => "external_signer_mismatch",
             Self::ExternalSignerRejected => "external_signer_rejected",
+            Self::ObsoleteKeyPackage(_) => "obsolete_key_package",
+            Self::MemberDiscoveryIncomplete(_) => "member_discovery_incomplete",
+            Self::MemberRelayBudgetExceeded(_) => "member_relay_budget_exceeded",
+            Self::MemberNoUsableDiscoveryRelays(_) => "member_no_usable_discovery_relays",
+            Self::MemberInvalidKeyPackage(_) => "member_invalid_key_package",
+            Self::MemberInvalidKeyPackageLifetime(_) => "member_invalid_key_package_lifetime",
+            Self::MemberIncompatibleKeyPackage(_) => "member_incompatible_key_package",
+            Self::MemberDiscoveryTimeout => "member_discovery_timeout",
             Self::InvalidKeyPackageEvent(_) => "invalid_key_package_event",
             Self::MissingDirectoryEntry(_) => "missing_directory_entry",
             Self::InvalidDirectorySearch(_) => "invalid_directory_search",
@@ -536,7 +565,11 @@ impl AppError {
             Self::Session(error) => session_error_class(error),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
-            Self::RelayDirectory(_) => SyncErrorClass::RelayDirectory,
+            Self::RelayDirectory(_)
+            | Self::MemberDiscoveryIncomplete(_)
+            | Self::MemberRelayBudgetExceeded(_)
+            | Self::MemberNoUsableDiscoveryRelays(_) => SyncErrorClass::RelayDirectory,
+            Self::MemberDiscoveryTimeout => SyncErrorClass::Timeout,
             Self::AccountCatchUp(error) => error.classification().error_class,
             Self::FullHistoryRepairIncomplete { reason, .. } => match reason {
                 FullHistoryRepairIncompleteReason::Cancelled => SyncErrorClass::Cancelled,
@@ -553,7 +586,11 @@ impl AppError {
             | Self::InvalidAppMessagePayload(_)
             | Self::InvalidAppComponent(_)
             | Self::InvalidNostrRouting(_)
-            | Self::InvalidKeyPackageEvent(_) => SyncErrorClass::Protocol,
+            | Self::InvalidKeyPackageEvent(_)
+            | Self::MemberInvalidKeyPackage(_)
+            | Self::MemberInvalidKeyPackageLifetime(_)
+            | Self::MemberIncompatibleKeyPackage(_)
+            | Self::ObsoleteKeyPackage(_) => SyncErrorClass::Protocol,
             _ => SyncErrorClass::Unknown,
         }
     }

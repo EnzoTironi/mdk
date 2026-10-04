@@ -183,6 +183,25 @@ pub(crate) fn preferred_fresh_key_package_from_records(
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
 ) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
+    preferred_key_package_from_records(account_id_hex, records, freshness, requirements, false)
+}
+
+pub(crate) fn preferred_member_key_package_from_records(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
+    preferred_key_package_from_records(account_id_hex, records, freshness, requirements, true)
+}
+
+fn preferred_key_package_from_records(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    classify_member_failure: bool,
+) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
     let mut records = records.iter().collect::<Vec<_>>();
     records.sort_by(|a, b| {
         a.event
@@ -212,12 +231,27 @@ pub(crate) fn preferred_fresh_key_package_from_records(
             continue;
         }
         let priority = key_package_client_priority(&record.event);
-        let fetched = match key_package_from_borrowed_record(record) {
+        let parsed = if classify_member_failure {
+            key_package_from_borrowed_record_for_profile(record, ProtocolProfile::Current)
+        } else {
+            key_package_from_borrowed_record(record)
+        };
+        let fetched = match parsed {
             Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
                 fetched
             }
             Ok(_) => continue,
             Err(error) => {
+                let error = if classify_member_failure
+                    && obsolete_key_package_observed(
+                        account_id_hex,
+                        std::slice::from_ref(record),
+                        freshness,
+                    ) {
+                    AppError::ObsoleteKeyPackage(account_id_hex.to_owned())
+                } else {
+                    error
+                };
                 newest_error.get_or_insert(error);
                 continue;
             }
@@ -245,6 +279,37 @@ pub(crate) fn preferred_fresh_key_package_from_records(
     Ok(DirectorySelection {
         value: selected,
         rejected_future,
+    })
+}
+
+/// Read-only diagnosis of v1 publications. Client labels and advertised extension tags
+/// are not protocol evidence: the decoded MLS signature, lifetime and account proof must validate.
+pub(crate) fn obsolete_key_package_observed(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+) -> bool {
+    records.iter().any(|record| {
+        if record.event.pubkey != account_id_hex || !freshness.accepts(record) {
+            return false;
+        }
+        if record.event.kind == KIND_MARMOT_KEY_PACKAGE {
+            return key_package_from_borrowed_record_for_profile(record, ProtocolProfile::Legacy)
+                .is_ok_and(|fetched| {
+                    fetched.key_package.protocol_profile == ProtocolProfile::Legacy
+                });
+        }
+        if record.event.kind != 443 {
+            return false;
+        }
+        let Ok(bytes) = BASE64_STANDARD.decode(record.event.content.as_bytes()) else {
+            return false;
+        };
+        let package = KeyPackage::new(bytes).with_protocol_profile(ProtocolProfile::Legacy);
+        key_package_metadata(&package).is_ok_and(|metadata| {
+            metadata.protocol_profile == ProtocolProfile::Legacy
+                && metadata.credential_identity_hex == account_id_hex
+        })
     })
 }
 
@@ -367,6 +432,20 @@ pub(crate) fn key_package_from_record(
 fn key_package_from_borrowed_record(
     record: &RelayEventRecord,
 ) -> Result<FetchedKeyPackage, AppError> {
+    key_package_from_borrowed_record_for_profile(record, ProtocolProfile::Current).map_err(
+        |error| match error {
+            AppError::MemberInvalidKeyPackageLifetime(_) => {
+                AppError::InvalidKeyPackageEvent("KeyPackage lifetime is invalid".into())
+            }
+            error => error,
+        },
+    )
+}
+
+fn key_package_from_borrowed_record_for_profile(
+    record: &RelayEventRecord,
+    profile: ProtocolProfile,
+) -> Result<FetchedKeyPackage, AppError> {
     let event = &record.event;
     require_key_package_tag(event, "mls_protocol_version", |value| value == "1.0")?;
     let key_package_id = event
@@ -387,18 +466,19 @@ fn key_package_from_borrowed_record(
             "empty key package content".into(),
         ));
     }
-    // Strict cutover only permits relay-fetched KeyPackages for new joins to
-    // use the current profile. Annotate the transport DTO before decoding its
-    // proof/profile metadata; the raw-byte constructor defaults to Legacy for
-    // backward-compatible callers and would otherwise misclassify every
-    // freshly published current KeyPackage.
+    // The admission wrapper forces Current. Legacy is used only by the boolean
+    // diagnostic validator above, which never exposes a package to a group mutation.
     let key_package = KeyPackage::with_source_event_id(
         key_package_bytes,
         key_package_event_id_from_hex(&event.id)?,
     )
-    .with_protocol_profile(ProtocolProfile::Current);
-    let metadata = key_package_metadata(&key_package)
-        .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    .with_protocol_profile(profile);
+    let metadata = key_package_metadata(&key_package).map_err(|error| match error {
+        cgka_traits::EngineError::InvalidKeyPackageLifetime { .. } => {
+            AppError::MemberInvalidKeyPackageLifetime(event.pubkey.clone())
+        }
+        error => AppError::InvalidKeyPackageEvent(error.to_string()),
+    })?;
     require_key_package_tag(event, "mls_ciphersuite", |value| {
         value == format!("0x{:04x}", metadata.ciphersuite)
     })?;

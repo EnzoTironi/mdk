@@ -56,6 +56,10 @@ for each release.
 - Every fallible function returns `MarmotStatus` (`MARMOT_STATUS_OK` is
   0); detail text for the calling thread's most recent failure comes from
   `marmot_last_error_message()` (free with `marmot_string_free`).
+  Invitation discovery has distinct status codes for obsolete packages,
+  incomplete searches, relay budgets, unusable routes, invalid packages and
+  lifetimes, incompatible capabilities, and timeouts. These detail strings
+  omit recipient identifiers; status codes carry the diagnosis.
 - Structs returned by pointer are freed ONLY with their matching
   `marmot_*_free`, which deep-frees every field. Never free fields
   individually, never free twice; NULL is always a no-op.

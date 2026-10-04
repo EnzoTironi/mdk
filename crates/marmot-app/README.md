@@ -187,6 +187,15 @@ the MLS add.
   requests a fresh readiness signal, so debounce roster changes. The process-local prewarm cache keeps only bounded
   relay metadata; only completed discovery and advertised-outbox metadata hops renew its freshness deadline, and a
   usable package returned after an incomplete metadata hop does not make previously cached routes fresh.
+- A failed lookup using prewarmed routes refreshes those relay lists once within the same deadline. It preserves
+  key-package replacements already observed, so a stale route cannot revive retired private material. Safe, normalized
+  recipient routes are searched up to 64 distinct endpoints, with 16 concurrent requests per endpoint set and a
+  separately bounded configured fallback. Large lists do not fail before trying usable routes.
+- Invitation failures distinguish completed missing/current-version searches, verified obsolete-only packages,
+  incomplete discovery, exhausted relay budgets, invalid or incompatible packages, invalid lifetimes, and missing
+  inbox routes. Hosts should localize these typed failures; incomplete acquisition is not proof of absence, and legacy
+  packages are diagnostic evidence only. The 50-second total deadline reserves two seconds after network acquisition
+  for validation and classification while preserving completed positive results.
 - Directory diagnostics (such as `wn keys check` / `keys fetch`) may still describe cached public packages. Their availability
   result is advisory and does not guarantee a fresh relay lookup or acceptance by the create/invite admission policy.
 
