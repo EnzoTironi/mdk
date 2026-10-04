@@ -211,19 +211,25 @@ retained-epoch window (5) past those messages, which could then never be decrypt
   nothing.
 - **Hold.** A route with debt holds its group's epoch: a durable row the engine reads at
   convergence, next to the deferred-peel barrier. Commits buffer, and the group's own
-  changes (commits, disbands, maintenance commits) queue. Application messages seal under
-  the current epoch and still go out.
+  changes (commits, disbands, maintenance commits) queue. Application messages keep the
+  ordinary convergence gate: they go out unless a retained commit is waiting. Once a held
+  commit is retained, chat queues until release, because a member catching up is behind
+  and a message sealed under its stale epoch could be unreadable to peers more than 5
+  epochs ahead.
 - **Release.** The admission that removes a hold's last debt ends the hold and reschedules
   the group's convergence, whether the event came live or through recovery and whether or
   not another comparison pass follows. Any settlement or account open also removes holds
   and debt on routes that no runnable obligation owes, which covers recovery giving up
   with its "history may be incomplete" notice.
-- **Backstop.** After 6 settled passes in a row that reached one of the route's relays but
-  admitted none of its debt, the hold stops blocking the epoch. Passes that reach no relay,
-  such as offline ones, never count. Its debt is then abandoned: the group may already be
-  past the epoch a late event needs, so a later admission no longer clears it. The route
-  stays uncertified until recovery parks with its notice, so a scheduler fault costs a
-  notice, never a frozen group or a silent loss.
+- **Backstop.** After 6 settled passes in a row on which every relay of the route answered
+  but none served any of its debt, the hold stops blocking the epoch. A pass counts only when
+  every one of the route's relays answered: a relay that is down may hold the named
+  history, so the hold waits it out. Once the limit is reached, every relay is reachable
+  yet none serves the named events, so the debt is abandoned: the group may already be past
+  the epoch a late event needs, so a later admission no longer clears it, and the route
+  stays uncertified until recovery parks with its notice. The trade-off is deliberate: a
+  relay that stays down keeps its group held until it returns or recovery parks, rather
+  than risk applying commits past history that relay may still deliver.
 
 A pass that admits debt counts as progress, so the hold lasts as long as the download of
 the backlog.

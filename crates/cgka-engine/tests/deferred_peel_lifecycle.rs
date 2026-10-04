@@ -1686,8 +1686,8 @@ async fn history_acquisition_hold_defers_convergence_until_released() {
 
 /// A held group queues local group-state work too: a commit this device
 /// publishes would advance the epoch past history the hold is waiting for,
-/// even before any remote commit is retained (mdk#2086). Application
-/// messages seal under the current epoch and still go out.
+/// even before any remote commit is retained (mdk#2086). With no retained
+/// commit waiting, an application message still goes out.
 #[tokio::test]
 async fn history_acquisition_hold_queues_local_commits() {
     let (_alice, mut carol, carol_storage, _carol_peeler, group_id, _commit2, _commit3) =
@@ -1732,6 +1732,57 @@ async fn history_acquisition_hold_queues_local_commits() {
             .iter()
             .any(|result| matches!(result, SendResult::GroupEvolution { .. })),
         "release lets the queued commit go out, got {drained:?}"
+    );
+}
+
+/// Once a held commit is retained, an application message waits for it like
+/// it waits behind any unresolved convergence: a member that is catching up
+/// is behind, and sealing under its stale epoch could leave the message
+/// unreadable to peers more than the retained-epoch window ahead. It goes out
+/// at the converged tip after release (mdk#2086).
+#[tokio::test]
+async fn history_acquisition_hold_queues_chat_behind_a_retained_commit() {
+    let (_alice, mut carol, carol_storage, _carol_peeler, group_id, commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    carol_storage
+        .hold_history_acquisition(&group_id, &[9; 32], &[[1; 32]])
+        .unwrap();
+    carol.ingest(commit2).await.unwrap();
+
+    let result = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, "after catch-up"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, SendResult::Queued { .. }),
+        "chat waits behind the held commit, got {result:?}"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+
+    assert!(
+        carol_storage
+            .release_history_acquisition_hold(&group_id, &[9; 32])
+            .unwrap()
+    );
+    let mut drained = Vec::new();
+    for now_ms in 1_000_001..1_000_004 {
+        drained.extend(
+            carol
+                .converge_and_drain_queued_outbound_intents(&group_id, now_ms)
+                .await
+                .unwrap(),
+        );
+    }
+    assert!(carol.epoch(&group_id).unwrap() >= EpochId(2));
+    assert!(
+        drained
+            .iter()
+            .any(|result| matches!(result, SendResult::ApplicationMessage { .. })),
+        "the queued chat goes out at the converged tip, got {drained:?}"
     );
 }
 

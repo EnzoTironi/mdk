@@ -1005,9 +1005,10 @@ impl<S: StorageProvider> Engine<S> {
         if !settled {
             return Ok(Vec::new());
         }
-        // While a history-acquisition hold keeps the epoch (mdk#2086), only
-        // application messages drain: disbands, queued group-state intents
-        // and maintenance commits wait for the caller to release the hold.
+        // While a history-acquisition hold keeps the epoch (mdk#2086),
+        // disbands, queued group-state intents and maintenance commits wait
+        // for the caller to release the hold. Application messages drain
+        // whenever convergence has settled.
         let acquisition_held = self.storage.history_acquisition_held(group_id)?;
         if !acquisition_held && let Some(result) = self.prepare_pending_disband(group_id).await? {
             return Ok(vec![result]);
@@ -1231,8 +1232,9 @@ impl<S: StorageProvider> Engine<S> {
 
         // A history-acquisition hold keeps the epoch until the caller has the
         // history it is waiting for (mdk#2086). A local commit would move it
-        // as surely as a remote one, so group-state work queues; application
-        // messages seal under the current epoch and still go out.
+        // as surely as a remote one, so group-state work queues. Application
+        // messages keep the ordinary convergence gate below: they go out
+        // unless a retained commit is waiting, held or not.
         let acquisition_held = self.storage.history_acquisition_held(group_id)?;
         if acquisition_held && !matches!(intent, SendIntent::AppMessage { .. }) {
             return Ok(true);

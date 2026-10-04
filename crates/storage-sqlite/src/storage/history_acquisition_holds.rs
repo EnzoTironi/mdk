@@ -12,11 +12,14 @@ use cgka_traits::storage::{HistoryAcquisitionHoldStorage, StorageResult};
 use cgka_traits::types::GroupId;
 use rusqlite::{OptionalExtension, params};
 
-/// Settled passes in a row that reached a relay for the route but admitted
-/// none of its debt, after which the hold stops blocking the epoch. Its debt
-/// is then abandoned: a late admission may already be too late to decrypt,
-/// so it no longer clears the debt, the route never certifies again, and
-/// recovery ends with its "history may be incomplete" notice.
+/// Settled passes in a row on which every relay of the route answered but
+/// none served any of its debt, after which the hold stops blocking the epoch.
+/// A pass with any relay down never counts: that relay may be the one holding
+/// the named history, so the hold waits it out. Reaching the limit means every
+/// relay is reachable yet none serves the named events, so the debt is
+/// abandoned: a late admission may already be too late to decrypt and no
+/// longer clears it, the route never certifies again, and recovery ends with
+/// its "history may be incomplete" notice.
 pub const HISTORY_ACQUISITION_STALL_PASSES: u64 = 6;
 
 /// What settling one compared route's hold found.
@@ -85,14 +88,13 @@ impl SqliteAccountStorage {
     }
 
     /// Settle the hold `transport_group_id` places on `group_id` after a
-    /// comparison pass. `reached` says the pass reached at least one of the
-    /// route's relays; a pass that reached none, such as one made offline,
-    /// never counts toward the stall backstop.
+    /// comparison pass. `every_relay_answered` says every one of the route's
+    /// relays answered; only such passes count toward the stall backstop.
     pub fn settle_history_acquisition_route(
         &self,
         group_id: &GroupId,
         transport_group_id: &[u8; 32],
-        reached: bool,
+        every_relay_answered: bool,
     ) -> StorageResult<HistoryAcquisitionSettlement> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -117,7 +119,7 @@ impl SqliteAccountStorage {
             }
             let stalled = if admitted > 0 {
                 0
-            } else if reached {
+            } else if every_relay_answered {
                 stalled.saturating_add(1)
             } else {
                 stalled
@@ -357,10 +359,10 @@ mod tests {
         store: &SqliteAccountStorage,
         group: &GroupId,
         route: [u8; 32],
-        reached: bool,
+        every_relay_answered: bool,
     ) -> HistoryAcquisitionSettlement {
         store
-            .settle_history_acquisition_route(group, &route, reached)
+            .settle_history_acquisition_route(group, &route, every_relay_answered)
             .unwrap()
     }
 
@@ -441,7 +443,7 @@ mod tests {
         store
             .hold_history_acquisition(&group.id, &[7; 32], &[[1; 32], [2; 32]])
             .unwrap();
-        // Passes that reach no relay never count.
+        // Passes on which a relay was down never count.
         for _ in 0..HISTORY_ACQUISITION_STALL_PASSES * 2 {
             settle(&store, &group.id, [7; 32], false);
         }

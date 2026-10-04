@@ -59,6 +59,9 @@ struct AdmissionRoute {
 struct AcquisitionHold {
     group_id: cgka_traits::GroupId,
     transport_group_id: [u8; 32],
+    /// Every relay on the route answered the comparison, so none of them
+    /// can be silently holding the named history back.
+    every_relay_answered: bool,
 }
 
 fn comparison_failure(error: AppError) -> ClassifiedSyncFailure {
@@ -535,6 +538,8 @@ impl AppClient {
                         acquisition_hold = Some(AcquisitionHold {
                             group_id: group.group_id.clone(),
                             transport_group_id: *transport_group_id,
+                            every_relay_answered: summary.relays_failed == 0
+                                && summary.relays_succeeded > 0,
                         });
                     }
                     (outcome, certified, answered, events)
@@ -888,13 +893,13 @@ impl AppClient {
         &mut self,
         storage: &storage_sqlite::SqliteAccountStorage,
         hold: &AcquisitionHold,
-        reached: bool,
+        every_relay_answered: bool,
     ) -> Result<bool, AppError> {
         use storage_sqlite::HistoryAcquisitionSettlement as Settlement;
         let (outstanding, group_unheld) = match storage.settle_history_acquisition_route(
             &hold.group_id,
             &hold.transport_group_id,
-            reached,
+            every_relay_answered,
         )? {
             Settlement::Unheld => (false, false),
             Settlement::Complete { group_unheld } => (false, group_unheld),
@@ -931,11 +936,7 @@ impl AppClient {
             // satisfy the obligation and release the hold before it arrives.
             let debt_outstanding = match &route.acquisition_hold {
                 Some(hold) => self
-                    .settle_history_acquisition_hold(
-                        &storage,
-                        hold,
-                        !route.reached_endpoints.is_empty(),
-                    )
+                    .settle_history_acquisition_hold(&storage, hold, hold.every_relay_answered)
                     .map_err(comparison_failure)?,
                 None => false,
             };

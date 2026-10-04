@@ -410,12 +410,12 @@ async fn a_dead_best_effort_relay_does_not_block_the_release() {
     );
 }
 
-/// Once the stall backstop releases a hold, the group may already have moved
-/// past the epoch its debt needs. A late arrival must not then clear that
-/// debt and let recovery complete silently: the route ends with a history
-/// notice instead (mdk#2086).
+/// A relay that is down may be the one holding the named history, so it must
+/// not run the stall backstop out while another relay answers empty. The
+/// hold waits for the naming relay to return; the history then arrives in
+/// time and the hold ends normally (mdk#2086).
 #[tokio::test]
-async fn history_arriving_after_the_backstop_still_ends_in_a_notice() {
+async fn a_silent_naming_relay_keeps_the_hold_while_another_relay_answers() {
     use cgka_traits::storage::HistoryAcquisitionHoldStorage;
     const OPERATED: &str = "wss://operated.example";
     const BEST_EFFORT: &str = "wss://best-effort.example";
@@ -437,7 +437,7 @@ async fn history_arriving_after_the_backstop_still_ends_in_a_notice() {
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let group_id = client
         .create_group_with_options(
-            "late arrival",
+            "silent naming relay",
             &[],
             crate::AppCreateGroupOptions {
                 relays: Some(vec![OPERATED.into(), BEST_EFFORT.into()]),
@@ -458,9 +458,9 @@ async fn history_arriving_after_the_backstop_still_ends_in_a_notice() {
     .await;
     assert!(storage.history_acquisition_held(&group_id).unwrap());
 
-    // The operated relay then fails while the best-effort relay answers:
-    // recovery cannot spend its parking budget, but the backstop counts.
-    for _ in 0..storage_sqlite::HISTORY_ACQUISITION_STALL_PASSES {
+    // The operated relay then fails while the best-effort relay answers
+    // empty, for well past the stall limit.
+    for _ in 0..storage_sqlite::HISTORY_ACQUISITION_STALL_PASSES * 2 {
         run_group_comparison(&mut client, &storage, |_| NostrReconciliationSummary {
             relays_succeeded: 1,
             relays_failed: 1,
@@ -468,32 +468,14 @@ async fn history_arriving_after_the_backstop_still_ends_in_a_notice() {
             ..Default::default()
         })
         .await;
-    }
-    assert!(
-        !storage.history_acquisition_held(&group_id).unwrap(),
-        "the backstop released the epoch"
-    );
-    assert!(storage.parked_recovery_obligations().unwrap().is_empty());
-
-    // The operated relay recovers and the event finally arrives, possibly
-    // too late to decrypt. Clean passes must not complete recovery silently.
-    admit_named(&app, &group_id);
-    for _ in 0..storage_sqlite::RECOVERY_PARK_AFTER_QUIET_PASSES {
-        run_group_comparison(&mut client, &storage, |_| NostrReconciliationSummary {
-            relays_succeeded: 2,
-            ..Default::default()
-        })
-        .await;
         assert!(
-            !storage.pending_recovery_demands().unwrap().is_empty(),
-            "recovery never completes over abandoned debt"
+            storage.history_acquisition_held(&group_id).unwrap(),
+            "the epoch waits for the relay that named the history"
         );
-        if !storage.parked_recovery_obligations().unwrap().is_empty() {
-            break;
-        }
     }
-    assert!(
-        !storage.parked_recovery_obligations().unwrap().is_empty(),
-        "abandoned history is reported, not silently completed"
-    );
+
+    // The operated relay returns the event, still in time to decrypt.
+    admit_named(&app, &group_id);
+    assert!(!storage.history_acquisition_held(&group_id).unwrap());
+    assert!(storage.parked_recovery_obligations().unwrap().is_empty());
 }

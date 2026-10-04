@@ -30,9 +30,10 @@
   changes queue, so older messages can still be decrypted when they arrive.
   The hold ends when every named event is stored, or when recovery gives up
   on the route, which shows the "history may be incomplete" notice. After 6
-  passes that reach a relay without admitting any of those events, the group
-  stops waiting and the route ends with that notice, even if the events arrive
-  later. Chat messages are never held (#2086).
+  passes on which every relay answered but none served those events, the
+  group stops waiting and the route ends with that notice, even if the events
+  arrive later. Chat sent while a held commit waits is queued and goes out
+  once the group catches up (#2086).
 
 ## 0.12.0 - 2026-10-02
 
