@@ -2,14 +2,15 @@
 
 ## Unreleased
 
-### Added
+### Breaking changes
 
 - `PresentedChatRowFfi.draft_version` correlates the presented row's draft
   metadata with a captured composer revision through
   `MessageDraftRevisionFfi::includes_chat_list_version`. Regenerate Swift/Kotlin
-  bindings with the matching library and update host-constructed row records
-  for the new optional field. Keep these opaque versions device-local and use
-  revision-checked draft cleanup after local send acceptance.
+  bindings with the matching library. Host-constructed row records must pass
+  `nil` (Swift), `null` (Kotlin), or a version for the new optional field. Keep
+  these opaque versions device-local and use revision-checked draft cleanup
+  after local send acceptance.
 
 ### Changed
 
