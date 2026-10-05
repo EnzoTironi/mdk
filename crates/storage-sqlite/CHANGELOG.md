@@ -4,16 +4,32 @@
 
 ### Added
 
+- Test-only `test-migrated-template` feature adds
+  `SqliteAccountStorage::in_memory_from_migrated_template`, which copies one
+  migrated in-memory database per process instead of replaying every migration
+  for each open. Harnesses that open thousands of databases use it.
+
+## 0.12.0 - 2026-10-02
+
+Account storage advances from migration 98 through 101 on first open; downgrade
+is unsupported.
+
+### Added
+
+- Migration 0100 keeps a tapped attachment's explicit priority when its
+  history row is reprojected, and migration 0101
+  adds bounded outgoing-upload staging records, written after the blob upload
+  and before publication; confirmed sends later promote them to retained
+  attachment bytes.
+  (#2142)
+
 - `SqliteAccountStorage::poll_votes` pages each voter's effective selection for
   one visible poll (1..=100 per page, `(voted_at, voter)` cursor). The timeline
   tally and this read share one resolver, so the per-voter pages always sum to
   `PollProjection`'s counts and `participants`. (#2091)
-
-### Fixed
-
-- Certifying incremental-history debt through a full-history repair now settles the
-  pending recovery comparison, so a comparison with no work left is no longer selected
-  ahead of other recovery causes. (#2100)
+- `SqliteAccountStorage::defer_attachment_preparation` counts consecutive
+  missing-key deferrals (migration 0099, `preparation_deferrals`) with backoff
+  and fails the acquisition after the sixth.
 
 ### Changed
 
@@ -21,6 +37,18 @@
   now reference their media epoch secret like kind-9 chats, so the image stays
   decryptable after the group advances.
 
+### Fixed
+
+- Certifying incremental-history debt through a full-history repair now settles the
+  pending recovery comparison, so a comparison with no work left is no longer selected
+  ahead of other recovery causes. (#2100)
+- `checkpoint_recovery_comparison` counts each scope's unserved comparisons in a
+  row (stored in the scope payload, no migration). A scope with six, on passes
+  that could retry, counts toward parking like one with three quiet comparisons.
+  The caller counts only requests answered by at least one required relay;
+  offline and deadline-cut scopes are omitted.
+  Progress resets both counts, a quiet comparison resets the unserved count, and
+  a goal or required-relay change starts both over. (#2110)
 
 ## 0.11.0 - 2026-09-29
 

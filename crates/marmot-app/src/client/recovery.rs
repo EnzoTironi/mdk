@@ -199,8 +199,8 @@ const RECOVERY_PARK_AFTER_ATTEMPTS: u64 = storage_sqlite::RECOVERY_PARK_AFTER_QU
 /// Comparison-owned recovery keeps retrying while passes certify new
 /// coverage. Storage parks an obligation after its own quiet passes in a row
 /// (`RecoveryPassProgress::Quiet`) until new evidence or an explicit repair.
-/// A pass whose required relays failed or timed out does not count:
-/// unreachable relays are waited out with pacing. Refused admission waits for
+/// A pass that reaches no required relay does not count; partial required-relay
+/// failures spend the longer unserved budget. Refused admission waits for
 /// capacity, and a proven incapability waits for a capability change.
 pub(super) fn eligibility_after_comparison(
     outcome: storage_sqlite::RecoveryScopeOutcome,
@@ -4000,6 +4000,19 @@ mod tests {
         AppClient,
         crate::tests::ScriptedEosePump,
     ) {
+        loss_fixture_with_relays(bound, vec!["wss://relay.example".into()]).await
+    }
+
+    async fn loss_fixture_with_relays(
+        bound: Option<u64>,
+        endpoints: Vec<String>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::tests::ScriptedPushRelayClient>,
+        crate::MarmotApp,
+        AppClient,
+        crate::tests::ScriptedEosePump,
+    ) {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
             scripted_eose_pump,
@@ -4009,8 +4022,12 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
+        let app = crate::MarmotApp::with_relays_and_config(
+            dir.path(),
+            endpoints,
+            crate::MarmotAppConfig::default(),
+        )
+        .with_test_relay_client(relay.clone());
         let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         // A checkpointed cursor: the account opens without an unbounded
         // no-cursor investigation, so the loss is the only debt.
@@ -4272,10 +4289,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn required_relay_outages_never_spend_the_parking_budget() {
+    async fn all_required_relay_outages_keep_retrying_without_spending_budget() {
         let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
         let storage = app.account_storage("alice").unwrap();
-        for pass in 1..=RECOVERY_PARK_AFTER_ATTEMPTS * 2 {
+        for pass in 1..=8 {
             let grant = client
                 .authorize_account_recovery(
                     None,
@@ -4283,32 +4300,77 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap_or_else(|| panic!("pass {pass} is selected"));
-            // Every required relay fails or times out.
             client.test_comparison_results = Some(scripted_routes(&grant, |_| true));
             client.run_recovery_grant_for_test(grant).await.unwrap();
+            client.recovery_owner.test_advance_to_retry(&storage);
             assert_eq!(
                 queue_loss(&storage),
                 Some(storage_sqlite::RecoveryEligibility::Retry),
-                "pass {pass}: an unserved pass is waited out, not counted"
+                "pass {pass} reached no required relay"
             );
-            client.recovery_owner.test_advance_to_retry(&storage);
         }
-        // Two quiet passes after the outages: the streak starts from zero.
-        for _ in 1..RECOVERY_PARK_AFTER_ATTEMPTS {
+    }
+
+    #[tokio::test]
+    async fn partial_required_relay_failures_park_after_exactly_six_passes() {
+        let (_dir, _relay, app, mut client, _pump) = loss_fixture_with_relays(
+            None,
+            vec!["wss://relay.example".into(), "wss://second.example".into()],
+        )
+        .await;
+        let storage = app.account_storage("alice").unwrap();
+        for pass in 1..=6 {
             let grant = client
                 .authorize_account_recovery(
                     None,
                     marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
                 )
                 .unwrap()
-                .unwrap();
-            client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
+                .unwrap_or_else(|| panic!("pass {pass} is selected"));
+            assert!(
+                grant
+                    .inventory
+                    .iter()
+                    .all(|inventory| inventory.required.len() == 2)
+            );
+            client.test_comparison_results = Some(
+                grant
+                    .inventory
+                    .iter()
+                    .map(|inventory| {
+                        Ok(Some((
+                            transport_nostr_adapter::NostrReconciliationSummary {
+                                relays_succeeded: 1,
+                                relays_failed: 1,
+                                failed_endpoints: vec![inventory.work.endpoints()[1].clone()],
+                                ..Default::default()
+                            },
+                            Vec::new(),
+                        )))
+                    })
+                    .collect(),
+            );
             client.run_recovery_grant_for_test(grant).await.unwrap();
             client.recovery_owner.test_advance_to_retry(&storage);
+            assert_eq!(
+                queue_loss(&storage),
+                Some(if pass == 6 {
+                    storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+                } else {
+                    storage_sqlite::RecoveryEligibility::Retry
+                }),
+                "partial failure pass {pass}"
+            );
         }
-        assert_eq!(
-            queue_loss(&storage),
-            Some(storage_sqlite::RecoveryEligibility::Retry)
+        assert!(
+            client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .unwrap()
+                .is_none(),
+            "parking ends automatic passes"
         );
     }
 
