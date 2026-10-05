@@ -376,6 +376,7 @@ mod tests {
         fanout
             .mark_attempt_started_at(0, 1_700_000_001_100)
             .unwrap();
+        storage.put_outbound_fanout(&fanout).unwrap();
         fanout
             .record_target_failure(
                 0,
@@ -416,6 +417,10 @@ mod tests {
             1
         );
         let mut acknowledged = storage.outbound_fanout(&exact.id).unwrap().unwrap();
+        acknowledged
+            .mark_attempt_started_at(0, 1_700_000_002_100)
+            .unwrap();
+        storage.put_outbound_fanout(&acknowledged).unwrap();
         acknowledged.mark_target_accepted(0).unwrap();
         storage.put_outbound_fanout(&acknowledged).unwrap();
         reopened.confirm_queued_outbound_intent(&intent).unwrap();
@@ -462,6 +467,10 @@ mod tests {
             Some(&(group.clone(), row.id))
         );
         let mut fanout = storage.outbound_fanout(&origin).unwrap().unwrap();
+        fanout
+            .mark_attempt_started_at(0, 1_700_000_001_100)
+            .unwrap();
+        storage.put_outbound_fanout(&fanout).unwrap();
         fanout.mark_target_accepted(0).unwrap();
         storage.put_outbound_fanout(&fanout).unwrap();
         reopened
@@ -619,6 +628,7 @@ mod tests {
             fanout
                 .mark_attempt_started_at(0, 1_700_000_001_100)
                 .unwrap();
+            storage.put_outbound_fanout(&fanout).unwrap();
             match outcome {
                 "ambiguous" => {
                     fanout
@@ -677,6 +687,7 @@ mod tests {
         fanout
             .mark_attempt_started_at(0, 1_700_000_001_100)
             .unwrap();
+        storage.put_outbound_fanout(&fanout).unwrap();
         fanout
             .record_target_failure(
                 0,
@@ -872,6 +883,10 @@ mod tests {
         let origin = msg.id.clone();
         let pending = *pending;
         let mut unexposed = storage.outbound_fanout(&origin).unwrap().unwrap();
+        unexposed
+            .mark_attempt_started_at(0, 1_700_000_001_100)
+            .unwrap();
+        storage.put_outbound_fanout(&unexposed).unwrap();
         unexposed
             .record_target_failure(
                 0,

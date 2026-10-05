@@ -88,6 +88,8 @@ pub fn mark_queued_results_unexposed<S: cgka_traits::storage::StorageProvider>(
         assert!(!fanout.possible_exposure());
         assert_eq!(fanout.outcome().accepted_targets, 0);
         for index in 0..fanout.request().target.endpoints().len() {
+            fanout.mark_attempt_started(index).unwrap();
+            storage.put_outbound_fanout(&fanout).unwrap();
             fanout
                 .record_target_failure(
                     index,
@@ -99,7 +101,7 @@ pub fn mark_queued_results_unexposed<S: cgka_traits::storage::StorageProvider>(
                     },
                 )
                 .unwrap();
+            storage.put_outbound_fanout(&fanout).unwrap();
         }
-        storage.put_outbound_fanout(&fanout).unwrap();
     }
 }

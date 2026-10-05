@@ -1820,11 +1820,13 @@ async fn current_queued_artifact_ack_after_restart_retires_binding_without_regen
                 authority: *authority,
             })
             .unwrap();
+        alice.put_outbound_fanout(&fanout).unwrap();
         fanout.mark_attempt_started(0).unwrap();
+        alice.put_outbound_fanout(&fanout).unwrap();
         if acknowledged_before_restart {
             fanout.mark_target_accepted(0).unwrap();
+            alice.put_outbound_fanout(&fanout).unwrap();
         }
-        alice.put_outbound_fanout(&fanout).unwrap();
         drop(alice);
         let reopened = current_session(&path, &key, b"current-queued-restart");
         let adapter = RecordingAdapter::default();
