@@ -407,7 +407,7 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
             10002,
             vec![
                 vec!["r".into(), "wss://healthy.example".into()],
-                vec!["r".into(), "wss://relay.damus.io".into()],
+                vec!["r".into(), "wss://relay.nostr.band".into()],
             ],
             OnboardingIssue::RetiredRelay,
         ),
@@ -416,7 +416,7 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
             10050,
             vec![
                 vec!["relay".into(), "wss://healthy.example".into()],
-                vec!["relay".into(), "wss://relay.damus.io".into()],
+                vec!["relay".into(), "wss://relay.nostr.band".into()],
             ],
             OnboardingIssue::RetiredRelay,
         ),
@@ -443,7 +443,7 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|endpoint| !endpoint.contains("relay.damus.io")
+                .all(|endpoint| !endpoint.contains("relay.nostr.band")
                     && !endpoint.contains("127.0.0.1"))
         );
     }
@@ -464,7 +464,7 @@ async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
             10002,
             vec![
                 vec!["r".into(), "wss://healthy.example".into()],
-                vec!["r".into(), "wss://relay.damus.io".into()],
+                vec!["r".into(), "wss://relay.nostr.band".into()],
             ],
             "",
             unix_now_seconds(),
@@ -474,7 +474,7 @@ async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
             10050,
             vec![
                 vec!["relay".into(), "wss://healthy.example".into()],
-                vec!["relay".into(), "wss://relay.damus.io".into()],
+                vec!["relay".into(), "wss://relay.nostr.band".into()],
             ],
             "",
             unix_now_seconds(),
@@ -502,7 +502,7 @@ async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
             .lock()
             .unwrap()
             .iter()
-            .all(|endpoint| !endpoint.contains("relay.damus.io"))
+            .all(|endpoint| !endpoint.contains("relay.nostr.band"))
     );
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -650,13 +650,13 @@ async fn relay_directionality_and_inconclusive_checks_never_produce_false_readin
         (
             OnboardingStep::Relays,
             10002,
-            vec![vec!["r".into(), "wss://relay.damus.io".into()]],
+            vec![vec!["r".into(), "wss://relay.nostr.band".into()]],
             OnboardingStatus::NeedsInput,
         ),
         (
             OnboardingStep::InboxRelays,
             10050,
-            vec![vec!["relay".into(), "wss://relay.damus.io".into()]],
+            vec![vec!["relay".into(), "wss://relay.nostr.band".into()]],
             OnboardingStatus::NeedsInput,
         ),
         (
@@ -949,6 +949,36 @@ fn signed(
     NostrTransportEvent::from_nostr_event(&event).unwrap()
 }
 
+fn retired_relay_fixture_endpoint() -> String {
+    format!(
+        "wss://{}",
+        crate::retired_relay_hosts()
+            .first()
+            .expect("retired-route rejection fixtures require a configured retired host")
+    )
+}
+
+#[tokio::test]
+async fn minimal_relay_repair_retains_a_currently_allowed_damus_declaration() {
+    let (_dir, runtime, _network, keys, _id) = fixture().await;
+    let tags = vec![vec!["r".into(), "wss://relay.damus.io".into()]];
+    let event = signed(&keys, 10002, tags.clone(), "opaque", unix_now_seconds() - 1);
+    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+        OnboardingStep::Relays,
+        Some(&event),
+        &["wss://public.example".into()],
+    );
+    assert_eq!(repair.before_tags[0].fields, tags[0]);
+    assert_eq!(repair.after_tags[0].fields, tags[0]);
+    assert!(
+        repair
+            .changes
+            .iter()
+            .all(|change| change.disposition == OnboardingRelayTagDisposition::Retained)
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test]
 async fn minimal_relay_repair_preserves_exact_custom_tags_and_removes_only_policy_rejected() {
     let (_dir, runtime, _network, keys, _id) = fixture().await;
@@ -957,7 +987,7 @@ async fn minimal_relay_repair_preserves_exact_custom_tags_and_removes_only_polic
         vec!["r".into(), "wss://read.example".into(), "read".into()],
         vec!["r".into(), "wss://read.example".into(), "read".into()],
         vec!["r".into(), "wss://write.example".into(), "write".into()],
-        vec!["r".into(), "wss://relay.damus.io".into()],
+        vec!["r".into(), retired_relay_fixture_endpoint()],
         vec!["x".into(), "opaque".into()],
     ];
     let event = signed(
@@ -1007,7 +1037,7 @@ async fn minimal_relay_repair_retains_unsafe_routes_while_removing_retired_route
     let tags = vec![
         vec!["r".into(), "wss://hidden.onion".into(), "read".into()],
         vec!["r".into(), "ws://192.168.1.10".into(), "write".into()],
-        vec!["r".into(), "wss://relay.damus.io".into()],
+        vec!["r".into(), retired_relay_fixture_endpoint()],
     ];
     let event = signed(&keys, 10002, tags.clone(), "opaque", unix_now_seconds() - 1);
     let (repair, _, _) = runtime.accounts().minimal_relay_repair(
@@ -1242,7 +1272,7 @@ async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_onl
         vec![
             vec!["client".into(), "keep".into()],
             vec!["r".into(), "wss://custom.example".into()],
-            vec!["r".into(), "wss://relay.damus.io".into()],
+            vec!["r".into(), retired_relay_fixture_endpoint()],
         ],
         "opaque content",
         unix_now_seconds() - 1,
@@ -1406,7 +1436,7 @@ async fn cancel_removal_only_cleanup(restart: bool) {
         10002,
         vec![
             vec!["r".into(), "wss://custom.example".into()],
-            vec!["r".into(), "wss://relay.damus.io".into()],
+            vec!["r".into(), retired_relay_fixture_endpoint()],
         ],
         "opaque content",
         unix_now_seconds() - 1,
@@ -1500,7 +1530,7 @@ async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection
         10002,
         vec![
             vec!["r".into(), "wss://custom.example".into()],
-            vec!["r".into(), "wss://relay.damus.io".into()],
+            vec!["r".into(), retired_relay_fixture_endpoint()],
         ],
         "",
         unix_now_seconds() - 1,
@@ -1585,7 +1615,7 @@ async fn typed_relay_repair_checkpoint_fences_pre_preview_readers() {
     checkpoint.records[OnboardingStep::Relays.index()] = Some(signed(
         &keys,
         10002,
-        vec![vec!["r".into(), "wss://relay.damus.io".into()]],
+        vec![vec!["r".into(), retired_relay_fixture_endpoint()]],
         "",
         unix_now_seconds() - 1,
     ));
@@ -1642,7 +1672,7 @@ async fn minimal_relay_repair_restart_preserves_preview_and_retries_exact_signed
         vec![
             vec!["client".into(), "keep".into()],
             vec!["r".into(), "wss://custom.example".into()],
-            vec!["r".into(), "wss://relay.damus.io".into()],
+            vec!["r".into(), retired_relay_fixture_endpoint()],
         ],
         "opaque content",
         unix_now_seconds() - 1,
@@ -1718,7 +1748,7 @@ async fn minimal_relay_repair_rejects_modified_preview_without_publication() {
         10002,
         vec![
             vec!["r".into(), "wss://custom.example".into()],
-            vec!["r".into(), "wss://relay.damus.io".into()],
+            vec!["r".into(), retired_relay_fixture_endpoint()],
         ],
         "opaque content",
         unix_now_seconds() - 1,
@@ -1783,7 +1813,7 @@ async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signi
         10002,
         vec![
             vec!["r".into(), "wss://custom.example".into()],
-            vec!["r".into(), "wss://relay.damus.io".into()],
+            vec!["r".into(), retired_relay_fixture_endpoint()],
         ],
         "opaque content",
         unix_now_seconds() - 1,
@@ -1863,7 +1893,7 @@ async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_
             10050,
             vec![
                 vec!["client".into(), "keep".into()],
-                vec!["relay".into(), "wss://relay.damus.io".into()],
+                vec!["relay".into(), retired_relay_fixture_endpoint()],
             ],
             "opaque inbox content",
             unix_now_seconds() - 1,
@@ -1951,7 +1981,7 @@ async fn minimal_relay_repair_rejects_changed_source_without_publication() {
     let source = signed(
         &keys,
         10050,
-        vec![vec!["relay".into(), "wss://relay.damus.io".into()]],
+        vec![vec!["relay".into(), retired_relay_fixture_endpoint()]],
         "",
         unix_now_seconds() - 2,
     );
@@ -2191,7 +2221,7 @@ async fn onboarding_rejects_unsafe_inbox_defaults() {
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
-                inbox_relays: vec!["wss://relay.damus.io".into()],
+                inbox_relays: vec!["wss://relay.nostr.band".into()],
                 ..options()
             },
         )

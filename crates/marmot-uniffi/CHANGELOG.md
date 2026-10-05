@@ -11,6 +11,11 @@
   optional field. Optional passed-step previews retain readiness when dismissed
   before approval.
 
+### Changed
+
+- `retired_relay_hosts()` no longer includes `relay.damus.io`, and
+  `classify_relay_endpoints` now reports it as `Allowed`.
+
 ## 0.12.0 - 2026-10-02
 
 Regenerate Swift/Kotlin bindings with the matching native library. See the
