@@ -155,11 +155,10 @@ The installers also show these values directly and render a terminal QR when
    public profile is not proof of identity.
 2. Give the verified account a local nickname, where your app supports it. The
    terminal installers do not publish a public agent profile. Suggested cues
-   are `🧑‍💻 Codex`, `🦀 Claude Code`, and `🥧 Pi`; different installations can
-   have different private nicknames.
-3. Invite it from the account you authorized. For task titles, create a normal
-   group and explicitly grant the agent admin permission. Direct messages do
-   not provide the same editable group-title workflow.
+   are `🧑‍💻 Codex`, `🦀 Claude Code`, `🥧 Pi`, and `🛠️ OpenCode`; different
+   installations can have different private nicknames.
+3. Invite it from the account you authorized. Terminal task groups can use a
+   normal group; ordinary messaging does not require an admin grant.
 4. Send a harmless test prompt with a fresh word you choose, asking the agent
    to echo that word without running tools or changing files. Check that the
    backend's reply contains that word and arrives in the same verified group;
@@ -173,9 +172,12 @@ backend can answer a phone prompt. Hermes and OpenClaw use their own gateway
 workspace/session configuration instead of this terminal picker.
 
 Connector files being installed is one milestone; a verified phone-to-backend
-conversation is another. Terminal automatic titles require an instruction plus matching
-group-profile-capable connector and harness releases. They are not enabled by
-the installation steps alone. See the shared
+conversation is another. Terminal automatic titles require an instruction plus
+matching group-profile-capable connector and harness releases. They are not enabled by
+the installation steps alone. Once that capability is available, you can grant
+the verified agent admin permission for title edits in a normal group. This
+also allows group and member changes. Direct messages do not provide the same
+editable group-title workflow. See the shared
 [session workflow](terminal-harness/README.md#organize-your-task-groups) and
 [onboarding design](terminal-harness/onboarding-design.md) for the proposed
 defaults and their remaining dependencies.

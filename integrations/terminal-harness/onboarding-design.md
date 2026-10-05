@@ -9,6 +9,14 @@ copy setup from White Noise, approve the concrete installation on your trusted
 computer, verify the connector account, and receive a reply in one reusable task
 group. Extra groups and preferences can follow that first success.
 
+Current capability references: [`prepare_prompt` in the shared bridge](src/bridge.rs)
+applies the privately stored goal on each invocation;
+[`SessionStore`](src/store.rs) retains independent group goals and sessions.
+[`GroupCreate` in agent-control](../../crates/agent-control/src/lib.rs) provides
+group creation, and [bootstrap](../../crates/agent-connector/src/bootstrap.rs)
+owns the existing identity/KeyPackage handoff. These capabilities do not provide
+the verified pairing or typed completion flow proposed below.
+
 ## Defaults
 
 | Decision | Recommended default |
@@ -22,9 +30,9 @@ group. Extra groups and preferences can follow that first success.
 | Completion | Offer the existing completion-mention instruction; build a typed completion signal separately |
 | Execution | Preserve the backend's existing permission and sandbox settings |
 
-Suggested connector cues are `🧑‍💻` for Codex, `🦀` for Claude Code, and `🥧` for
-Pi. They identify the connector family, not the installation or signer. Users
-can choose other cues. A local nickname can distinguish two Codex installations;
+Suggested connector cues are `🧑‍💻` for Codex, `🦀` for Claude Code, `🥧` for Pi,
+and `🛠️` for OpenCode. They identify the connector family, not the installation
+or signer. Users can choose other cues. A local nickname can distinguish two Codex installations;
 only the verified public key establishes which account is which.
 
 ## Identity and first contact
@@ -51,11 +59,11 @@ backend reply verified. Neither `/status` nor a service-start acknowledgement
 proves that the authenticated backend can answer.
 
 The smallest reliable workflow today is user-created: add the verified account,
-create one normal group, optionally grant the connector admin permission for
-title edits, select a workspace, and check a harmless backend reply containing a
+create one normal group, select a workspace, and check a harmless backend reply containing a
 fresh word chosen by the user. That word distinguishes a new test from stale
-replies; it does not authenticate the key. Admin permission confers broader
-group authority and should be a deliberate grant to the verified account;
+replies; it does not authenticate the key. After installing a title-capable
+connector/harness release, admin permission for title edits should be a
+deliberate grant to the verified account. It confers broader group authority;
 ordinary messaging does not require it. Avoid
 making ten empty groups on installation. Let users add groups with the same
 account as their workflow grows.

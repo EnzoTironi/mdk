@@ -106,6 +106,13 @@ run_linux_service_case() {
     local output_file="$fixture_root/installer-output.log"
     shift 3
 
+    local mock_command
+    for mock_command in curl shasum tar systemctl sleep uname python3; do
+        if [ ! -x "$mock_bin/$mock_command" ]; then
+            echo "missing installer fixture command: $mock_command" >&2
+            return 1
+        fi
+    done
     : >"$log_file"
     SYSTEMCTL_ACTIVE="$active" \
     SYSTEMCTL_LOG="$log_file" \
@@ -237,6 +244,14 @@ EOF
 chmod +x "$mock_bin"/*
 
 fresh_log="$fixture_root/systemctl-fresh.log"
+missing_mock_root="$fixture_root/missing-mock"
+mkdir -p "$missing_mock_root"
+if run_linux_service_case "$missing_mock_root" 0 "$missing_mock_root/systemctl.log" >"$missing_mock_root/error.log" 2>&1; then
+    echo "$kind installer fixture ran without mocked network/service commands" >&2
+    exit 1
+fi
+grep -F "missing installer fixture command: curl" "$missing_mock_root/error.log" >/dev/null
+[ ! -f "$missing_mock_root/systemctl.log" ]
 run_linux_service_case "$fixture_root" 0 "$fresh_log"
 installer_output="$fixture_root/installer-output.log"
 grep -F "npub: npub-test" "$installer_output" >/dev/null
@@ -246,7 +261,9 @@ grep -F "Phone conversation verification is still required." "$installer_output"
 grep -F "Compare this full npub on your trusted computer" "$installer_output" >/dev/null
 grep -F "\"$connector_emoji $display_name\"" "$installer_output" >/dev/null
 grep -F "This installer does not publish a public agent profile." "$installer_output" >/dev/null
-grep -F "Grant it admin permission if you want it to update that group's title." "$installer_output" >/dev/null
+grep -F "Admin permission is not required for ordinary messaging." "$installer_output" >/dev/null
+grep -F "Once that capability is" "$installer_output" >/dev/null
+grep -F "That grant also allows group and member changes." "$installer_output" >/dev/null
 grep -F "phone-to-backend connection is not verified." "$installer_output" >/dev/null
 grep -F "fresh word in this group" "$installer_output" >/dev/null
 grep -F "/new does not erase" "$installer_output" >/dev/null
@@ -271,8 +288,11 @@ if grep -Fq "Add the verified agent account" "$legacy_output"; then
 fi
 grep -F "then rerun guided setup." "$legacy_output" >/dev/null
 
-TEST_NO_NPROFILE=1 run_linux_service_case "$fixture_root" 1 "$fixture_root/systemctl-no-nprofile.log" --no-service
-partial_output="$fixture_root/installer-output.log"
+no_nprofile_root="$fixture_root/no-nprofile"
+mkdir -p "$no_nprofile_root"
+cp -R "$mock_bin" "$no_nprofile_root/mock-bin"
+TEST_NO_NPROFILE=1 run_linux_service_case "$no_nprofile_root" 1 "$no_nprofile_root/systemctl.log" --no-service
+partial_output="$no_nprofile_root/installer-output.log"
 grep -F "npub: npub-test" "$partial_output" >/dev/null
 grep -F "Add the verified agent account" "$partial_output" >/dev/null
 if grep -Fq "Pairing is paused" "$partial_output"; then
@@ -505,7 +525,7 @@ case "$installer_dry_run" in
     *) echo "$kind installer dry-run did not distinguish preview from real pairing" >&2; exit 1;;
 esac
 case "$installer_dry_run" in
-    *"Compare this full npub"* | *"Connector files installed."* )
+    *"Compare this full npub"* | *"Connector files installed."* | *"Add the verified agent account"* | *"Pairing is paused"* )
         echo "$kind installer dry-run offered a placeholder as a verified identity" >&2
         exit 1
         ;;

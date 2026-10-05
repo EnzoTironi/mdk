@@ -1039,6 +1039,9 @@ EOF
 }
 
 print_conversation_steps() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return
+    fi
     if [ -z "$BOOTSTRAP_NPUB" ]; then
         printf '\nPairing is paused: retrieve the full agent npub from bootstrap.json first.\n'
         return
@@ -1048,8 +1051,7 @@ print_conversation_steps() {
     as "$HARNESS_EMOJI $HARNESS_DISPLAY_NAME" if your app supports nicknames.
     This installer does not publish a public agent profile.
   - From your authorized account, create one normal group with the agent.
-    Grant it admin permission if you want it to update that group's title.
-    Use a normal group for editable task titles, rather than a direct message.
+    Admin permission is not required for ordinary messaging.
   - Send /<path> to select a workspace under your home directory. Choose a
     fresh word and send "Reply with Connected <my-fresh-word>, without running
     tools or changing files.", replacing <my-fresh-word> with that word.
@@ -1063,8 +1065,11 @@ session in this group while preserving its workspace. /new does not erase
 backend transcript files or cancel work that is already running.
 
 Automatic title updates require matching group-profile-capable wn-agent and
-harness releases, admin permission, and an instruction to the agent. Installing
-this connector alone does not enable automatic titles or completion alerts.
+harness releases plus an instruction to the agent. Once that capability is
+available, you can explicitly grant admin permission for title edits in a
+normal group. That grant also allows group and member changes.
+Installing this connector alone does not enable automatic titles or completion
+alerts.
 EOF
 }
 

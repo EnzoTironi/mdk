@@ -249,7 +249,7 @@ assume that iOS has the same Android OS channel controls.
 
 Where the connector exposes a current-group profile update operation and the
 agent has admin permission, a short title can help you find the right group.
-Use a stable connector cue first (`🧑‍💻`, `🦀`, or `🥧`), then a consistent
+Use a stable connector cue first (`🧑‍💻`, `🦀`, `🥧`, or `🛠️`), then a consistent
 project emoji when the project is known, and a short task label. Omit an unknown
 project cue instead of guessing. Keep the last task title when work finishes;
 activity status should not replace the task label.
