@@ -4,6 +4,25 @@
 
 ### Added
 
+- Test-only `test-migrated-template` feature adds
+  `SqliteAccountStorage::in_memory_from_migrated_template`, which copies one
+  migrated in-memory database per process instead of replaying every migration
+  for each open. Harnesses that open thousands of databases use it.
+
+## 0.12.0 - 2026-10-02
+
+Account storage advances from migration 98 through 101 on first open; downgrade
+is unsupported.
+
+### Added
+
+- Migration 0100 keeps a tapped attachment's explicit priority when its
+  history row is reprojected, and migration 0101
+  adds bounded outgoing-upload staging records, written after the blob upload
+  and before publication; confirmed sends later promote them to retained
+  attachment bytes.
+  (#2142)
+
 - `SqliteAccountStorage::poll_votes` pages each voter's effective selection for
   one visible poll (1..=100 per page, `(voted_at, voter)` cursor). The timeline
   tally and this read share one resolver, so the per-voter pages always sum to

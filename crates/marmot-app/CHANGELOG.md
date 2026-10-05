@@ -2,7 +2,39 @@
 
 ## Unreleased
 
+### Changed
+
+- `relay.damus.io` is no longer on the retired-relay denylist; the relay is
+  still operating. `retired_relay_hosts()` now returns only
+  `relay.nostr.band`. Members whose kind-10050 inbox list names only
+  `relay.damus.io` can be invited again.
+
+### Fixed
+
+- When a member lookup does not complete and the member's known inbox relay
+  list has no usable relays, the invite now fails with "known member inbox
+  relay list has no usable relays and its refresh did not complete" instead
+  of "relay-list absence was not authoritatively established". The error is
+  still retryable. A completed lookup still returns
+  `AppError::MissingMemberInboxRoute`.
+
+- A sent message the engine queued while the group was converging is no longer
+  marked failed when an unrelated publish in the same batch fails, and a sent
+  row already marked failed revives once a relay accepts its fanout. Before,
+  other members received the message while the sender's row stayed failed
+  forever, and a sender's poll showed no projection.
+
+## 0.12.0 - 2026-10-02
+
 ### Added
+
+- `MarmotAppRuntime::group_app_component` and `update_app_component` read and
+  admin-update optional application-owned MLS group components (ids at or
+  above `0xf000`). Invalid ids, required components and oversized state fail
+  with `AppError::InvalidAppComponent`. (#1929)
+- `MarmotAppRuntime::request_explicit_attachment` joins or promotes attachment
+  demand to explicit priority without resetting retry budgets, backoff or
+  active deadlines. (#2142)
 
 - Hosts can declare a separate kind-10050 inbox relay list.
   `AccountSetupRequest::inbox_relays`, `AccountRelayListBootstrap::inbox_relays`
@@ -32,6 +64,19 @@
   `account worker startup timed out at <stage>`; hosts that matched the old
   message exactly should match its prefix. (#1911, #2098)
 
+### Changed
+
+- A durable chat mute suppresses ordinary notification traffic but still emits
+  a typed direct mention of the receiving account. Sender blocks still suppress
+  those mentions. Hosts using notification subscriptions apply their own
+  permission, channel, and foreground policy to emitted updates.
+  (marmot-protocol/whitenoise-android#2984)
+- A successful outgoing upload stages a private local copy before the message
+  is published. Once the send is confirmed, the staged bytes gain owners and
+  are promoted to retained attachment bytes, so the sender reopens the file
+  without reacquisition. Staging is best-effort and bounded; its failure never
+  blocks the send. (#2142)
+
 ### Fixed
 
 - v5 audit rows keep the engine's `pre_membership_event`,
@@ -39,6 +84,20 @@
   `quarantined_group_input_deferred` message reasons instead of writing them
   as `unclassified`. Older v5 rows with an `unclassified` reason stay
   ambiguous (#2120).
+- Import and external-signer onboarding now searches the built-in public
+  indexers alongside the host's discovery relays when checking an identity's
+  profile, follows, and kind-10002/10050 relay lists. Previously a host that
+  passed only its own messaging relays could see an existing identity's lists
+  as missing and be offered (or automatically approve) a defaults-only
+  replacement. A missing list is now concluded, and a repair approved, only
+  when every searched relay, indexers included, answers. Indexers are dialed
+  on top of the 16-relay inspection cap, so they neither displace the host's
+  or the account's declared relays nor get dropped themselves. Repairs still
+  publish only to the host's discovery relays and the account's declared
+  relays, not to the indexers. A host-selected set from
+  `set_onboarding_discovery_relays` is used as given, without indexers, so an
+  unreachable indexer can be bypassed. Loopback (development) routes are
+  unchanged, and the KeyPackage device check keeps its existing sources.
 - A route change, such as creating or leaving a group, no longer resets
   history recovery for every route. Routes whose own window and required
   relays are unchanged keep their certificates and quiet streak; only changed
