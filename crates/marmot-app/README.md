@@ -19,7 +19,7 @@ the generic account, session, and engine crates. Read this if you are building a
 - [History may be incomplete notices](#history-may-be-incomplete-notices)
 - [User blocking](#user-blocking)
 - [Group reports and admin deletion](#group-reports-and-admin-deletion)
-- [Controlled audit v5 experiment](#controlled-audit-v5-experiment)
+- [Audit v5 Welcome evidence](#audit-v5-welcome-evidence)
 - [Run the tests](#run-the-tests)
 
 ## Runtime overview
@@ -379,12 +379,12 @@ deletion while retained.
 See [the implementation contract](../../docs/marmot-architecture/overview/content-moderation.md) for source-state
 authorization, durable recovery, retention, and client compatibility.
 
-## Controlled audit v5 experiment
+## Audit v5 Welcome evidence
 
-Opt-in production audit recording writes v5 files (see [`marmot-forensics`](../marmot-forensics/README.md)); historical
-v4 files keep their separate legacy upload path. The [recipient Welcome probe](tests/audit-v5-welcome-probe.md) is a
-unit-test-only experiment that exercises real app receipt and checkpoint boundaries and measures a partial v5 Welcome
-record set:
+Opt-in audit recording writes v5 files (see [`marmot-forensics`](../marmot-forensics/README.md)); historical v4 files
+keep their separate legacy whole-file upload path. With audit logging enabled, the app records v5 Welcome evidence from
+real founding, publication, receipt, peel, join and checkpoint boundaries. The
+[Welcome probe notes](tests/audit-v5-welcome-probe.md) describe those boundaries and the unit tests that exercise them:
 
 ```sh
 cargo test -p marmot-app --lib audit_v5_probe -- --nocapture --test-threads=1
