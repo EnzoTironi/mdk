@@ -946,7 +946,7 @@ EOF
         cat <<EOF
 
 Compare this full npub on your trusted computer with the agent account in
-White Noise before you accept its invite or send it a task. A matching name,
+White Noise before you add it to a group, accept its invite, or send it a task. A matching name,
 emoji, or group title does not verify the account.
 EOF
         if [ -n "$BOOTSTRAP_NPROFILE" ] && [ -t 1 ] && command -v qrencode >/dev/null 2>&1; then

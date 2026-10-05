@@ -225,7 +225,7 @@ without replacing the group. `/goal` instructions survive `/new` and compaction.
 
 ### Optional Completion Mentions
 
-To request the existing mention-based workaround in one group, send a standing
+To request the advisory mention-based workaround in one group, send a standing
 goal with your **own full npub**, for example:
 
 ```text
@@ -241,14 +241,18 @@ overridden; notification settings and delivery still determine whether you are
 alerted. Completed assistant text blocks can arrive before a backend turn ends,
 so adding mentions to every delivered block would create false completion alerts.
 
-Android exposes a Mentions notification channel separately from ordinary group
-messages. Configure it in the app or Android notification settings. Do not
+The shared [Markdown tokenizer](../../crates/marmot-markdown/src/inline.rs)
+recognizes `@npub` mentions. Android exposes a Mentions notification channel
+separately from ordinary group messages. Configure it in the app or Android
+notification settings and check a test mention on your phone before relying on
+it; this candidate does not include device notification verification. Do not
 assume that iOS has the same Android OS channel controls.
 
 ### Task Titles
 
-Where the connector exposes a current-group profile update operation and the
-agent has admin permission, a short title can help you find the right group.
+For manual titles today, or once automatic title support is available, a short
+title can help you find the right group. Agent-driven edits need a callable
+current-group profile update operation and admin permission.
 Use a stable connector cue first (`🧑‍💻`, `🦀`, `🥧`, or `🛠️`), then a consistent
 project emoji when the project is known, and a short task label. Omit an unknown
 project cue instead of guessing. Keep the last task title when work finishes;

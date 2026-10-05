@@ -17,6 +17,12 @@ group creation, and [bootstrap](../../crates/agent-connector/src/bootstrap.rs)
 owns the existing identity/KeyPackage handoff. These capabilities do not provide
 the verified pairing or typed completion flow proposed below.
 
+The mobile observations are pinned to the inspected
+[Android agent list](https://github.com/marmot-protocol/whitenoise-android/blob/be4fd6adfcd8e7606380a12c9d61a220fc401c74/app/src/main/java/dev/ipf/whitenoise/android/ui/settings/AgentConnector.kt),
+[Android setup prompts](https://github.com/marmot-protocol/whitenoise-android/blob/be4fd6adfcd8e7606380a12c9d61a220fc401c74/app/src/main/res/values/strings.xml),
+and [iOS connector prompts](https://github.com/marmot-protocol/whitenoise-ios/blob/94edeaf9595fc8faad0432a0ec865efa8756482b/whitenoise-ios/Settings/AIAgentConnector.swift).
+These source observations are not a claim about every installed app version.
+
 ## Defaults
 
 | Decision | Recommended default |
@@ -134,12 +140,16 @@ uncertain task finished. This is a separate capability from automatic titles.
 
 ## Completion notifications
 
-Keep the current `@npub` technique available as an advisory per-group goal,
+Keep the user-reported `@npub` workaround available as an advisory per-group goal,
 targeted at the user's full verified account key and limited to a final answer.
 Explain that `/goal <text>` replaces an existing goal. Let users remove the
 preference and never hard-code the operator's account into a shipped prompt.
-Android already exposes Mentions separately from group-message notifications;
-iOS needs its own supported notification presentation and controls.
+The [Markdown tokenizer](../../crates/marmot-markdown/src/inline.rs) recognizes
+`@npub` mentions, and the inspected
+[Android channel mapping](https://github.com/marmot-protocol/whitenoise-android/blob/be4fd6adfcd8e7606380a12c9d61a220fc401c74/app/src/main/java/dev/ipf/whitenoise/android/notifications/NotificationChannelSpec.kt)
+exposes Mentions separately from group-message notifications. This candidate
+has not been tested for notification delivery on devices; iOS needs its own
+supported notification presentation and controls.
 
 Do not append a mention to every assistant text block. Claude can emit completed
 assistant text between tool calls; other backends also have distinct text and
@@ -161,14 +171,15 @@ second alert for the same completion.
 ## Delivery order and verification
 
 1. **Installer handoff:** full-key comparison, private nickname guidance,
-   explicit admin group, workspace selection, and pending round-trip status.
+   one normal group without an admin grant, workspace selection, and pending
+   round-trip status.
    This patch changes that handoff and the canonical quickstart. It does not
    publish profiles, create groups, change permissions, or enable auto-titles.
-2. **Title defaults:** consume the existing
-   [harness group-profile exposure](https://github.com/marmot-protocol/mdk/pull/2115)
-   in a matching release. Add per-turn default policy and editable preferences,
+2. **Title defaults:** consume the proposed
+   [harness group-profile exposure (open PR 2115)](https://github.com/marmot-protocol/mdk/pull/2115)
+   once merged and included in a matching release. Add per-turn default policy and editable preferences,
    including non-admin, concurrent-group, compaction, and unknown-write tests.
-3. **Mobile parity and pairing:** Android currently offers Codex but not Claude
+3. **Mobile parity and pairing:** the inspected Android source offers Codex but not Claude
    or Pi in its agent list; iOS offers all three. Align their installation prompts
    and key-verification handoff first, then build the bound agent-created flow.
    Exercise wrong keys, forged display names, replay, expiry, cancellation,
