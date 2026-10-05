@@ -1821,6 +1821,9 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(epoch);
         }
 
+        self.checked_queued_artifact_bindings(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mut mls_group = {
             let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
@@ -2151,6 +2154,9 @@ impl<S: StorageProvider> Engine<S> {
             self.epoch_manager.set_stable(group_id.clone(), group.epoch);
             ("stable", promotion_reason)
         };
+        self.restore_queued_artifact_bindings(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
         if let Some(request) = leave_request {
             self.leave_requests.insert(group_id.clone(), request);
             self.leaving_groups.insert(group_id.clone());
@@ -2595,6 +2601,10 @@ impl<S: StorageProvider> Engine<S> {
     /// attempt (the leave-request/leaving-group entries, which every attempt
     /// sets or clears, and the epoch entry itself).
     fn discard_hydration_side_effects(&mut self, group_id: &GroupId) {
+        self.queued_intent_by_message
+            .retain(|_, (group, _)| group != group_id);
+        self.queued_intent_by_pending
+            .retain(|_, (group, _)| group != group_id);
         let restored_pending = self.epoch_manager.pending_refs_for_group(group_id);
         self.pending_origin_commits
             .retain(|pending, _| !restored_pending.contains(pending));
@@ -3457,8 +3467,12 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.confirm_regenerated_queued_intent(intent_id)
     }
 
-    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId, intent_id: &MessageId) {
-        self.retry_regenerated_queued_intent(group_id, intent_id);
+    fn retry_queued_outbound_intent(
+        &mut self,
+        group_id: &GroupId,
+        intent_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        self.retry_regenerated_queued_intent(group_id, intent_id)
     }
 
     async fn confirm_published(

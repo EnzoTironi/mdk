@@ -72,6 +72,7 @@ fn queued(payload: &[u8]) -> QueuedOutboundIntent {
         },
         created_at_ms: 1,
         reissue_attempts: 0,
+        preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
     }
 }
 

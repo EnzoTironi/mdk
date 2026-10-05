@@ -667,6 +667,7 @@ async fn run_child_case(database: &Path) {
             },
             created_at_ms: 2_100,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
         })
         .expect("persist queued work");
     // Persist the independent outbound obligation before admitting the late
@@ -1071,6 +1072,7 @@ async fn run_probe_child(database: &Path) {
             },
             created_at_ms: 1,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
         })
         .unwrap();
     // The parent-owned temp directory is private; create the evidence file

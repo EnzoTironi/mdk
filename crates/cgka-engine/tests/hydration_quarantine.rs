@@ -219,6 +219,7 @@ fn seed_probe_work_rows(
         },
         created_at_ms: u64::from(suffix),
         reissue_attempts: 0,
+        preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
     };
     storage
         .put_queued_outbound_intent(&queued)

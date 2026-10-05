@@ -41,7 +41,10 @@ use cgka_traits::ingest::{IngestOutcome, PeeledContent};
 #[cfg(test)]
 use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{ConvergencePassStorage, MessageStorage, StorageProvider};
+use cgka_traits::storage::{
+    ConvergencePassStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
+    QueuedIntentPreparation, RegeneratedArtifact, StorageProvider,
+};
 #[cfg(test)]
 use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -1557,9 +1560,51 @@ impl HarnessClient {
         &mut self,
         group_id: &GroupId,
         intent_id: &MessageId,
-    ) {
+    ) -> Result<(), EngineError> {
         self.engine_mut()
-            .retry_queued_outbound_intent(group_id, intent_id);
+            .retry_queued_outbound_intent(group_id, intent_id)
+    }
+
+    pub(crate) fn mark_regenerated_artifact_accepted(
+        &self,
+        message_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        let Some(mut fanout) = self.storage().outbound_fanout(message_id)? else {
+            return Ok(());
+        };
+        fanout
+            .mark_target_accepted(0)
+            .map_err(|_| EngineError::QueuedIntentRecoveryFailed)?;
+        self.storage().put_outbound_fanout(&fanout)?;
+        Ok(())
+    }
+
+    /// Called only after the bus proves it retracted every recipient copy.
+    pub(crate) fn mark_regenerated_artifact_unexposed(
+        &self,
+        message_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        let Some(mut fanout) = self.storage().outbound_fanout(message_id)? else {
+            return Ok(());
+        };
+        if fanout.outcome().accepted_targets > 0 || fanout.possible_exposure() {
+            return Err(EngineError::QueuedIntentReissueRefused);
+        }
+        for index in 0..fanout.request().target.endpoints().len() {
+            fanout
+                .record_target_failure(
+                    index,
+                    cgka_traits::TransportEndpointFailure {
+                        endpoint: fanout.request().target.endpoints()[index].clone(),
+                        reason: "bus proved no recipient exposure".into(),
+                        kind: cgka_traits::TransportEndpointFailureKind::NotExposed,
+                        rejection_category: None,
+                    },
+                )
+                .map_err(|_| EngineError::QueuedIntentReissueRefused)?;
+        }
+        self.storage().put_outbound_fanout(&fanout)?;
+        Ok(())
     }
 
     pub(crate) fn forget_regenerated_queued_intent(&mut self, message_id: &MessageId) {
@@ -1917,7 +1962,27 @@ impl HarnessClient {
         &mut self,
         pending: PendingStateRef,
     ) -> Result<(), EngineError> {
-        self.engine_mut().confirm_published(pending).await?;
+        let retained = self
+            .pending_publication_artifacts
+            .get(&pending)
+            .into_iter()
+            .flatten()
+            .map(|message_id| self.storage().outbound_fanout(message_id))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .find(|fanout| fanout.pending_ref() == Some(pending));
+        if let Some(mut fanout) = retained {
+            fanout
+                .mark_target_accepted(0)
+                .map_err(|_| EngineError::QueuedIntentRecoveryFailed)?;
+            self.storage().put_outbound_fanout(&fanout)?;
+            self.engine_mut()
+                .confirm_published_fanout(pending, &mut fanout)
+                .await?;
+        } else {
+            self.engine_mut().confirm_published(pending).await?;
+        }
         self.pending_publication_artifacts.remove(&pending);
         self.pending_confirmation_artifacts.remove(&pending);
         if let Some(scenario_id) = self.pending_scenario_inputs.remove(&pending) {
@@ -1974,6 +2039,9 @@ impl HarnessClient {
                     recipient_exposures,
                 },
             )?;
+        for message_id in &message_ids {
+            self.mark_regenerated_artifact_unexposed(message_id)?;
+        }
         self.engine_mut().publish_failed(pending).await?;
         self.pending_publication_artifacts.remove(&pending);
         self.pending_confirmation_artifacts.remove(&pending);
@@ -2762,6 +2830,7 @@ impl HarnessClient {
     }
 
     async fn publish_send_result(&mut self, result: SendResult) -> Result<(), EngineError> {
+        self.stage_regenerated_artifact(&result)?;
         let gid = self.default_group.clone();
         match result {
             SendResult::ApplicationMessage {
@@ -2862,6 +2931,84 @@ impl HarnessClient {
             | SendResult::DisbandRequested { .. }
             | SendResult::Queued { .. } => {}
         }
+        Ok(())
+    }
+
+    fn stage_regenerated_artifact(&self, result: &SendResult) -> Result<(), EngineError> {
+        let (message, group, pending) = match result {
+            SendResult::ApplicationMessage { msg, group_id, .. } => (msg, group_id.clone(), None),
+            SendResult::Proposal { msg } => {
+                let Some((group, _)) = self.engine().regenerated_queued_intent_for_message(&msg.id)
+                else {
+                    return Ok(());
+                };
+                (msg, group, None)
+            }
+            SendResult::GroupEvolution { msg, pending, .. } => (
+                msg,
+                self.engine().pending_group_id(*pending)?,
+                Some(*pending),
+            ),
+            _ => return Ok(()),
+        };
+        let bound = self
+            .storage()
+            .list_queued_outbound_intents(&group)?
+            .into_iter()
+            .any(|record| match record.preparation {
+                QueuedIntentPreparation::BoundArtifact {
+                    artifact: RegeneratedArtifact::Message { message_id },
+                } => message_id == message.id,
+                QueuedIntentPreparation::BoundArtifact {
+                    artifact: RegeneratedArtifact::PendingCommit { origin_message_id },
+                } => origin_message_id == message.id,
+                QueuedIntentPreparation::Unprepared => false,
+            });
+        if !bound || self.storage().outbound_fanout(&message.id)?.is_some() {
+            return Ok(());
+        }
+        let TransportEnvelope::GroupMessage { transport_group_id } = &message.envelope else {
+            return Err(EngineError::QueuedIntentRecoveryFailed);
+        };
+        let mut fanout = cgka_traits::OutboundFanout::stage(
+            cgka_traits::TransportPublishRequest {
+                account_id: self.engine().self_id(),
+                message: message.clone(),
+                target: cgka_traits::TransportPublishTarget::Group {
+                    group_id: group.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![cgka_traits::TransportEndpoint::from("simulator://bus")],
+                },
+                required_acks: 1,
+            },
+            pending,
+            Some(group),
+            self.harness_convergence_now_ms()?,
+        )
+        .map_err(|_| EngineError::QueuedIntentRecoveryFailed)?;
+        if let SendResult::ApplicationMessage {
+            group_id,
+            app_event_id,
+            source_epoch,
+            retention,
+            authority,
+            ..
+        } = result
+        {
+            fanout
+                .set_application_message(cgka_traits::OutboundApplicationMessage {
+                    group_id: group_id.clone(),
+                    app_event_id: app_event_id.clone(),
+                    source_epoch: *source_epoch,
+                    retention: *retention,
+                    authority: *authority,
+                })
+                .map_err(|_| EngineError::QueuedIntentRecoveryFailed)?;
+        }
+        fanout
+            .mark_attempt_started_at(0, self.harness_convergence_now_ms()?)
+            .map_err(|_| EngineError::QueuedIntentRecoveryFailed)?;
+        self.storage().put_outbound_fanout(&fanout)?;
         Ok(())
     }
 

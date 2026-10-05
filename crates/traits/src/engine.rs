@@ -916,6 +916,13 @@ pub trait CgkaEngine: Send + Sync {
     /// monotonic lifecycle clock to decide whether the quiescence window has
     /// elapsed.
     ///
+    /// The host must hold its enclosing storage transaction across local
+    /// preparation, the required queued-artifact binding and durable frozen
+    /// fanout staging, before releasing any returned artifact externally.
+    /// After rollback the host discards this engine and reconstructs it from
+    /// the same storage. A bound row without matching artifact/fanout authority
+    /// fails closed on reopen and cannot regenerate itself.
+    ///
     /// Returns publishable [`SendResult`] values. If a queued group evolution
     /// is regenerated, the engine stops after that result because the group
     /// enters `PendingPublish` until the application reports
@@ -933,10 +940,15 @@ pub trait CgkaEngine: Send + Sync {
     fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError>;
 
     /// Re-arm a group after a regenerated standalone queued publish reached no
-    /// endpoint. The durable intent remains intact until confirmation; the
-    /// named intent's in-flight association is cleared so the next drain
-    /// regenerates a fresh artifact for it.
-    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId, intent_id: &MessageId);
+    /// endpoint. The durable fanout must prove no acknowledgment, possible exposure or
+    /// active attempt. Retire that exact fanout and clear the binding atomically
+    /// before the next drain may prepare a new artifact. Missing authority or
+    /// ambiguity refuses this operation and preserves the original binding.
+    fn retry_queued_outbound_intent(
+        &mut self,
+        group_id: &GroupId,
+        intent_id: &MessageId,
+    ) -> Result<(), EngineError>;
 
     /// Confirm that a [`SendResult::GroupEvolution`] (or legacy-profile
     /// [`SendResult::GroupCreated`]) was successfully published to the

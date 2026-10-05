@@ -994,6 +994,8 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
 
+        self.restore_queued_artifact_bindings(group_id)?;
+
         // This entry point belongs to background recovery even when output is
         // queued. Borrowing a send's four-row preflight allowance here makes
         // queued maintenance throttle the worker's entire deferred generation.
@@ -1028,7 +1030,10 @@ impl<S: StorageProvider> Engine<S> {
             // A regenerated intent the host has not yet confirmed or retired
             // is still the host's obligation: re-preparing it would publish
             // the same logical message twice (mdk#1472).
-            if self.queued_outbound_intent_in_flight(group_id, &record.id) {
+            if matches!(
+                record.preparation,
+                cgka_traits::storage::QueuedIntentPreparation::BoundArtifact { .. }
+            ) {
                 continue;
             }
             if !reservation.permits(&record.intent) {
@@ -1074,21 +1079,7 @@ impl<S: StorageProvider> Engine<S> {
                 Err(error) => return Err(error),
             };
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
-            match &result {
-                SendResult::ApplicationMessage { msg, .. } | SendResult::Proposal { msg } => {
-                    self.queued_intent_by_message
-                        .insert(msg.id.clone(), (record.group_id.clone(), record.id.clone()));
-                }
-                SendResult::GroupEvolution { pending, .. } => {
-                    self.queued_intent_by_pending
-                        .insert(*pending, (record.group_id.clone(), record.id.clone()));
-                }
-                SendResult::GroupCreated { .. }
-                | SendResult::FoundingGroupCreated { .. }
-                | SendResult::NoChange { .. }
-                | SendResult::DisbandRequested { .. }
-                | SendResult::Queued { .. } => {}
-            }
+            self.bind_regenerated_queued_artifact(&record, &result)?;
             drained.push(result);
             if reservation.is_available() {
                 reservation.consume_attempt(self, group_id, true)?;
@@ -1271,19 +1262,6 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
-    /// Whether a durable queued intent was already regenerated into an
-    /// artifact the host has not yet confirmed or retired. The association
-    /// lives from regeneration until `confirm_regenerated_queued_intent`,
-    /// `retry_regenerated_queued_intent`, or a publish rollback clears it.
-    fn queued_outbound_intent_in_flight(&self, group_id: &GroupId, intent_id: &MessageId) -> bool {
-        self.queued_intent_by_message
-            .values()
-            .chain(self.queued_intent_by_pending.values())
-            .any(|(queued_group_id, queued_intent_id)| {
-                queued_group_id == group_id && queued_intent_id == intent_id
-            })
-    }
-
     pub(crate) fn schedule_pending_convergence_group(&mut self, group_id: &GroupId) {
         self.pending_convergence_groups.insert(group_id.clone());
     }
@@ -1311,15 +1289,76 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    /// Re-arm a regenerated intent whose publication reached no endpoint.
-    /// Clearing the in-flight association lets the next drain regenerate a
-    /// fresh artifact; the durable intent row is untouched.
-    pub fn retry_regenerated_queued_intent(&mut self, group_id: &GroupId, intent_id: &MessageId) {
+    /// Regenerate only a standalone artifact with durable proof of no exposure.
+    /// Ambiguous or acknowledged artifacts keep their binding and exact fanout.
+    /// Pending commits use publish_failed's protocol rollback instead.
+    pub fn retry_regenerated_queued_intent(
+        &mut self,
+        group_id: &GroupId,
+        intent_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        use cgka_traits::storage::{QueuedIntentPreparation, RegeneratedArtifact};
+        use cgka_traits::{
+            FanoutTargetStatus, TransportEndpointFailure, TransportEndpointFailureKind,
+        };
+        let mut record = self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .into_iter()
+            .find(|record| &record.id == intent_id)
+            .ok_or(EngineError::QueuedIntentRecoveryFailed)?;
+        let message_id = match &record.preparation {
+            QueuedIntentPreparation::Unprepared => {
+                self.schedule_pending_convergence_group(group_id);
+                return Ok(());
+            }
+            QueuedIntentPreparation::BoundArtifact {
+                artifact: RegeneratedArtifact::Message { message_id },
+            } => message_id.clone(),
+            QueuedIntentPreparation::BoundArtifact { .. } => {
+                return Err(EngineError::QueuedIntentReissueRefused);
+            }
+        };
+        self.checked_queued_artifact_bindings(group_id)?;
+        let mut fanout = self
+            .storage
+            .outbound_fanout(&message_id)?
+            .ok_or(EngineError::QueuedIntentRecoveryFailed)?;
+        if fanout.outcome().accepted_targets > 0
+            || fanout.possible_exposure()
+            || fanout
+                .target_statuses()
+                .contains(&FanoutTargetStatus::Attempting)
+        {
+            return Err(EngineError::QueuedIntentReissueRefused);
+        }
+        for index in 0..fanout.request().target.endpoints().len() {
+            fanout
+                .record_target_failure(
+                    index,
+                    TransportEndpointFailure {
+                        endpoint: fanout.request().target.endpoints()[index].clone(),
+                        reason: "unexposed queued artifact retired".into(),
+                        kind: TransportEndpointFailureKind::NotExposed,
+                        rejection_category: None,
+                    },
+                )
+                .map_err(|_| EngineError::QueuedIntentReissueRefused)?;
+        }
+        record.preparation = QueuedIntentPreparation::Unprepared;
+        self.storage
+            .with_transaction(|storage| -> Result<(), EngineError> {
+                storage.put_outbound_fanout(&fanout)?;
+                storage.delete_outbound_fanout(&message_id)?;
+                storage.put_queued_outbound_intent(&record)?;
+                Ok(())
+            })?;
         self.queued_intent_by_message
-            .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
+            .retain(|_, (_, id)| id != intent_id);
         self.queued_intent_by_pending
-            .retain(|_, (_, queued_intent_id)| queued_intent_id != intent_id);
+            .retain(|_, (_, id)| id != intent_id);
         self.schedule_pending_convergence_group(group_id);
+        Ok(())
     }
 
     pub(crate) fn schedule_self_remove_auto_commit(
@@ -3534,6 +3573,7 @@ impl<S: StorageProvider> Engine<S> {
             intent,
             created_at_ms,
             reissue_attempts,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
         })
     }
 
@@ -3783,7 +3823,7 @@ pub(crate) fn route_wrapped_group_message(
     }
 }
 
-fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
+pub(crate) fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
     match intent {
         SendIntent::AppMessage { group_id, .. }
         | SendIntent::Invite { group_id, .. }

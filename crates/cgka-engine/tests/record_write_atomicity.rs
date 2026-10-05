@@ -45,6 +45,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
+#[path = "support/queued_artifact.rs"]
+mod queued_artifact;
 mod support;
 use support::proof_signer;
 
@@ -2574,6 +2576,8 @@ async fn queued_output_preserves_background_recovery_allowance() {
                 .unwrap()
                 .is_none()
         );
+        queued_artifact::stage_queued_results(&engine, &storage, &group_id, &drained);
+        queued_artifact::mark_queued_results_unexposed(&storage, &drained);
         assert!(
             engine
                 .advance_convergence(&group_id)

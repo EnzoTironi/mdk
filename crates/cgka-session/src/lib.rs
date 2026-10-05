@@ -1200,9 +1200,25 @@ impl AccountDeviceSession {
             .confirm_regenerated_queued_intent(&intent.intent_id)?)
     }
 
-    pub fn retry_regenerated_queued_intent(&mut self, intent: &QueuedIntentRef) {
+    pub fn regenerated_queued_intent_for_message(
+        &self,
+        message_id: &MessageId,
+    ) -> Option<QueuedIntentRef> {
         self.engine
-            .retry_regenerated_queued_intent(&intent.group_id, &intent.intent_id);
+            .regenerated_queued_intent_for_message(message_id)
+            .map(|(group_id, intent_id)| QueuedIntentRef {
+                group_id,
+                intent_id,
+            })
+    }
+
+    pub fn retry_regenerated_queued_intent(
+        &mut self,
+        intent: &QueuedIntentRef,
+    ) -> SessionResult<()> {
+        Ok(self
+            .engine
+            .retry_regenerated_queued_intent(&intent.group_id, &intent.intent_id)?)
     }
 
     pub async fn confirm_published(

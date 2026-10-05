@@ -385,6 +385,42 @@ impl<S: StorageProvider> Engine<S> {
             .kind_for_pending(pending)
             .ok_or(EngineError::UnknownPending)?;
 
+        let queued_intent = self.queued_intent_by_pending.get(&pending).cloned();
+        let queued_rollback_fanout = if let Some((queued_group, intent_id)) = queued_intent.as_ref()
+        {
+            self.checked_queued_artifact_bindings(queued_group)?;
+            let row = self
+                .storage
+                .list_queued_outbound_intents(queued_group)?
+                .into_iter()
+                .find(|record| &record.id == intent_id)
+                .ok_or(EngineError::QueuedIntentRecoveryFailed)?;
+            let cgka_traits::storage::QueuedIntentPreparation::BoundArtifact {
+                artifact:
+                    cgka_traits::storage::RegeneratedArtifact::PendingCommit { origin_message_id },
+            } = row.preparation
+            else {
+                return Err(EngineError::QueuedIntentRecoveryFailed);
+            };
+            let retained = self
+                .storage
+                .outbound_fanout(&origin_message_id)?
+                .ok_or(EngineError::QueuedIntentRecoveryFailed)?;
+            let observation = fanout.as_deref().unwrap_or(&retained);
+            observation
+                .validate_successor_of(&retained)
+                .map_err(|_| EngineError::QueuedIntentRecoveryFailed)?;
+            if observation.outcome().accepted_targets > 0
+                || observation.possible_exposure()
+                || !observation.outcome().fanout_complete
+            {
+                return Err(EngineError::QueuedIntentReissueRefused);
+            }
+            Some(observation.clone())
+        } else {
+            None
+        };
+
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
@@ -392,6 +428,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let rolled_back_fanout = fanout
             .as_deref()
+            .or(queued_rollback_fanout.as_ref())
             .map(|fanout| {
                 let outcome = fanout.outcome();
                 if fanout.pending_ref() != Some(pending)
@@ -469,6 +506,25 @@ impl<S: StorageProvider> Engine<S> {
                 storage.put_group(&g)?;
                 if let Some(fanout) = rolled_back_fanout.as_ref() {
                     storage.put_outbound_fanout(fanout)?;
+                }
+                if let Some((queued_group, intent_id)) = queued_intent.as_ref() {
+                    use cgka_traits::storage::{QueuedIntentPreparation, RegeneratedArtifact};
+                    let mut record = storage
+                        .list_queued_outbound_intents(queued_group)?
+                        .into_iter()
+                        .find(|record| &record.id == intent_id)
+                        .ok_or(EngineError::QueuedIntentRecoveryFailed)?;
+                    let QueuedIntentPreparation::BoundArtifact {
+                        artifact: RegeneratedArtifact::PendingCommit { origin_message_id },
+                    } = &record.preparation
+                    else {
+                        return Err(EngineError::QueuedIntentRecoveryFailed);
+                    };
+                    if origin_commit_id.as_ref() != Some(origin_message_id) {
+                        return Err(EngineError::QueuedIntentRecoveryFailed);
+                    }
+                    record.preparation = QueuedIntentPreparation::Unprepared;
+                    storage.put_queued_outbound_intent(&record)?;
                 }
                 if let Some(message_id) = origin_commit_id.as_ref()
                     && let Some(maintenance) = storage.maintenance_storage()

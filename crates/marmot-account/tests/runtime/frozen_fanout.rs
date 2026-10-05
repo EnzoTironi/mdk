@@ -1,4 +1,3 @@
-
 #[derive(Clone, Default)]
 struct CrashDuringFanoutPublishAdapter {
     publishes: Arc<Mutex<Vec<TransportPublishRequest>>>,
@@ -273,7 +272,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
     .unwrap();
     fanout
         .set_application_message(OutboundApplicationMessage {
- authority: None,
+            authority: None,
             group_id: group_id.clone(),
             app_event_id: "terminal-app-event".into(),
             source_epoch: EpochId(1),
@@ -459,7 +458,11 @@ async fn queued_app_message_with_missing_route_remains_retryable() {
 async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot ordered fanout key").unwrap();
-    let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-ordered-fanout");
+    let mut alice = session(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice-ordered-fanout",
+    );
     let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-ordered-fanout");
     let bob_key_package = bob.fresh_key_package().await.unwrap();
     let created = alice
@@ -777,12 +780,8 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
         group_id.as_slice().to_vec(),
         vec![endpoint],
     );
-    let mut runtime = AccountDeviceRuntime::new(
-        alice,
-        adapter,
-        policy,
-        RecordingKeyPackages::default(),
-    );
+    let mut runtime =
+        AccountDeviceRuntime::new(alice, adapter, policy, RecordingKeyPackages::default());
     let payload = app_payload_for(&alice_hex, b"only one semantic message");
     let app_event_id = MarmotAppEvent::decode(&payload).unwrap().id;
 
@@ -799,7 +798,10 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
     assert!(effects.published_app_messages.is_empty());
     assert_eq!(effects.unresolved_app_messages.len(), 1);
     assert_eq!(effects.unresolved_app_messages[0].group_id, group_id);
-    assert_eq!(effects.unresolved_app_messages[0].app_event_id, app_event_id);
+    assert_eq!(
+        effects.unresolved_app_messages[0].app_event_id,
+        app_event_id
+    );
     assert_eq!(
         effects.unresolved_app_messages[0].message_id,
         transport_event_id
@@ -1004,7 +1006,11 @@ async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
         [PendingResolution::Confirmed { .. }]
     ));
     let attempts = adapter.publishes();
-    assert_eq!(attempts.len(), 3, "commit retry must release the frozen Welcome");
+    assert_eq!(
+        attempts.len(),
+        3,
+        "commit retry must release the frozen Welcome"
+    );
     assert_eq!(attempts[1].message, original_commit);
     let recovered_welcome = attempts
         .iter()
@@ -1734,5 +1740,117 @@ async fn invite_quorum_survives_restart() {
         assert_eq!(attempts[0].target.endpoints(), &[slow]);
         assert_eq!(attempts[0].message, fanouts[0].request().message);
         assert!(resumed.session().outbound_fanouts().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn current_queued_artifact_ack_after_restart_retires_binding_without_regeneration() {
+    for acknowledged_before_restart in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued-current.sqlite");
+        let key = SqlCipherKey::new("synthetic current queued restart key").unwrap();
+        let mut alice = current_session(&path, &key, b"current-queued-restart");
+        let sender = hex::encode(alice.self_id().as_slice());
+        let created = alice
+            .create_group(CreateGroupRequest {
+                name: "current queued restart".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            created.effects.publish.as_slice(),
+            [PublishWork::FoundingGroupCreated { .. }]
+        ));
+        let group = created.group_id;
+        alice
+            .queue_app_message_with_audit_context(
+                group.clone(),
+                app_payload_for(&sender, b"one saved intent"),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let prepared = alice.advance_convergence(&group).await.unwrap();
+        let [
+            PublishWork::ApplicationMessage {
+                msg,
+                queued_intent,
+                app_event_id,
+                source_epoch,
+                retention,
+                authority,
+                ..
+            },
+        ] = prepared.publish.as_slice()
+        else {
+            panic!("one queued application");
+        };
+        assert!(queued_intent.is_some());
+        let exact = msg.clone();
+        let TransportEnvelope::GroupMessage { transport_group_id } = &exact.envelope else {
+            panic!("group message");
+        };
+        let mut fanout = OutboundFanout::stage(
+            TransportPublishRequest {
+                account_id: alice.self_id(),
+                message: exact.clone(),
+                target: TransportPublishTarget::Group {
+                    group_id: group.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![TransportEndpoint::from("wss://queued-original.example")],
+                },
+                required_acks: 1,
+            },
+            None,
+            Some(group.clone()),
+            0,
+        )
+        .unwrap();
+        fanout
+            .set_application_message(OutboundApplicationMessage {
+                group_id: group.clone(),
+                app_event_id: app_event_id.clone(),
+                source_epoch: *source_epoch,
+                retention: *retention,
+                authority: *authority,
+            })
+            .unwrap();
+        fanout.mark_attempt_started(0).unwrap();
+        if acknowledged_before_restart {
+            fanout.mark_target_accepted(0).unwrap();
+        }
+        alice.put_outbound_fanout(&fanout).unwrap();
+        drop(alice);
+        let reopened = current_session(&path, &key, b"current-queued-restart");
+        let adapter = RecordingAdapter::default();
+        let replacement = StaticTransportRouting::new(vec![]).with_group_route(
+            group.clone(),
+            vec![0xEE; 32],
+            vec![TransportEndpoint::from("wss://queued-replacement.example")],
+        );
+        let mut runtime = AccountDeviceRuntime::new(
+            reopened,
+            adapter.clone(),
+            replacement,
+            RecordingKeyPackages::default(),
+        );
+        let resumed = runtime.resume_outbound_fanouts().await.unwrap();
+        assert_eq!(resumed.published_app_messages.len(), 1);
+        assert!(!runtime.has_queued_outbound_intents(&group).unwrap());
+        let attempts = adapter.publishes();
+        assert_eq!(attempts.len(), usize::from(!acknowledged_before_restart));
+        assert!(attempts.iter().all(|attempt| attempt.message == exact
+            && attempt.target.endpoints() == fanout.request().target.endpoints()));
+        runtime.advance_convergence(&group).await.unwrap();
+        assert_eq!(adapter.publishes().len(), attempts.len());
+        runtime
+            .acknowledge_published_app_messages(&resumed.published_app_messages)
+            .unwrap();
+        assert!(runtime.session().outbound_fanouts().unwrap().is_empty());
     }
 }

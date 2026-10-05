@@ -57,6 +57,7 @@ async fn retained_submission_preserves_noncanonical_json_bytes_for_engine_handof
             },
             created_at_ms: 1,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
         })
         .unwrap();
     assert_eq!(

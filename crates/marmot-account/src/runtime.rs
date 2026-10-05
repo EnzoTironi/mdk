@@ -2707,14 +2707,14 @@ where
             match work {
                 PublishWork::ApplicationMessage {
                     msg,
-                    queued_intent,
+                    queued_intent: _,
                     group_id,
                     app_event_id,
                     source_epoch,
                     retention,
                     authority,
                 } => {
-                    let status = Box::pin(self.publish_one(
+                    Box::pin(self.publish_one(
                         msg,
                         None,
                         Some(OutboundApplicationMessage {
@@ -2729,13 +2729,13 @@ where
                         context.clone(),
                     ))
                     .await?;
-                    self.resolve_regenerated_queued_intent(queued_intent, status);
                 }
-                PublishWork::Proposal { msg, queued_intent } => {
-                    let status =
-                        Box::pin(self.publish_one(msg, None, None, output, queue, context.clone()))
-                            .await?;
-                    self.resolve_regenerated_queued_intent(queued_intent, status);
+                PublishWork::Proposal {
+                    msg,
+                    queued_intent: _,
+                } => {
+                    Box::pin(self.publish_one(msg, None, None, output, queue, context.clone()))
+                        .await?;
                 }
                 PublishWork::GroupCreated { welcomes, pending } => {
                     Box::pin(self.publish_group_created(
@@ -2807,6 +2807,10 @@ where
                     && outcome.accepted_targets > 0
                     && outcome.fanout_complete
                     && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    && self
+                        .session
+                        .regenerated_queued_intent_for_message(fanout.message_id())
+                        .is_none()
                 {
                     self.session.delete_outbound_fanout(fanout.message_id())?;
                 }
@@ -2851,6 +2855,16 @@ where
                     blocked_groups.insert(fanout_group);
                 }
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
+                let queued_intent = self
+                    .session
+                    .regenerated_queued_intent_for_message(fanout.message_id());
+                self.resolve_regenerated_queued_intent(
+                    queued_intent,
+                    PublishStatus {
+                        accepted_by_any_endpoint: true,
+                        ..Default::default()
+                    },
+                );
                 record_published_application_fanout(&fanout, &mut output);
                 output.fanout.push(outcome);
             } else {
@@ -2864,7 +2878,23 @@ where
                 });
                 record_failed_application_fanout(&fanout, reason, &mut output);
                 output.fanout.push(outcome);
-                self.session.delete_outbound_fanout(fanout.message_id())?;
+                let queued_intent = self
+                    .session
+                    .regenerated_queued_intent_for_message(fanout.message_id());
+                self.resolve_regenerated_queued_intent(
+                    queued_intent,
+                    PublishStatus {
+                        terminal_failure: true,
+                        ..Default::default()
+                    },
+                );
+                if self
+                    .session
+                    .regenerated_queued_intent_for_message(fanout.message_id())
+                    .is_none()
+                {
+                    self.session.delete_outbound_fanout(fanout.message_id())?;
+                }
             }
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
@@ -3126,9 +3156,8 @@ where
                 .is_err()
             {
                 // The message is externally visible, so do not report the send
-                // as failed. Keep the durable intent and re-arm convergence;
-                // the duplicate-safe publish layer can retry cleanup later.
-                self.session.retry_regenerated_queued_intent(&intent);
+                // as failed. Keep its bound artifact and exact fanout; a later
+                // pass can retry cleanup without regenerating cryptography.
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "resolve_regenerated_queued_intent",
@@ -3144,9 +3173,8 @@ where
             {
                 // Every target failed terminally, so the logical queued intent
                 // is complete even though it was not delivered. If durable
-                // cleanup fails, retain and re-arm it rather than losing the
-                // obligation.
-                self.session.retry_regenerated_queued_intent(&intent);
+                // cleanup fails, retain the binding and frozen terminal fanout
+                // rather than preparing another artifact.
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "resolve_regenerated_queued_intent",
@@ -3155,10 +3183,9 @@ where
                 );
             }
         } else {
-            // Nothing accepted, but routing/setup failure or at least one
-            // retryable or ambiguously exposed target means terminal failure
-            // has not been proved. Preserve and re-arm the durable intent.
-            self.session.retry_regenerated_queued_intent(&intent);
+            // Retry the exact frozen fanout for routing/setup failures and
+            // ambiguous exposure. A relay observation does not authorize
+            // regeneration of the queued intent's cryptographic artifact.
         }
     }
 
@@ -3881,7 +3908,12 @@ where
             }
             Box::pin(self.drive_outbound_fanout(fanout, output, queue, context)).await
         } else {
-            self.publish_legacy_one(message, output, context).await
+            let queued_intent = self
+                .session
+                .regenerated_queued_intent_for_message(&message.id);
+            let status = self.publish_legacy_one(message, output, context).await?;
+            self.resolve_regenerated_queued_intent(queued_intent, status);
+            Ok(status)
         }
     }
 
@@ -4142,8 +4174,16 @@ where
             // bytes when the per-target delay expires.
             output.pending_convergence.push(group_id.clone());
         }
+        let queued_intent = self
+            .session
+            .regenerated_queued_intent_for_message(fanout.message_id());
+        self.resolve_regenerated_queued_intent(queued_intent, status);
         output.fanout.push(fanout_outcome.clone());
         if fanout_outcome.fanout_complete
+            && self
+                .session
+                .regenerated_queued_intent_for_message(fanout.message_id())
+                .is_none()
             && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
             && !(fanout_outcome.accepted_targets > 0 && fanout.application_message().is_some())
         {
