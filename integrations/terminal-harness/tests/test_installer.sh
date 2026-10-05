@@ -8,6 +8,7 @@ unset MARMOT_HARNESS_EXECUTION_PROFILE
 kind="${1:?usage: test_installer.sh claude|codex|pi|opencode}"
 case "$kind" in
     claude)
+        connector_emoji="🦀"
         env_prefix="WN_CLAUDE"
         display_name="Claude Code"
         default_home="$HOME/.marmot-agents/claude"
@@ -16,6 +17,7 @@ case "$kind" in
         agent_label="claude-harness-agent"
         ;;
     codex)
+        connector_emoji="🧑‍💻"
         env_prefix="WN_CODEX"
         display_name="Codex"
         default_home="$HOME/.marmot-agents/codex"
@@ -24,6 +26,7 @@ case "$kind" in
         agent_label="codex-harness-agent"
         ;;
     pi)
+        connector_emoji="🥧"
         env_prefix="WN_PI"
         display_name="Pi"
         default_home="$HOME/.marmot-agents/pi"
@@ -32,6 +35,7 @@ case "$kind" in
         agent_label="pi-harness-agent"
         ;;
     opencode)
+        connector_emoji="🛠️"
         env_prefix="WN_OPENCODE"
         display_name="OpenCode"
         default_home="$HOME/.marmot-agents/harnesses"
@@ -106,6 +110,7 @@ run_linux_service_case() {
     SYSTEMCTL_ACTIVE="$active" \
     SYSTEMCTL_LOG="$log_file" \
     TEST_LEGACY_BOOTSTRAP="${TEST_LEGACY_BOOTSTRAP:-0}" \
+    TEST_NO_NPROFILE="${TEST_NO_NPROFILE:-0}" \
     TEST_HARNESS_BINARY="$harness_binary" \
     HOME="$fixture_root/home" \
     MARMOT_HOME="$fixture_root/marmot-home" \
@@ -222,7 +227,9 @@ case "$code" in
         [ "${TEST_LEGACY_BOOTSTRAP:-0}" = 1 ] || printf '%s\n' npub-test
         ;;
     *'json.load(sys.stdin).get("nprofile", "")'*)
-        [ "${TEST_LEGACY_BOOTSTRAP:-0}" = 1 ] || printf '%s\n' nprofile-test
+        if [ "${TEST_LEGACY_BOOTSTRAP:-0}" != 1 ] && [ "${TEST_NO_NPROFILE:-0}" != 1 ]; then
+            printf '%s\n' nprofile-test
+        fi
         ;;
     *) exit 1 ;;
 esac
@@ -235,6 +242,18 @@ installer_output="$fixture_root/installer-output.log"
 grep -F "npub: npub-test" "$installer_output" >/dev/null
 grep -F "nprofile: nprofile-test" "$installer_output" >/dev/null
 grep -F "Services were installed and started for the current user." "$installer_output" >/dev/null
+grep -F "Phone conversation verification is still required." "$installer_output" >/dev/null
+grep -F "Compare this full npub on your trusted computer" "$installer_output" >/dev/null
+grep -F "\"$connector_emoji $display_name\"" "$installer_output" >/dev/null
+grep -F "This installer does not publish a public agent profile." "$installer_output" >/dev/null
+grep -F "Grant it admin permission if you want it to update that group's title." "$installer_output" >/dev/null
+grep -F "phone-to-backend connection is not verified." "$installer_output" >/dev/null
+grep -F "fresh word in this group" "$installer_output" >/dev/null
+grep -F "/new does not erase" "$installer_output" >/dev/null
+if grep -Fq "Install complete." "$installer_output"; then
+    echo "$kind installer confused software installation with verified conversation setup" >&2
+    exit 1
+fi
 if grep -Fq "To run it manually:" "$installer_output"; then
     echo "$kind installer printed manual-start steps after starting services" >&2
     exit 1
@@ -245,6 +264,21 @@ TEST_LEGACY_BOOTSTRAP=1 run_linux_service_case "$fixture_root" 1 "$legacy_log" -
 legacy_output="$fixture_root/installer-output.log"
 grep -F "White Noise agent identity was not returned by this wn-agent release." "$legacy_output" >/dev/null
 grep -F "Inspect the bootstrap response at: $fixture_root/marmot-home/bootstrap.json" "$legacy_output" >/dev/null
+grep -F "Pairing is paused: retrieve the full agent npub" "$legacy_output" >/dev/null
+if grep -Fq "Add the verified agent account" "$legacy_output"; then
+    echo "$kind installer offered pairing steps without an agent identity" >&2
+    exit 1
+fi
+grep -F "then rerun guided setup." "$legacy_output" >/dev/null
+
+TEST_NO_NPROFILE=1 run_linux_service_case "$fixture_root" 1 "$fixture_root/systemctl-no-nprofile.log" --no-service
+partial_output="$fixture_root/installer-output.log"
+grep -F "npub: npub-test" "$partial_output" >/dev/null
+grep -F "Add the verified agent account" "$partial_output" >/dev/null
+if grep -Fq "Pairing is paused" "$partial_output"; then
+    echo "$kind installer blocked full-npub pairing because optional nprofile was missing" >&2
+    exit 1
+fi
 assert_log_contains "$fresh_log" "--user enable --now $agent_service"
 assert_log_contains "$fresh_log" "--user enable --now $harness_service"
 assert_log_excludes "$fresh_log" "--user restart $agent_service"
@@ -465,6 +499,16 @@ esac
 case "$installer_dry_run" in
     *"Dry run complete. No services were installed or started."* ) ;;
     *) echo "$kind installer dry-run claimed that services were started" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"Dry run: no agent identity was created or verified."*"Installation preview."* ) ;;
+    *) echo "$kind installer dry-run did not distinguish preview from real pairing" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"Compare this full npub"* | *"Connector files installed."* )
+        echo "$kind installer dry-run offered a placeholder as a verified identity" >&2
+        exit 1
+        ;;
 esac
 case "$installer_dry_run" in
     *"--socket $default_home/dev/wn-agent.sock"* ) ;;
