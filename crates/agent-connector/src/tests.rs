@@ -7805,6 +7805,10 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     )
     .await;
 
+    // Additions must supersede the initial second-resolution replaceable
+    // lists too; a same-second tie can retain the older inbox copy.
+    sleep(Duration::from_millis(1_100)).await;
+
     let connector = AgentConnector::open(test_config(
         dir.path(),
         dir.path().join("dev").join("wn-agent.sock"),
