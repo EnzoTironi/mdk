@@ -10,6 +10,12 @@
   mode. Regenerate Swift/Kotlin bindings and update record initializers for the new
   optional field. Optional passed-step previews retain readiness when dismissed
   before approval.
+- `Marmot::message_reactions` returns complete local reaction details for one exact
+  account/group/message, with one effective entry per sender/emoji and no
+  conversation-preview cap. Missing, hidden, deleted, invalidated and
+  retention-pruned targets return no participants; blocked reactors are excluded.
+  The read performs no network work or conversation-history scan.
+  Regenerate matching Swift/Kotlin bindings to call `messageReactions`.
 
 ### Changed
 
