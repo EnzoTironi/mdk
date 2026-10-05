@@ -14,6 +14,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   a borrowed selected revision without exposing account/group identifiers.
   Newer identical drafts remain distinguishable. Rebuild with matching generated
   headers/libraries; the row layout changes. See the shared chat-list contract.
+- Add `marmot_message_reactions` and the owned
+  `MarmotTimelineUserReactionList` root/free for complete exact-message details.
+  Existing record layouts are unchanged; the new symbols require matching
+  generated headers and native libraries.
 
 ## [0.12.0] - 2026-10-02
 
