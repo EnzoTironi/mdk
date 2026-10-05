@@ -13,6 +13,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   incomplete searches, relay budgets, unusable discovery routes, invalid
   packages and lifetimes, incompatible capabilities, and timeouts. Existing
   status values remain unchanged; use the matching generated header and library.
+- Add `marmot_message_reactions` and the owned
+  `MarmotTimelineUserReactionList` root/free for complete exact-message details.
+  Existing record layouts are unchanged; the new symbols require matching
+  generated headers and native libraries.
 
 ## [0.12.0] - 2026-10-02
 
