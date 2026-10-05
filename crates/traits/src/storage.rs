@@ -493,7 +493,7 @@ pub struct QueuedOutboundIntent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueuedIntentPreparation {
-    Unprepared,
+    Unprepared {},
     BoundArtifact { artifact: RegeneratedArtifact },
 }
 
@@ -1086,7 +1086,7 @@ mod tests {
             intent: SendIntent::SelfUpdate { group_id },
             created_at_ms: 1,
             reissue_attempts: 0,
-            preparation: QueuedIntentPreparation::Unprepared,
+            preparation: QueuedIntentPreparation::Unprepared {},
         };
         let mut encoded = serde_json::to_value(&record).unwrap();
         assert_eq!(
@@ -1106,6 +1106,42 @@ mod tests {
         encoded["preparation"] =
             serde_json::json!({"state":"unprepared","artifact":{"kind":"message"}});
         assert!(serde_json::from_value::<QueuedOutboundIntent>(encoded).is_err());
+        for artifact in [
+            RegeneratedArtifact::Message {
+                message_id: MessageId::new(vec![3; 32]),
+            },
+            RegeneratedArtifact::PendingCommit {
+                origin_message_id: MessageId::new(vec![4; 32]),
+            },
+        ] {
+            let bound = QueuedOutboundIntent {
+                preparation: QueuedIntentPreparation::BoundArtifact { artifact },
+                ..record.clone()
+            };
+            let encoded = serde_json::to_value(&bound).unwrap();
+            assert_eq!(
+                serde_json::from_value::<QueuedOutboundIntent>(encoded.clone()).unwrap(),
+                bound
+            );
+            let mut unknown_state_field = encoded.clone();
+            unknown_state_field["preparation"]["unexpected"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<QueuedOutboundIntent>(unknown_state_field).is_err());
+            let mut unknown_artifact_field = encoded.clone();
+            unknown_artifact_field["preparation"]["artifact"]["unexpected"] =
+                serde_json::json!(true);
+            assert!(
+                serde_json::from_value::<QueuedOutboundIntent>(unknown_artifact_field).is_err()
+            );
+            let mut missing_artifact = encoded.clone();
+            missing_artifact["preparation"]
+                .as_object_mut()
+                .unwrap()
+                .remove("artifact");
+            assert!(serde_json::from_value::<QueuedOutboundIntent>(missing_artifact).is_err());
+            let mut unknown_kind = encoded;
+            unknown_kind["preparation"]["artifact"]["kind"] = serde_json::json!("other");
+            assert!(serde_json::from_value::<QueuedOutboundIntent>(unknown_kind).is_err());
+        }
     }
 
     #[test]

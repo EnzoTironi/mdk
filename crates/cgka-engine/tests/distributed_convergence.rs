@@ -3049,7 +3049,7 @@ async fn engine_defers_child_commit_until_parent_arrives() {
             },
             created_at_ms: 1_001,
             reissue_attempts: 0,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .expect("persist already-queued admin group-state intent");
 
@@ -3324,7 +3324,7 @@ fn queue_intent(
             intent,
             created_at_ms,
             reissue_attempts: 0,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .expect("persist queued outbound intent");
 }
@@ -4621,7 +4621,7 @@ async fn durable_unrecoverable_halt_blocks_queued_drain_without_rehydration() {
             },
             created_at_ms: 1,
             reissue_attempts: 0,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
     let mut stored_group = storage.get_group(&group_id).unwrap();
@@ -9759,7 +9759,7 @@ async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
             },
             created_at_ms: 0,
             reissue_attempts: 0,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
 
@@ -9806,7 +9806,7 @@ async fn restart_schedules_groups_with_durable_queued_intents() {
             },
             created_at_ms: 1,
             reissue_attempts: 0,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
     drop(alice);
@@ -9859,7 +9859,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             },
             created_at_ms: 0,
             reissue_attempts: 0,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
     let app_intent_id = MessageId::new(b"later-app".to_vec());
@@ -9874,7 +9874,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             },
             created_at_ms: 1,
             reissue_attempts: 0,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
 

@@ -2962,7 +2962,7 @@ impl HarnessClient {
                 QueuedIntentPreparation::BoundArtifact {
                     artifact: RegeneratedArtifact::PendingCommit { origin_message_id },
                 } => origin_message_id == message.id,
-                QueuedIntentPreparation::Unprepared => false,
+                QueuedIntentPreparation::Unprepared {} => false,
             });
         if !bound || self.storage().outbound_fanout(&message.id)?.is_some() {
             return Ok(());

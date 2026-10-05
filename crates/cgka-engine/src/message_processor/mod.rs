@@ -1308,7 +1308,7 @@ impl<S: StorageProvider> Engine<S> {
             .find(|record| &record.id == intent_id)
             .ok_or(EngineError::QueuedIntentRecoveryFailed)?;
         let message_id = match &record.preparation {
-            QueuedIntentPreparation::Unprepared => {
+            QueuedIntentPreparation::Unprepared {} => {
                 self.schedule_pending_convergence_group(group_id);
                 return Ok(());
             }
@@ -1345,7 +1345,7 @@ impl<S: StorageProvider> Engine<S> {
                 )
                 .map_err(|_| EngineError::QueuedIntentReissueRefused)?;
         }
-        record.preparation = QueuedIntentPreparation::Unprepared;
+        record.preparation = QueuedIntentPreparation::Unprepared {};
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 storage.put_outbound_fanout(&fanout)?;
@@ -3573,7 +3573,7 @@ impl<S: StorageProvider> Engine<S> {
             intent,
             created_at_ms,
             reissue_attempts,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
     }
 

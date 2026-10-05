@@ -70,6 +70,6 @@ pub(crate) fn sample_queued_intent(id: MessageId, group_id: GroupId) -> QueuedOu
         },
         created_at_ms: 42,
         reissue_attempts: 0,
-        preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+        preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
     }
 }

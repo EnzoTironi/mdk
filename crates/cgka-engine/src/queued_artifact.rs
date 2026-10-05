@@ -32,7 +32,7 @@ impl<S: StorageProvider> Engine<S> {
         record: &QueuedOutboundIntent,
         result: &SendResult,
     ) -> Result<(), EngineError> {
-        if record.preparation != QueuedIntentPreparation::Unprepared {
+        if !matches!(record.preparation, QueuedIntentPreparation::Unprepared {}) {
             return Err(EngineError::QueuedIntentRecoveryFailed);
         }
         let artifact = match result {
@@ -133,7 +133,7 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(EngineError::QueuedIntentRecoveryFailed);
             }
             let (message_id, expected_kind, is_pending) = match &record.preparation {
-                QueuedIntentPreparation::Unprepared => continue,
+                QueuedIntentPreparation::Unprepared {} => continue,
                 QueuedIntentPreparation::BoundArtifact {
                     artifact: RegeneratedArtifact::Message { message_id },
                 } => {
@@ -707,7 +707,7 @@ mod tests {
             .list_queued_outbound_intents(&group)
             .unwrap()
             .remove(0);
-        assert_eq!(reset.preparation, QueuedIntentPreparation::Unprepared);
+        assert_eq!(reset.preparation, QueuedIntentPreparation::Unprepared {});
         assert_eq!(reset.id, old_row.id);
         assert_eq!(reset.intent, old_row.intent);
         assert!(storage.outbound_fanout(&old_id).unwrap().is_none());
@@ -786,7 +786,7 @@ mod tests {
         original.publish_failed(pending).await.unwrap();
         assert_eq!(
             storage.list_queued_outbound_intents(&group).unwrap()[0].preparation,
-            QueuedIntentPreparation::Unprepared
+            QueuedIntentPreparation::Unprepared {}
         );
         assert!(matches!(
             storage

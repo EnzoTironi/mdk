@@ -274,7 +274,7 @@ mod tests {
             },
             created_at_ms: u64::from(id),
             reissue_attempts: 0,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         }
     }
 

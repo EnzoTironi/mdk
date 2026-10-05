@@ -523,7 +523,7 @@ impl<S: StorageProvider> Engine<S> {
                     if origin_commit_id.as_ref() != Some(origin_message_id) {
                         return Err(EngineError::QueuedIntentRecoveryFailed);
                     }
-                    record.preparation = QueuedIntentPreparation::Unprepared;
+                    record.preparation = QueuedIntentPreparation::Unprepared {};
                     storage.put_queued_outbound_intent(&record)?;
                 }
                 if let Some(message_id) = origin_commit_id.as_ref()

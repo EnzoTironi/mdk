@@ -664,7 +664,7 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
             },
             created_at_ms: 1,
             reissue_attempts: 0,
-            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
     let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
@@ -822,7 +822,7 @@ async fn resumable_public_background_advance_retains_progress_until_complete() {
                 },
                 created_at_ms: iteration,
                 reissue_attempts: 0,
-                preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+                preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
             })
             .unwrap();
         assert_ne!(generation, storage.mls_write_generation());
@@ -1165,7 +1165,7 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
         },
         created_at_ms: 1,
         reissue_attempts: 0,
-        preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared,
+        preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
     };
     storage.put_queued_outbound_intent(&queued).unwrap();
     let before = replay_state(&storage, &group_id);
