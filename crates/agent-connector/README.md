@@ -81,6 +81,17 @@ non-ASCII components can consume multiple bytes per character. A custom
 `--socket` changes this calculation: measure both its final address and
 `<parent>/.sock.<pid>.<filename>/<filename>` against the platform limit.
 
+That budget covers the regular control socket only. The daemon also binds the
+owner-only `<home>/dev/usage-diagnostics.sock` management socket. Its final
+address uses `H + 27` bytes and its staging address uses `H + 57 + P`, so a home
+that supports both sockets must fit `107 - 57 - P` bytes on Linux or
+`103 - 57 - P` on macOS (43 and 39 bytes with a seven-digit PID). A custom
+`--socket` does not move this management socket. If its bind fails, regular
+control continues and startup warns that local diagnostics controls are
+unavailable; usage-diagnostics commands cannot change a running daemon's
+consent through that missing socket. Use a shorter private home to retain
+those controls; do not relax permissions or automatically enable diagnostics.
+
 In another terminal, create or reuse the local agent account and print the phone invite details:
 
 ```sh
