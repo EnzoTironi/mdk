@@ -699,6 +699,9 @@ pub struct AccountRelayListBootstrap {
     /// Publication-only copies of public directory records. Never advertised
     /// as NIP-65 write relays or used for KeyPackage publication.
     pub indexer_relays: Vec<TransportEndpoint>,
+    /// Relays declared in the kind-10050 inbox list. Empty declares
+    /// `default_relays`, so one list still serves both kinds.
+    pub inbox_relays: Vec<TransportEndpoint>,
 }
 
 impl AccountRelayListBootstrap {
@@ -715,12 +718,34 @@ impl AccountRelayListBootstrap {
             default_relays,
             bootstrap_relays,
             indexer_relays: Vec::new(),
+            inbox_relays: Vec::new(),
         }
     }
 
     pub fn with_indexer_relays(mut self, indexer_relays: Vec<TransportEndpoint>) -> Self {
         self.indexer_relays = indexer_relays;
         self
+    }
+
+    pub fn with_inbox_relays(mut self, inbox_relays: Vec<TransportEndpoint>) -> Self {
+        self.inbox_relays = inbox_relays;
+        self
+    }
+
+    /// The relays a published kind-10050 inbox list declares.
+    pub fn inbox_declaration(&self) -> &[TransportEndpoint] {
+        if self.inbox_relays.is_empty() {
+            &self.default_relays
+        } else {
+            &self.inbox_relays
+        }
+    }
+
+    fn declared_relays(&self, list_kind: NostrAccountRelayListKind) -> Vec<TransportEndpoint> {
+        match list_kind {
+            NostrAccountRelayListKind::Nip65 => self.default_relays.clone(),
+            NostrAccountRelayListKind::Inbox => self.inbox_declaration().to_vec(),
+        }
     }
 }
 
@@ -1644,11 +1669,13 @@ impl MarmotApp {
     pub(crate) fn install_local_open_gate(
         &self,
         account_ref: &str,
+        stage: AccountStartupStage,
         reached: std::sync::mpsc::Sender<()>,
         proceed: std::sync::mpsc::Receiver<()>,
     ) -> Result<(), AppError> {
         let label = self.account_home().account(account_ref)?.label;
-        self.local_open_gates.install(label, reached, proceed);
+        self.local_open_gates
+            .install(label, stage, reached, proceed);
         Ok(())
     }
 
@@ -1733,9 +1760,6 @@ impl MarmotApp {
         defer_group_hydration: bool,
         startup_progress: Option<&AccountStartupProgress>,
     ) -> Result<AppClient, AppError> {
-        // Only a starting worker's ready-waiter reads the stage; other opens
-        // advance a cell nobody observes.
-        let startup_progress = startup_progress.cloned().unwrap_or_default();
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
@@ -1745,20 +1769,30 @@ impl MarmotApp {
             .as_ref()
             .map(runtime::RuntimeLifecycle::begin_account_open)
             .transpose()?;
-        startup_progress.enter(AccountStartupStage::OpenQueued);
-        let blocking_progress = startup_progress.clone();
+        // Only a starting worker records stage spans; other opens pass `None`.
+        let enter_stage = |progress: Option<&AccountStartupProgress>, stage| {
+            if let Some(progress) = progress {
+                progress.enter(stage);
+            }
+        };
+        enter_stage(startup_progress, AccountStartupStage::OpenQueued);
+        let blocking_progress = startup_progress.cloned();
         let open = blocking_app_task(move || {
             let _permit = permit;
-            blocking_progress.enter(AccountStartupStage::AccountState);
+            enter_stage(
+                blocking_progress.as_ref(),
+                AccountStartupStage::AccountState,
+            );
             app.ensure_account_state(&label)?;
-            blocking_progress.enter(AccountStartupStage::SessionOpen);
+            enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
             let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
             #[cfg(test)]
-            app.local_open_gates.wait(&label);
+            app.local_open_gates
+                .wait(&label, AccountStartupStage::SessionOpen);
             open
         })
         .await?;
-        startup_progress.enter(AccountStartupStage::ClientRestore);
+        enter_stage(startup_progress, AccountStartupStage::ClientRestore);
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
@@ -2079,11 +2113,17 @@ impl MarmotApp {
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
+        let declared_relays = bootstrap
+            .default_relays
+            .iter()
+            .chain(&bootstrap.inbox_relays)
+            .cloned()
+            .collect::<Vec<_>>();
         let indexer_endpoints = self.public_indexer_publish_endpoints(
             &bootstrap.indexer_relays,
             &endpoints,
             &endpoints,
-            &bootstrap.default_relays,
+            &declared_relays,
         );
 
         let mut requests = Vec::with_capacity(4);
@@ -2096,7 +2136,7 @@ impl MarmotApp {
                 event: NostrAccountRelayListPublication {
                     account_id: account_id.clone(),
                     list_kind,
-                    relays: bootstrap.default_relays.clone(),
+                    relays: bootstrap.declared_relays(list_kind),
                     publish_endpoints: endpoints.clone(),
                 }
                 .to_event()?,
@@ -2196,7 +2236,11 @@ impl MarmotApp {
             inbox: AccountRelayListState {
                 kind: KIND_MARMOT_INBOX_RELAY_LIST,
                 created_at: requests[1].event.created_at,
-                relays,
+                relays: bootstrap
+                    .inbox_declaration()
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
                 read_relays: Vec::new(),
                 write_relays: Vec::new(),
             },
@@ -2581,12 +2625,18 @@ impl MarmotApp {
             bootstrap
                 .default_relays
                 .iter()
+                .chain(&bootstrap.inbox_relays)
                 .chain(&relays.read_relays)
                 .chain(&relays.write_relays)
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            bootstrap.default_relays.clone()
+            bootstrap
+                .default_relays
+                .iter()
+                .chain(&bootstrap.inbox_relays)
+                .cloned()
+                .collect::<Vec<_>>()
         };
         let indexer_endpoints = self.public_indexer_publish_endpoints(
             &bootstrap.indexer_relays,
@@ -2611,7 +2661,7 @@ impl MarmotApp {
                 NostrAccountRelayListPublication {
                     account_id: account_id.clone(),
                     list_kind: *list_kind,
-                    relays: bootstrap.default_relays.clone(),
+                    relays: bootstrap.declared_relays(*list_kind),
                     publish_endpoints: endpoints.clone(),
                 }
                 .to_event()?
@@ -2691,7 +2741,7 @@ impl MarmotApp {
                         kind: KIND_MARMOT_INBOX_RELAY_LIST,
                         created_at: request.event.created_at,
                         relays: bootstrap
-                            .default_relays
+                            .inbox_declaration()
                             .iter()
                             .map(|endpoint| endpoint.0.clone())
                             .collect(),
@@ -2745,6 +2795,10 @@ impl MarmotApp {
             (
                 bootstrap.default_relays.as_slice(),
                 "account relay-list declaration",
+            ),
+            (
+                bootstrap.inbox_relays.as_slice(),
+                "account inbox relay-list declaration",
             ),
             (
                 bootstrap.bootstrap_relays.as_slice(),
@@ -4361,6 +4415,43 @@ impl MarmotApp {
         }))
     }
 
+    /// One member's inbox route, by the same precedence as `routing_for`: a
+    /// local account's own inbox, else the safe inbox of its directory entry.
+    fn member_inbox_route(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<Vec<TransportEndpoint>>, AppError> {
+        let local = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex);
+        if let Some(account) = local {
+            let profile = self.profile_for_account(account);
+            return Ok(Some(
+                profile
+                    .inbox_endpoints
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+            ));
+        }
+        let Some(entry) = self.directory_entry_for_account_id(account_id_hex)? else {
+            return Ok(None);
+        };
+        let endpoints = self.retain_safe_discovered_endpoints(
+            entry
+                .relay_lists
+                .inbox
+                .relays
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect(),
+            "directory inbox routing",
+        );
+        Ok((!endpoints.is_empty()).then_some(endpoints))
+    }
+
     fn latest_key_package(&self, label: &str) -> Result<KeyPackage, AppError> {
         let path = self.key_package_record_path(label);
         if !path.exists() {
@@ -5610,6 +5701,9 @@ impl MarmotApp {
         if ready.contains(label) {
             return Ok(());
         }
+        #[cfg(test)]
+        self.local_open_gates
+            .wait(label, AccountStartupStage::AccountState);
         // Run KeyPackage cutover before any other account-storage access. The
         // cutover uses pre-existence of the encrypted account database as the
         // durable distinction between a fresh local account and an upgraded
@@ -6044,6 +6138,8 @@ impl MarmotApp {
         self.record_account_app_event_at(label, message, unix_now_seconds())
     }
 
+    /// Commit source projection atomically; optional outgoing retention runs
+    /// after the outermost commit and cannot reject accepted publication.
     pub(crate) fn record_account_app_event_at(
         &self,
         label: &str,
@@ -6059,6 +6155,14 @@ impl MarmotApp {
                 message.retention,
                 message.authority,
             )?;
+            if message.direction == "sent" {
+                storage.retain_attachment_uploads_after_commit(
+                    &message.group_id_hex,
+                    &message.message_id_hex,
+                    received_at,
+                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                );
+            }
             self.app_projection_update(label, storage_update)
         })
     }
@@ -6078,10 +6182,20 @@ impl MarmotApp {
                 message.retention,
                 message.authority,
             )?;
+            if message.direction == "sent" {
+                storage.retain_attachment_uploads_after_commit(
+                    &message.group_id_hex,
+                    &message.message_id_hex,
+                    now,
+                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                );
+            }
             self.app_projection_update(label, storage_update)
         })
     }
 
+    /// Finalize accepted source authority and retry outgoing byte promotion even
+    /// when retention metadata was already committed by an earlier fanout pass.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize_account_app_event_source_retention(
         &self,
@@ -6112,6 +6226,12 @@ impl MarmotApp {
                 source_epoch,
                 retention,
             )?;
+            storage.retain_attachment_uploads_after_commit(
+                group_id_hex,
+                message_id_hex,
+                unix_now_seconds(),
+                runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+            );
             retention_update
                 .or(authority_update)
                 .map(|update| self.app_projection_update(label, update))
@@ -6156,15 +6276,17 @@ impl MarmotApp {
 
     /// Clear a `local_publish_failed` retraction on one locally-sent row, so a
     /// fresh send intent for an id a failed send already retracted starts from a
-    /// live pending row instead of a permanent tombstone.
+    /// live pending row instead of a permanent tombstone, and so a retracted
+    /// send that a relay later accepted stops claiming it reached no one.
     ///
     /// An exact retained-event retry reuses the failed send's id; identical
     /// independently authored chat messages within one second also share an id.
     /// `record_app_event`'s upsert keeps
     /// invalidation terminal, so the revival has to be explicit and has to carry
-    /// evidence — and the send intent is the evidence. Only this path can
-    /// produce one: replay seams (`observe_drained_session_events`, backfill,
-    /// rejoin reprocessing) re-record rows without ever entering a send.
+    /// evidence. Two callers hold some: the send path holds a fresh send intent,
+    /// and publish finalization holds a relay acceptance of the row's own
+    /// fanout. Replay seams (`observe_drained_session_events`, backfill, rejoin
+    /// reprocessing) re-record rows without either and never call this.
     pub(crate) fn clear_timeline_local_publish_failure(
         &self,
         label: &str,
@@ -6963,6 +7085,19 @@ impl AppTransportRouting {
 
     fn snapshot(&self) -> AppRoutingState {
         self.read().clone()
+    }
+
+    /// Replace one member's inbox route; `None` removes it.
+    fn replace_inbox_route(&self, member: MemberId, endpoints: Option<Vec<TransportEndpoint>>) {
+        let mut state = self.write();
+        match endpoints {
+            Some(endpoints) => {
+                state.inbox_routes.insert(member, endpoints);
+            }
+            None => {
+                state.inbox_routes.remove(&member);
+            }
+        }
     }
 
     fn replace(&self, state: AppRoutingState) {

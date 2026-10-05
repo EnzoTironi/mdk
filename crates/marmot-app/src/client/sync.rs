@@ -255,6 +255,18 @@ fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback
     }
 }
 
+fn event_encrypted_media_secret(
+    event: &cgka_traits::engine::GroupEvent,
+) -> Option<&cgka_traits::EncryptedMediaSecret> {
+    match event {
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            encrypted_media_secret,
+            ..
+        } => encrypted_media_secret.as_ref(),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum TransportReconciliationWork {
     Inbox(Vec<cgka_traits::TransportEndpoint>),
@@ -584,6 +596,8 @@ pub(crate) struct RouteComparison {
     /// certified nor admitted anything is quiet. A failed or timed-out relay,
     /// or a route this pass skipped, did not answer.
     pub(crate) answered: bool,
+    /// Queried relays that answered, including incomplete comparisons.
+    pub(crate) reached_endpoints: Vec<String>,
     /// What the route's relays returned, for the attempt's audit row only.
     /// Settlement never reads it.
     pub(crate) acquisition: super::audit_recovery::RouteAcquisition,
@@ -1774,8 +1788,12 @@ impl AppClient {
                 None,
                 self.app.allow_loopback_blob_endpoints(),
             ) {
-                match self.project_received_message(message, group_metadata.as_ref(), &mut summary)
-                {
+                match self.project_received_message(
+                    message,
+                    event_encrypted_media_secret(event),
+                    group_metadata.as_ref(),
+                    &mut summary,
+                ) {
                     Ok(Some(gossip_message_id)) => {
                         gossip_message_ids.insert(gossip_message_id);
                     }
@@ -4292,6 +4310,17 @@ impl AppClient {
                                         .since_seconds
                                         .is_some_and(|since| since >= window.since))
                                 && scope.goal.until_seconds <= window.until
+                                // A route certificate says nothing about a
+                                // required relay absent from this network pass.
+                                // A comparison pass queries the incremental
+                                // debt's relays; when that debt was not rebuilt
+                                // with this grant, another obligation's scope on
+                                // the same route can require a relay it lacks.
+                                && scope.goal.required_endpoints.iter().all(|endpoint| {
+                                    window.work.endpoints().iter().any(|queried| {
+                                        crate::relay_plane::same_relay(queried.as_str(), endpoint)
+                                    })
+                                })
                         })
                     });
                     let scope_certified = comparison_owned
@@ -4308,9 +4337,6 @@ impl AppClient {
                         storage_sqlite::RecoveryPassProgress::Progressed
                     } else if !refused
                         && compared.is_some_and(|compared| {
-                            // A route no comparison backend could compare
-                            // was not answered by its relays, so it spends
-                            // no parking budget.
                             compared.answered
                                 && compared.outcome
                                     != storage_sqlite::RecoveryComparisonOutcome::Unsupported
@@ -4326,8 +4352,18 @@ impl AppClient {
                             obligation_progress,
                             scope_progress,
                         ));
+                        if scope_progress != storage_sqlite::RecoveryPassProgress::Unserved
+                            || compared.is_some_and(|compared| {
+                                scope.goal.required_endpoints.iter().any(|required| {
+                                    compared.reached_endpoints.iter().any(|reached| {
+                                        crate::relay_plane::same_relay(required, reached)
+                                    })
+                                })
+                            })
+                        {
+                            progress.push((scope.goal.scope_id, scope_progress));
+                        }
                     }
-                    progress.push((scope.goal.scope_id, scope_progress));
                     let retained_known_event = match (&route, scope.goal.known_event_id) {
                         (Some(route), Some(event)) => storage.retained_recovery_event(
                             route,
@@ -4841,6 +4877,7 @@ impl AppClient {
     fn project_received_message(
         &mut self,
         message: crate::ReceivedMessage,
+        carried_media_secret: Option<&cgka_traits::EncryptedMediaSecret>,
         group_metadata: Option<&cgka_traits::Group>,
         summary: &mut SyncSummary,
     ) -> Result<Option<String>, AppError> {
@@ -4916,7 +4953,12 @@ impl AppClient {
         )?;
         if retains_encrypted_media
             && self
-                .remember_current_encrypted_media_secret(&message.group_id)
+                .remember_received_encrypted_media_secret(
+                    &message.group_id,
+                    message.source_epoch,
+                    &message.tags,
+                    carried_media_secret,
+                )
                 .is_err()
         {
             tracing::warn!(
@@ -5397,9 +5439,12 @@ impl AppClient {
                 source_received_at,
                 event_outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
-            ) && let Some(gossip_message_id) =
-                self.project_received_message(message, group_metadata.as_ref(), summary)?
-            {
+            ) && let Some(gossip_message_id) = self.project_received_message(
+                message,
+                event_encrypted_media_secret(event),
+                group_metadata.as_ref(),
+                summary,
+            )? {
                 gossip_message_ids.insert(gossip_message_id);
             }
             let updated_group =
@@ -6632,6 +6677,7 @@ mod tests {
                     epoch: client.runtime.group_record(&group_id).unwrap().epoch,
                     payload,
                     retention: None,
+                    encrypted_media_secret: None,
                 });
         }
         // A corrupt sender profile must not lose any already-ingested message,
