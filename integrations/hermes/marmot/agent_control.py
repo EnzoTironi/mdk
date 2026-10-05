@@ -24,11 +24,15 @@ _EXPECTED_RESPONSE_TYPES = {
     "timeline_list": frozenset({"timeline_page"}),
     "account_profile_lookup": frozenset({"profile_lookup"}),
     "account_publish_profile": frozenset({"profile_published"}),
+    "account_relay_lists": frozenset({"relay_lists"}),
+    "account_relay_list_add": frozenset({"relay_lists"}),
+    "account_relay_list_remove": frozenset({"relay_lists"}),
     "send_final": frozenset({"final_sent"}),
     "delete_message": frozenset({"app_event_sent"}),
     "send_reaction": frozenset({"app_event_sent"}),
     "remove_reaction": frozenset({"app_event_sent"}),
     "group_info": frozenset({"group_info"}),
+    "group_profile_update": frozenset({"group_profile_updated"}),
     "diagnostic_status": frozenset({"diagnostic_status"}),
     "send_media": frozenset({"final_sent"}),
     "download_media": frozenset({"media_downloaded"}),
@@ -208,15 +212,92 @@ class MarmotAgentControlClient:
         account_id_hex: str,
         name: str,
         display_name: Optional[str] = None,
+        about: Optional[str] = None,
+        picture: Optional[str] = None,
+        nip05: Optional[str] = None,
+        lud16: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return await self.request(
+        payload: Dict[str, Any] = {
+            "type": "account_publish_profile",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "name": str(name or ""),
+            "display_name": str(display_name) if display_name is not None else None,
+        }
+        # An omitted field keeps its published value; never send an empty string
+        # in its place, which would clear it.
+        for key, value in (
+            ("about", about),
+            ("picture", picture),
+            ("nip05", nip05),
+            ("lud16", lud16),
+        ):
+            if value is not None:
+                payload[key] = str(value)
+        return await self.request(payload)
+
+    async def account_relay_lists(self, account_id_hex: str) -> Dict[str, Any]:
+        """Read the account's cached relay lists (NIP-65 and the Marmot inbox)."""
+        response = await self.request(
             {
-                "type": "account_publish_profile",
+                "type": "account_relay_lists",
                 "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
-                "name": str(name or ""),
-                "display_name": str(display_name) if display_name is not None else None,
             }
         )
+        _require_relay_lists(response)
+        return response
+
+    async def account_relay_list_add(
+        self,
+        account_id_hex: str,
+        relay_type: str,
+        url: str,
+        direction: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add one relay to one published account relay list.
+
+        The connector reads the published list, overlays this entry and
+        republishes the merge; an entry the request does not name survives. The
+        call fails rather than publishing a partial list when the published list
+        cannot be confirmed.
+        """
+        return await self._relay_list_edit(
+            "account_relay_list_add", account_id_hex, relay_type, url, direction
+        )
+
+    async def account_relay_list_remove(
+        self,
+        account_id_hex: str,
+        relay_type: str,
+        url: str,
+        direction: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Remove one relay from one published account relay list."""
+        return await self._relay_list_edit(
+            "account_relay_list_remove", account_id_hex, relay_type, url, direction
+        )
+
+    async def _relay_list_edit(
+        self,
+        request_type: str,
+        account_id_hex: str,
+        relay_type: str,
+        url: str,
+        direction: Optional[str],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "type": request_type,
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "relay_type": _normalize_relay_type(relay_type),
+            "url": str(url or "").strip(),
+        }
+        # Optional on the wire: omitted means both directions, which is the
+        # connector's own default. Never send an empty string in its place.
+        normalized_direction = _normalize_relay_direction(direction)
+        if normalized_direction is not None:
+            payload["direction"] = normalized_direction
+        response = await self.request(payload)
+        _require_relay_lists(response)
+        return response
 
     async def send_final(
         self,
@@ -305,6 +386,27 @@ class MarmotAgentControlClient:
                 "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
             }
         )
+
+    async def group_profile_update(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if name is None and description is None:
+            raise ValueError("name or description required")
+        payload: Dict[str, Any] = {
+            "type": "group_profile_update",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+        }
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        return await self.request(payload)
 
     async def send_media(
         self,
@@ -752,6 +854,47 @@ def _normalize_hex(value: Any, field: str = "hex") -> str:
     except ValueError as exc:
         raise AgentControlError(f"{field} must be hexadecimal", code="invalid_hex") from exc
     return text
+
+
+def _normalize_relay_type(value: Any) -> str:
+    relay_type = str(value or "").strip().lower()
+    if relay_type not in {"nip65", "inbox"}:
+        raise AgentControlError(
+            "relay_type must be nip65 or inbox", code="invalid_relay_type"
+        )
+    return relay_type
+
+
+def _normalize_relay_direction(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    direction = str(value).strip().lower()
+    if direction not in {"read", "write", "both"}:
+        raise AgentControlError(
+            "direction must be read, write or both", code="invalid_relay_direction"
+        )
+    return direction
+
+
+def _require_relay_lists(response: Dict[str, Any]) -> None:
+    """Reject a relay_lists response that a caller would have to re-validate."""
+    lists = response.get("relay_lists")
+    if response.get("type") != "relay_lists" or not isinstance(lists, dict):
+        raise AgentControlError(
+            "wn-agent returned invalid relay_lists response", code="protocol_error"
+        )
+    for name in ("nip65", "inbox"):
+        entry = lists.get(name)
+        if not isinstance(entry, dict):
+            raise AgentControlError(
+                "wn-agent returned invalid relay_lists response", code="protocol_error"
+            )
+        if not isinstance(entry.get("relays"), list) or not isinstance(
+            entry.get("created_at"), int
+        ):
+            raise AgentControlError(
+                "wn-agent returned invalid relay_lists response", code="protocol_error"
+            )
 
 
 def _normalize_stream_capability(value: Any) -> str:

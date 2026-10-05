@@ -51,6 +51,22 @@ pub(crate) enum PendingRecoverySelection {
     Grant(Box<AttemptGrant>),
 }
 
+/// How much recovery work a sync may do beyond draining live input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncMode {
+    /// Drain live input only. Runtime catch-ups and automatic passes use this:
+    /// the worker's paced job serves any recovery debt, so a catch-up never
+    /// holds the account worker for a recovery job (mdk#2110).
+    Drain,
+    /// A startup-shaped pass: installs live subscriptions and takes a recovery
+    /// credit only if one is free. The worker's real startup goes through
+    /// `prepare_sync_grant` instead; only tests drive this mode.
+    Startup,
+    /// A directly owned client with no worker to run the paced job: joins the
+    /// comparison, waits for a credit and runs one job in place.
+    Explicit,
+}
+
 /// Account-wide startup budget for the timestamp-independent correctness pass.
 /// Partial progress is durable, so a slow or non-NIP-77 relay cannot hold the
 /// account worker indefinitely and the next sync can resume from a smaller
@@ -236,6 +252,18 @@ fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback
             hex::encode(via_welcome.as_slice())
         }
         _ => fallback.to_owned(),
+    }
+}
+
+fn event_encrypted_media_secret(
+    event: &cgka_traits::engine::GroupEvent,
+) -> Option<&cgka_traits::EncryptedMediaSecret> {
+    match event {
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            encrypted_media_secret,
+            ..
+        } => encrypted_media_secret.as_ref(),
+        _ => None,
     }
 }
 
@@ -568,6 +596,8 @@ pub(crate) struct RouteComparison {
     /// certified nor admitted anything is quiet. A failed or timed-out relay,
     /// or a route this pass skipped, did not answer.
     pub(crate) answered: bool,
+    /// Queried relays that answered, including incomplete comparisons.
+    pub(crate) reached_endpoints: Vec<String>,
     /// What the route's relays returned, for the attempt's audit row only.
     /// Settlement never reads it.
     pub(crate) acquisition: super::audit_recovery::RouteAcquisition,
@@ -1316,7 +1346,7 @@ impl AppClient {
     /// contract. Call [`Self::sync_with_partial_progress`] when the caller must
     /// report the durably applied prefix of a failed catch-up pass.
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
-        match self.sync_inner(None, true).await {
+        match self.sync_inner(None, SyncMode::Explicit).await {
             Ok(summary) => Ok(summary),
             Err(failure) => {
                 // Compatibility callers cannot observe a failure summary.
@@ -1339,21 +1369,16 @@ impl AppClient {
     pub(crate) async fn sync_with_classified_partial_progress(
         &mut self,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        match self.sync_inner(None, true).await {
-            Ok(summary) => Ok(summary),
-            Err(mut failure) => {
-                self.drain_epoch_stall_escalations(&mut failure.partial_summary);
-                Err(failure)
-            }
-        }
+        self.sync_with_stage_telemetry(None, SyncMode::Explicit)
+            .await
     }
 
     pub(crate) async fn sync_with_stage_telemetry(
         &mut self,
-        telemetry: &AppPerformanceTelemetry,
-        explicit: bool,
+        telemetry: Option<&AppPerformanceTelemetry>,
+        mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        match self.sync_inner(Some(telemetry), explicit).await {
+        match self.sync_inner(telemetry, mode).await {
             Ok(summary) => Ok(summary),
             Err(mut failure) => {
                 self.drain_epoch_stall_escalations(&mut failure.partial_summary);
@@ -1365,12 +1390,13 @@ impl AppClient {
     pub(crate) async fn sync_automatically_with_partial_progress(
         &mut self,
     ) -> Result<SyncSummary, SyncFailure> {
-        self.sync_inner(None, false)
+        self.sync_inner(None, SyncMode::Drain)
             .await
             .map_err(SyncFailure::from)
     }
 
-    /// One sync: live interest, the live queue, then the recovery job.
+    /// One sync: live interest, the live queue, then (by mode) the recovery
+    /// job.
     ///
     /// Only startup, a frozen wake or a client with no activation yet installs
     /// live subscriptions, and a route change refreshes them; recovery never
@@ -1379,12 +1405,12 @@ impl AppClient {
     /// nothing is fetched twice. With recovery debt, an explicit caller then
     /// waits for a process credit, drains once more and runs one job in
     /// place; startup takes a credit only if one is free. Without debt no
-    /// credit is taken. Automatic catch-up, such as key-package maintenance,
-    /// only drains: the worker's own job serves its debt.
+    /// credit is taken. A drain, such as a runtime catch-up or key-package
+    /// maintenance, only drains: the worker's own job serves its debt.
     async fn sync_inner(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
-        explicit: bool,
+        mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let routing_changed = self.refresh_sync_routes().map_err(|error| {
             ClassifiedSyncFailure::at_stage(
@@ -1393,7 +1419,8 @@ impl AppClient {
                 SyncFailureStage::StatePersist,
             )
         })?;
-        let startup = telemetry.is_some() && !explicit;
+        let startup = mode == SyncMode::Startup;
+        let explicit = mode == SyncMode::Explicit;
         if self.app.cursor_persistence() == CursorPersistence::Frozen
             || startup
             || self.adapter.account_subscription_attempt().await.is_none()
@@ -1761,8 +1788,12 @@ impl AppClient {
                 None,
                 self.app.allow_loopback_blob_endpoints(),
             ) {
-                match self.project_received_message(message, group_metadata.as_ref(), &mut summary)
-                {
+                match self.project_received_message(
+                    message,
+                    event_encrypted_media_secret(event),
+                    group_metadata.as_ref(),
+                    &mut summary,
+                ) {
                     Ok(Some(gossip_message_id)) => {
                         gossip_message_ids.insert(gossip_message_id);
                     }
@@ -4279,6 +4310,17 @@ impl AppClient {
                                         .since_seconds
                                         .is_some_and(|since| since >= window.since))
                                 && scope.goal.until_seconds <= window.until
+                                // A route certificate says nothing about a
+                                // required relay absent from this network pass.
+                                // A comparison pass queries the incremental
+                                // debt's relays; when that debt was not rebuilt
+                                // with this grant, another obligation's scope on
+                                // the same route can require a relay it lacks.
+                                && scope.goal.required_endpoints.iter().all(|endpoint| {
+                                    window.work.endpoints().iter().any(|queried| {
+                                        crate::relay_plane::same_relay(queried.as_str(), endpoint)
+                                    })
+                                })
                         })
                     });
                     let scope_certified = comparison_owned
@@ -4295,9 +4337,6 @@ impl AppClient {
                         storage_sqlite::RecoveryPassProgress::Progressed
                     } else if !refused
                         && compared.is_some_and(|compared| {
-                            // A route no comparison backend could compare
-                            // was not answered by its relays, so it spends
-                            // no parking budget.
                             compared.answered
                                 && compared.outcome
                                     != storage_sqlite::RecoveryComparisonOutcome::Unsupported
@@ -4313,8 +4352,18 @@ impl AppClient {
                             obligation_progress,
                             scope_progress,
                         ));
+                        if scope_progress != storage_sqlite::RecoveryPassProgress::Unserved
+                            || compared.is_some_and(|compared| {
+                                scope.goal.required_endpoints.iter().any(|required| {
+                                    compared.reached_endpoints.iter().any(|reached| {
+                                        crate::relay_plane::same_relay(required, reached)
+                                    })
+                                })
+                            })
+                        {
+                            progress.push((scope.goal.scope_id, scope_progress));
+                        }
                     }
-                    progress.push((scope.goal.scope_id, scope_progress));
                     let retained_known_event = match (&route, scope.goal.known_event_id) {
                         (Some(route), Some(event)) => storage.retained_recovery_event(
                             route,
@@ -4828,6 +4877,7 @@ impl AppClient {
     fn project_received_message(
         &mut self,
         message: crate::ReceivedMessage,
+        carried_media_secret: Option<&cgka_traits::EncryptedMediaSecret>,
         group_metadata: Option<&cgka_traits::Group>,
         summary: &mut SyncSummary,
     ) -> Result<Option<String>, AppError> {
@@ -4903,7 +4953,12 @@ impl AppClient {
         )?;
         if retains_encrypted_media
             && self
-                .remember_current_encrypted_media_secret(&message.group_id)
+                .remember_received_encrypted_media_secret(
+                    &message.group_id,
+                    message.source_epoch,
+                    &message.tags,
+                    carried_media_secret,
+                )
                 .is_err()
         {
             tracing::warn!(
@@ -5384,9 +5439,12 @@ impl AppClient {
                 source_received_at,
                 event_outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
-            ) && let Some(gossip_message_id) =
-                self.project_received_message(message, group_metadata.as_ref(), summary)?
-            {
+            ) && let Some(gossip_message_id) = self.project_received_message(
+                message,
+                event_encrypted_media_secret(event),
+                group_metadata.as_ref(),
+                summary,
+            )? {
                 gossip_message_ids.insert(gossip_message_id);
             }
             let updated_group =
@@ -6619,6 +6677,7 @@ mod tests {
                     epoch: client.runtime.group_record(&group_id).unwrap().epoch,
                     payload,
                     retention: None,
+                    encrypted_media_secret: None,
                 });
         }
         // A corrupt sender profile must not lose any already-ingested message,

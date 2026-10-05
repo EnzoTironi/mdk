@@ -1,6 +1,7 @@
 //! Connector error type and its privacy-safe code/message projections.
 
 use agent_control::AgentControlError;
+use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
 use marmot_app::AppError;
 
@@ -32,6 +33,14 @@ pub enum ConnectorError {
     InvalidGroupCreate(&'static str),
     #[error("invalid profile name: {0}")]
     InvalidProfileName(&'static str),
+    #[error("invalid profile {0}: {1}")]
+    InvalidProfileField(&'static str, &'static str),
+    #[error("invalid relay URL: {0}")]
+    InvalidRelayUrl(&'static str),
+    #[error("invalid relay list edit: {0}")]
+    InvalidRelayListEdit(&'static str),
+    #[error("the published relay list could not be confirmed: {0}")]
+    RelayListInconclusive(&'static str),
     #[error("connector operation timed out: {0}")]
     OperationTimedOut(&'static str),
     #[error("matching send is still in progress")]
@@ -61,6 +70,15 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
             Self::App(AppError::AgentStreamFinishMismatch) => "stream_finalize_mismatch",
             Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
+            Self::App(AppError::InvalidGroupProfile(_)) => "invalid_group_profile",
+            Self::App(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(EngineError::NotGroupAdmin { .. })
+                ) =>
+            {
+                "not_group_admin"
+            }
             Self::App(_) => "app_error",
             Self::Control(_) => "control_error",
             Self::Hex(_) => "invalid_hex",
@@ -73,6 +91,10 @@ impl ConnectorError {
             Self::Stream(_) => "stream_error",
             Self::InvalidGroupCreate(_) => "invalid_group_create",
             Self::InvalidProfileName(_) => "invalid_profile_name",
+            Self::InvalidProfileField(_, _) => "invalid_profile_field",
+            Self::InvalidRelayUrl(_) => "invalid_relay_url",
+            Self::InvalidRelayListEdit(_) => "invalid_relay_list_edit",
+            Self::RelayListInconclusive(_) => "relay_list_inconclusive",
             Self::OperationTimedOut(_) => "operation_timed_out",
             Self::SendInProgress => "send_in_progress",
             Self::MediaPathDenied(_) => "media_path_denied",
@@ -102,8 +124,23 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamSendFailed(_)) => {
                 "stream durable send failed; retry the same finish request"
             }
+            Self::App(AppError::InvalidGroupProfile(_)) => "invalid group profile",
+            Self::App(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(EngineError::NotGroupAdmin { .. })
+                ) =>
+            {
+                "only a group admin can make this change"
+            }
             Self::InvalidGroupCreate(_) => "invalid group create request",
             Self::InvalidProfileName(_) => "invalid profile name",
+            Self::InvalidProfileField(_, _) => "invalid profile field",
+            Self::InvalidRelayUrl(_) => "invalid relay URL",
+            Self::InvalidRelayListEdit(_) => "invalid relay list edit",
+            Self::RelayListInconclusive(_) => {
+                "the published relay list could not be confirmed; nothing was published"
+            }
             Self::OperationTimedOut(_) => "connector operation timed out",
             Self::SendInProgress => {
                 "matching send is still in progress; retry with the same idempotency key"
@@ -130,6 +167,7 @@ impl ConnectorError {
         matches!(
             self,
             Self::SendInProgress
+                | Self::RelayListInconclusive(_)
                 | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
         )
     }

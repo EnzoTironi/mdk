@@ -1500,7 +1500,7 @@ fn comparison_fetches_probe(
 }
 
 #[test]
-fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
+fn catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
     run_composed_app_runtime_test("explicit-catch-up-backfill", || async {
         let dir = tempfile::tempdir().unwrap();
         let alice = AccountHome::open(dir.path())
@@ -1549,7 +1549,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
         assert_eq!(sync.synced_subscriptions, sync.tracked_subscriptions);
         let unfloored_before = relay.unfloored_account_subscription_count();
 
-        // Hold explicit CatchUp once it owns the account client. The worker is
+        // Hold the CatchUp once it owns the account client. The worker is
         // now committed to the command path and cannot consume these queued
         // deliveries through its live receive arm instead.
         let pin = Arc::new(tokio::sync::Barrier::new(2));
@@ -1560,7 +1560,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
         let catch_up = tokio::spawn(async move { catch_up_runtime.catch_up_accounts().await });
         tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, pin.wait())
             .await
-            .expect("explicit catch-up must reach its hold");
+            .expect("catch-up must reach its hold");
 
         let above_floor = cursor;
         for arm in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
@@ -1575,9 +1575,8 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
             .await;
         }
 
-        // The caller drains these probes before its one job, so that job
-        // already compares the gap they reveal. An unbounded gap cannot
-        // certify, so its debt stays pending for the owner.
+        // The catch-up only drains these probes and arms the gap they reveal;
+        // it runs no job (mdk#2110). The debt stays pending for the owner.
         tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, pin.wait())
             .await
             .expect("the held catch-up should accept its release");
@@ -1599,8 +1598,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
         );
-        // The caller's job earned the account its next backoff; the owner
-        // waits it out.
+        // The owner waits out the account's current backoff.
         runtime
             .advance_recovery_clock_for_test("alice", Duration::from_millis(retry.delay_ms))
             .await;
@@ -1666,8 +1664,8 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
                 .iter()
                 .map(|row| row["event"]["seam"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["explicit_catch_up", "maintenance"],
-            "the caller's job, then the owner's; incremental grants emit no epoch rows"
+            ["maintenance"],
+            "only the owner's job runs; incremental grants emit no epoch rows"
         );
         for started in &started_rows {
             let terminal = failed_rows
@@ -1688,7 +1686,7 @@ fn explicit_catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
             .into_iter()
             .filter(|row| {
                 row["event"]["record_context"]["operation_ref"]
-                    == started_rows[1]["event"]["record_context"]["operation_ref"]
+                    == started_rows[0]["event"]["record_context"]["operation_ref"]
             })
             .collect();
         assert!(
@@ -2059,6 +2057,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 epoch: current,
                 payload: Vec::new(),
                 retention: None,
+                encrypted_media_secret: None,
             });
         client.observe_recovery_health(&effects).unwrap();
         assert!(
@@ -3854,6 +3853,7 @@ async fn media_send_epoch_pin_body() {
         .send_app_event(
             &group_id,
             AppMessageIntent::Media {
+                message_tags: Vec::new(),
                 attachments: vec![pinned_elsewhere],
                 caption: None,
             },
@@ -3912,6 +3912,7 @@ async fn media_send_epoch_pin_body() {
         .send_app_event(
             &group_id,
             AppMessageIntent::Media {
+                message_tags: Vec::new(),
                 attachments: vec![current],
                 caption: None,
             },
@@ -6018,6 +6019,7 @@ async fn confirmed_bootstrap_retry_republishes_public_indexer_copies() {
     let request = || AccountSetupRequest {
         default_relays: vec![TransportEndpoint("wss://relay.example".into())],
         bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
         publish_initial_key_package: true,
         ..AccountSetupRequest::default()
@@ -6139,6 +6141,7 @@ async fn stalled_indexer_does_not_delay_generated_account_network_readiness() {
         runtime.create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
             publish_initial_key_package: true,
             ..AccountSetupRequest::default()
@@ -6175,6 +6178,7 @@ async fn runtime_shutdown_cancels_pending_indexer_copies() {
         .create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
             publish_initial_key_package: false,
             ..AccountSetupRequest::default()
@@ -6221,6 +6225,7 @@ async fn account_removal_cancels_pending_indexer_copies() {
         .create_identity(AccountSetupRequest {
             default_relays: vec![TransportEndpoint("wss://relay.example".into())],
             bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![TransportEndpoint("wss://index.example".into())],
             publish_initial_key_package: false,
             ..AccountSetupRequest::default()
@@ -8063,7 +8068,7 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
         .expect_err("an empty outbox cannot prove absence after discovery failed");
 
     assert!(
-        matches!(error, AppError::RelayDirectory(_)),
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("not authoritatively established")),
         "unknown discovery must remain retryable instead of becoming a missing-route verdict: {error:?}"
     );
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -8072,6 +8077,58 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
             .iter()
             .any(|endpoint| endpoint.0 == outbox)
     }));
+}
+
+#[tokio::test]
+/// A found inbox list naming only retired relays is named in the error, which
+/// still reports the incomplete outbox hop rather than a final verdict.
+async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_MARMOT_INBOX_RELAY_LIST {
+            event.tags = vec![vec!["relay".into(), "wss://relay.nostr.band".into()]];
+        }
+    }
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
+
+    let error = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("a member with no usable inbox cannot be invited");
+
+    assert!(
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("no usable relays") && message.contains("refresh did not complete")),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+/// A cached retired-only inbox list stays retryable when the refresh fails,
+/// and a completed refresh replaces it with the member's newer usable list.
+async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    remember_test_member_inbox(&app, &account_id, "wss://relay.nostr.band");
+    fetcher
+        .fail_all
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let error = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("a failed refresh cannot use a retired-only cached inbox");
+    assert!(
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("refresh did not complete")),
+        "{error:?}"
+    );
+
+    fetcher
+        .fail_all
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    app.resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect("a completed refresh finds the newer usable inbox without republication");
 }
 
 #[tokio::test]
@@ -13466,6 +13523,8 @@ fn reaction_intent_builds_kind_seven_with_e_tag() {
     let event = build(AppMessageIntent::Reaction {
         target_message_id: "abc123".to_owned(),
         emoji: "🔥".to_owned(),
+        tags: Vec::new(),
+        attachments: Vec::new(),
     });
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_REACTION);
     assert_eq!(event.content, "🔥");
@@ -13478,6 +13537,8 @@ fn reaction_intent_rejects_empty_emoji() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: "  ".to_owned(),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13492,6 +13553,8 @@ fn reaction_intent_rejects_padded_content() {
             &AppMessageIntent::Reaction {
                 target_message_id: "target-message".to_owned(),
                 emoji: emoji.to_owned(),
+                tags: Vec::new(),
+                attachments: Vec::new(),
             },
             SENDER_HEX,
             1,
@@ -13508,6 +13571,8 @@ fn reaction_intent_rejects_control_characters_and_oversized_content() {
             &AppMessageIntent::Reaction {
                 target_message_id: "abc123".to_owned(),
                 emoji: emoji.to_owned(),
+                tags: Vec::new(),
+                attachments: Vec::new(),
             },
             SENDER_HEX,
             1,
@@ -13519,6 +13584,8 @@ fn reaction_intent_rejects_control_characters_and_oversized_content() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: "👍".repeat(65),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13532,6 +13599,8 @@ fn reaction_intent_accepts_bounded_multi_scalar_emoji() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: "👨‍👩‍👧‍👦".to_owned(),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13547,6 +13616,8 @@ fn reaction_intent_accepts_exact_maximum_scalar_count() {
         &AppMessageIntent::Reaction {
             target_message_id: "abc123".to_owned(),
             emoji: emoji.clone(),
+            tags: Vec::new(),
+            attachments: Vec::new(),
         },
         SENDER_HEX,
         1,
@@ -13593,6 +13664,7 @@ fn reply_intent_builds_kind_nine_with_e_and_q_tags() {
 #[test]
 fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
     let event = build(AppMessageIntent::Media {
+        message_tags: Vec::new(),
         attachments: vec![
             MediaAttachmentReference {
                 locators: vec![MediaLocator {
@@ -13970,6 +14042,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
     // keeps a structurally well-formed media reference regardless of locator
     // policy; fetchability is decided later at download time.
     let event = build(AppMessageIntent::Media {
+        message_tags: Vec::new(),
         attachments: vec![MediaAttachmentReference {
             // A locator kind that is not the default `blossom-v1` and would be
             // out of a blossom-only policy.
@@ -14007,6 +14080,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
 
 fn malformed_media_message(version: &str) -> Vec<u8> {
     let mut event = build(AppMessageIntent::Media {
+        message_tags: Vec::new(),
         attachments: vec![MediaAttachmentReference {
             locators: vec![MediaLocator {
                 kind: "blossom-v1".to_owned(),
@@ -16657,7 +16731,7 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
     // The runtime's own open: hydration deferred, no transport preparation, so
     // the route table is seeded from persisted state alone.
     let mut reopened = app
-        .local_client_with_relay_plane_and_hydration("bob", &plane, None, true)
+        .local_client_with_relay_plane_and_hydration("bob", &plane, None, true, None)
         .await
         .unwrap();
     // The worker's pipeline, run to completion the way a reconnect does.
@@ -17371,6 +17445,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
             epoch: reopened.runtime.group_record(&group_id).unwrap().epoch,
             payload: fresh_payload,
             retention: None,
+            encrypted_media_secret: None,
         }],
         ..Default::default()
     };
@@ -17479,6 +17554,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             epoch,
             payload: historical_payload,
             retention: None,
+            encrypted_media_secret: None,
         };
         let fresh_event = cgka_traits::engine::GroupEvent::MessageReceived {
             authority: None,
@@ -17488,6 +17564,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             epoch,
             payload: fresh_payload,
             retention: None,
+            encrypted_media_secret: None,
         };
         let effects = marmot_account::AccountDeviceEffects {
             events: if fresh_first {
@@ -17564,6 +17641,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
+        encrypted_media_secret: None,
     };
     let storage = app.account_storage("alice").unwrap();
     storage.put_pending_application_event(&event).unwrap();
@@ -17647,6 +17725,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
+        encrypted_media_secret: None,
     };
     let storage = app.account_storage("alice").unwrap();
     storage.put_pending_application_event(&event).unwrap();
@@ -18740,6 +18819,215 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
         audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
         1,
         "the arm must leave exactly one durable forensic row"
+    );
+}
+
+/// A send the engine queued durably was never fanned out, so an unrelated
+/// failure in the same batch says nothing about it. Retracting it would
+/// tombstone a row the queued-outbound drain later delivers: the group sees the
+/// message while the sender sees `failed`, and a poll loses its projection.
+#[tokio::test]
+async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://queued-send-gate.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("queued send gate", &[]).await.unwrap();
+    let queued_for = |group_id: &cgka_traits::GroupId| cgka_session::QueuedIntentRef {
+        group_id: group_id.clone(),
+        intent_id: cgka_traits::MessageId::new(vec![0x22; 32]),
+    };
+
+    let mut queued = a_refusal_riding_a_rolled_back_publish(&group_id);
+    queued.queued.push(queued_for(&group_id));
+    assert!(
+        client
+            .observe_recovery_evidence_then_gate_send_publish(&queued, &group_id, "current-send")
+            .await
+            .is_ok(),
+        "a durably queued send must survive an unrelated rolled-back sibling"
+    );
+
+    let mut failed = a_refusal_riding_a_rolled_back_publish(&group_id);
+    failed.queued.push(queued_for(&group_id));
+    failed
+        .failed_app_messages
+        .push(marmot_account::FailedApplicationMessage {
+            group_id: group_id.clone(),
+            app_event_id: "current-send".to_owned(),
+            message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
+            reason: "injected publish failure".to_owned(),
+        });
+    assert!(
+        client
+            .observe_recovery_evidence_then_gate_send_publish(&failed, &group_id, "current-send")
+            .await
+            .is_err(),
+        "a queued sibling must not excuse the current send's own terminal failure"
+    );
+
+    let other_group = cgka_traits::GroupId::new(vec![0x99; 16]);
+    let mut elsewhere = a_refusal_riding_a_rolled_back_publish(&group_id);
+    elsewhere.queued.push(queued_for(&other_group));
+    assert!(
+        client
+            .observe_recovery_evidence_then_gate_send_publish(&elsewhere, &group_id, "current-send")
+            .await
+            .is_err(),
+        "an intent queued in another group is not evidence about this send"
+    );
+}
+
+/// A relay accepting a send the send path already retracted must revive the
+/// row: otherwise the group has the message while the sender's row says
+/// `failed` forever, and a poll's projection stays dropped. A terminal group
+/// keeps the sweep's verdict.
+#[tokio::test]
+async fn a_relay_accepted_send_revives_its_local_publish_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://revive-accepted-send.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let created_at = unix_now_seconds();
+    let poll = |app_event_id: &str, group_id: &cgka_traits::GroupId| AppMessageProjection {
+        authority: None,
+        message_id_hex: app_event_id.to_owned(),
+        source_message_id_hex: None,
+        direction: "sent".to_owned(),
+        group_id_hex: hex::encode(group_id.as_slice()),
+        sender: account.account_id_hex.clone(),
+        plaintext: "Lunch?".to_owned(),
+        kind: cgka_traits::MARMOT_APP_EVENT_KIND_POLL,
+        tags: cgka_traits::poll_tags(
+            created_at,
+            "Lunch?",
+            &["Yes".to_owned(), "No".to_owned()],
+            cgka_traits::PollType::SingleChoice,
+            None,
+        )
+        .unwrap(),
+        source_epoch: None,
+        retention: None,
+        recorded_at: Some(created_at),
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    let published = |app_event_id: &str, group_id: &cgka_traits::GroupId| {
+        marmot_account::AccountDeviceEffects {
+            published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+                authority: None,
+                group_id: group_id.clone(),
+                app_event_id: app_event_id.to_owned(),
+                // Source ids are unique per account; reuse the event id bytes.
+                message_id: cgka_traits::MessageId::new(hex::decode(app_event_id).unwrap()),
+                source_epoch: cgka_traits::EpochId(1),
+                retention: AppMessageRetentionDecision::new(created_at, 0),
+            }],
+            ..Default::default()
+        }
+    };
+    let retracted = |app_event_id: &str, group_id: &cgka_traits::GroupId| {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        app.record_account_app_event("alice", &poll(app_event_id, group_id))
+            .unwrap();
+        app.invalidate_timeline_app_event(
+            "alice",
+            &group_id_hex,
+            app_event_id,
+            crate::LOCAL_PUBLISH_FAILED_REASON,
+        )
+        .unwrap();
+        let row = app
+            .timeline_message("alice", &group_id_hex, app_event_id)
+            .unwrap()
+            .unwrap();
+        assert!(row.poll.is_none(), "a retracted poll has no projection");
+    };
+
+    let live = client.create_group("revive live", &[]).await.unwrap();
+    let live_event = "11".repeat(32);
+    retracted(&live_event, &live);
+    client
+        .finalize_published_app_message_source_retention(&published(&live_event, &live))
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &hex::encode(live.as_slice()), &live_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status, None,
+        "relay acceptance revives the row"
+    );
+    assert_eq!(
+        row.source_message_id_hex,
+        Some(live_event.clone()),
+        "the revival keeps the finalized source"
+    );
+    assert!(row.poll.is_some(), "the revived poll projects again");
+
+    let terminal = client.create_group("revive terminal", &[]).await.unwrap();
+    let terminal_event = "22".repeat(32);
+    retracted(&terminal_event, &terminal);
+    make_group_terminal(&client, &terminal, false);
+    client
+        .finalize_published_app_message_source_retention(&published(&terminal_event, &terminal))
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &hex::encode(terminal.as_slice()), &terminal_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status.as_deref(),
+        Some(crate::LOCAL_PUBLISH_FAILED_REASON),
+        "a terminal group keeps the sweep's verdict"
+    );
+
+    // A group record that cannot be read yet decides nothing: the fanout must
+    // stay for a replay instead of being acknowledged with the row still failed.
+    let unreadable = cgka_traits::GroupId::new(vec![0x5a; 16]);
+    let unreadable_event = "33".repeat(32);
+    let unreadable_hex = hex::encode(unreadable.as_slice());
+    retracted(&unreadable_event, &unreadable);
+    let accepted = published(&unreadable_event, &unreadable);
+    client
+        .finalize_published_app_message_source_retention(&accepted)
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &unreadable_hex, &unreadable_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status.as_deref(),
+        Some(crate::LOCAL_PUBLISH_FAILED_REASON),
+        "an unreadable group cannot revive the row yet"
+    );
+    assert!(
+        client.pending_convergence_groups.contains(&unreadable),
+        "the accepted fanout is kept and its group scheduled for a replay"
+    );
+    {
+        use cgka_traits::storage::GroupStorage;
+        let storage = client.app.account_storage(&client.state.label).unwrap();
+        let mut record = storage.get_group(&live).unwrap();
+        record.id = unreadable.clone();
+        storage.put_group(&record).unwrap();
+    }
+    client
+        .finalize_published_app_message_source_retention(&accepted)
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &unreadable_hex, &unreadable_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status, None,
+        "the replay revives the row once the group is readable"
     );
 }
 
@@ -20978,6 +21266,176 @@ fn encrypted_media_warm_skips_authoritative_rechecks_at_an_unchanged_epoch() {
             "an authoritative REQUIRED answer must evict the stale confirmed-negative"
         );
     });
+}
+
+/// A convergence pass merges every commit it adopts before the applications
+/// replayed between them are drained, and a delayed message is read from
+/// retained past-epoch secrets, so a media message can be projected after its
+/// source epoch ended. Its attachments stay keyed to that epoch, which must be
+/// cached for background acquisition; caching the then-current epoch instead
+/// left the download deferred forever.
+#[test]
+fn received_media_from_a_left_epoch_caches_its_source_epoch_secret() {
+    run_composed_app_runtime_test("received-media-left-epoch", || {
+        check_received_media_source_epoch_secret(false)
+    });
+}
+
+/// A pass that advances past the anchor horizon prunes the source epoch's
+/// retained anchor before its applications are projected, so the secret the
+/// engine captured while authenticating the message is the only one left.
+#[test]
+fn received_media_past_the_anchor_horizon_caches_its_carried_secret() {
+    run_composed_app_runtime_test("received-media-carried-secret", || {
+        check_received_media_source_epoch_secret(true)
+    });
+}
+
+async fn check_received_media_source_epoch_secret(carried_secret: bool) {
+    use cgka_traits::app_components::{
+        GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("left epoch media", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
+    let storage = app.account_storage("alice").unwrap();
+
+    // Group creation warms its founding epoch, so the media message comes
+    // from a later epoch that no warm pass ever saw as current. Raw engine
+    // commits advance it without the app's subscription-refresh warm.
+    let founding_epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let (source_epoch, source_secret) = client
+        .runtime
+        .exporter_secret_with_epoch(&group_id, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
+        .unwrap();
+    assert!(source_epoch > founding_epoch);
+    let reference = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x66_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x66_u8; 32]),
+        plaintext_sha256: hex::encode([0x14_u8; 32]),
+        nonce_hex: hex::encode([0x25_u8; 12]),
+        file_name: "report.pdf".to_owned(),
+        media_type: "application/pdf".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: source_epoch.0,
+        dim: None,
+        thumbhash: None,
+    };
+    let payload = crate::messages::encode_inner_event(
+        &build_inner_event(
+            &AppMessageIntent::Media {
+                attachments: vec![reference.clone()],
+                caption: None,
+                message_tags: Vec::new(),
+            },
+            &sender_hex,
+            unix_now_seconds(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sent = client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: payload.clone(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(sent.failures.is_empty());
+
+    // The commits that end the source epoch land before the message is
+    // projected, as they do inside one convergence pass. Six of them
+    // carry the tip past the source epoch's retained anchor.
+    for _ in 0..if carried_secret { 6 } else { 1 } {
+        client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > source_epoch.0);
+    assert_eq!(
+        client
+            .runtime
+            .retained_encrypted_media_exporter_secret(&group_id, source_epoch)
+            .unwrap()
+            .is_none(),
+        carried_secret,
+        "precondition: the source anchor is pruned exactly when the secret is carried"
+    );
+    assert_eq!(
+        storage
+            .encrypted_media_epoch_secret(
+                &group_id_hex,
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                source_epoch.0,
+            )
+            .unwrap(),
+        None,
+        "precondition: the source epoch was never cached while current"
+    );
+
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
+            group_id: group_id.clone(),
+            message_id: sent.reports[0].message_id.clone(),
+            sender: MemberId::new(hex::decode(&sender_hex).unwrap()),
+            epoch: source_epoch,
+            payload,
+            retention: None,
+            encrypted_media_secret: carried_secret
+                .then(|| cgka_traits::EncryptedMediaSecret::new(source_secret.clone())),
+        }],
+        ..Default::default()
+    };
+    let summary = client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    assert_eq!(summary.messages.len(), 1);
+
+    assert_eq!(
+        storage
+            .encrypted_media_epoch_secret(
+                &group_id_hex,
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                source_epoch.0,
+            )
+            .unwrap()
+            .as_deref(),
+        Some(source_secret.as_ref()),
+        "the cached key must be the source epoch's exporter secret"
+    );
+    assert!(
+        client
+            .prepare_background_attachment_download(&group_id, reference, 1024 * 1024)
+            .unwrap()
+            .is_some(),
+        "background acquisition must find the source epoch's key"
+    );
 }
 
 #[test]

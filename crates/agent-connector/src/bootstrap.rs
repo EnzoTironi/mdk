@@ -509,6 +509,7 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::KeyPackagePublished { .. } => "key_package_published",
         AgentControlResponse::ProfilePublished { .. } => "profile_published",
         AgentControlResponse::ProfileLookup { .. } => "profile_lookup",
+        AgentControlResponse::RelayLists { .. } => "relay_lists",
         AgentControlResponse::FinalSent { .. } => "final_sent",
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",
@@ -516,6 +517,7 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::DiagnosticStatus { .. } => "diagnostic_status",
         AgentControlResponse::GroupCreated { .. } => "group_created",
         AgentControlResponse::GroupInfo { .. } => "group_info",
+        AgentControlResponse::GroupProfileUpdated { .. } => "group_profile_updated",
         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlResponse::KeyPackageMaintenanceStatus { .. } => {
             "key_package_maintenance_status"

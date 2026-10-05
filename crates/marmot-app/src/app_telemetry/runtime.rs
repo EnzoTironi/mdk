@@ -63,6 +63,14 @@ operations! {
     LifecycleLockWait => "lifecycle_lock_wait",
     AccountStartup => "account_startup",
     AccountStartupRetrySuppressed => "account_startup_retry_suppressed",
+    // One per `AccountStartupStage`: one span per stage a starting account
+    // worker enters, ending as a timeout if its ready-wait expired there.
+    AccountStartupSpawned => "account_startup_spawned",
+    AccountStartupOpenQueued => "account_startup_open_queued",
+    AccountStartupAccountState => "account_startup_account_state",
+    AccountStartupSessionOpen => "account_startup_session_open",
+    AccountStartupClientRestore => "account_startup_client_restore",
+    AccountStartupReadyHandoff => "account_startup_ready_handoff",
     WorkerHydration => "worker_hydration",
     WorkerCatchUp => "worker_catch_up",
     WorkerSnapshot => "worker_snapshot",

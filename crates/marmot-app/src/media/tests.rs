@@ -491,6 +491,54 @@ async fn spawn_progressing_http_server(
     (url, requests, server)
 }
 
+/// Send a first byte promptly, then pause a live body without stalling headers.
+async fn spawn_http_server_with_body_gap(
+    body: Arc<Vec<u8>>,
+    gap: Duration,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            stream.set_nodelay(true).unwrap();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_err()
+                    || stream.write_all(&body[..1]).await.is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(gap).await;
+                let _ = stream.write_all(&body[1..]).await;
+            });
+        }
+    });
+    (url, server)
+}
+
 fn spawn_roundtrip_blob_server() -> (String, mpsc::Receiver<(u64, String)>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test server");
     let addr = listener.local_addr().expect("upload test server addr");
@@ -709,6 +757,7 @@ fn operation_policy<'a>(
 
 fn media_upload_request(blossom_server: Option<String>) -> MediaUploadRequest {
     MediaUploadRequest {
+        message_tags: Vec::new(),
         attachments: vec![MediaUploadAttachmentRequest {
             file_name: "diagram.png".to_owned(),
             media_type: "image/png".to_owned(),
@@ -845,6 +894,7 @@ async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
     let keys = signing_keys();
     let plaintext_len = 64 * 1024 * 1024 + 1;
     let request = MediaUploadRequest {
+        message_tags: Vec::new(),
         attachments: vec![MediaUploadAttachmentRequest {
             file_name: "release.apk".to_owned(),
             media_type: "application/vnd.android.package-archive".to_owned(),
@@ -1553,8 +1603,9 @@ async fn download_prepare_stays_local() {
         .prepare_encrypted_media_download(&group, reference.clone())
         .await
         .unwrap();
-    // Remove only the historical cache entries; the current exporter cannot
-    // recover this original reference after the group has advanced.
+    // Remove only the historical cache entries. The current exporter cannot
+    // recover this original reference after the group has advanced, but the
+    // source epoch's retained MLS anchor can, without leaving the device.
     let path = app.account_storage_path("alice");
     let keys = app.account_home().load_signing_keys("alice").unwrap();
     let key = app
@@ -1567,17 +1618,36 @@ async fn download_prepare_stays_local() {
         storage_sqlite::SqlCipherHardening::cipher_only(),
     )
     .unwrap();
-    assert!(
-        connection
-            .execute(
-                "DELETE FROM encrypted_media_epoch_secrets WHERE group_id_hex = ?1 AND source_epoch = ?2",
-                rusqlite::params![
-                    hex::encode(group.as_slice()),
-                    i64::try_from(reference.source_epoch).unwrap(),
-                ],
-            )
-            .unwrap() > 0
-    );
+    let forget_source_epoch = || {
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM encrypted_media_epoch_secrets WHERE group_id_hex = ?1 AND source_epoch = ?2",
+                    rusqlite::params![
+                        hex::encode(group.as_slice()),
+                        i64::try_from(reference.source_epoch).unwrap(),
+                    ],
+                )
+                .unwrap()
+                > 0
+        );
+    };
+    forget_source_epoch();
+    client
+        .prepare_encrypted_media_download(&group, reference.clone())
+        .await
+        .expect("the source epoch's retained anchor recovers the secret");
+    assert_eq!(relay.subscription_count(), subscriptions);
+
+    // Past the five-epoch anchor horizon nothing on the device holds it.
+    while client.runtime.group_record(&group).unwrap().epoch.0 < reference.source_epoch + 6 {
+        client
+            .update_group_profile(&group, Some("advanced media again"), None)
+            .await
+            .unwrap();
+    }
+    forget_source_epoch();
+    let subscriptions = relay.subscription_count();
     let error = client
         .prepare_encrypted_media_download(&group, reference)
         .await
@@ -2097,6 +2167,46 @@ async fn slow_progressing_locator_is_not_cut_off_by_equal_fallback_share() {
     assert_eq!(primary_requests.load(Ordering::SeqCst), 1);
     assert_eq!(fallback_a_requests.load(Ordering::SeqCst), 0);
     assert_eq!(fallback_b_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn media_download_client_does_not_short_circuit_the_body_idle_policy() {
+    use super::attachment_resume::BODY_IDLE_TIMEOUT;
+
+    assert_eq!(
+        BlossomHttpTransport::new(true).read_timeout,
+        BODY_IDLE_TIMEOUT
+    );
+    assert!(BODY_IDLE_TIMEOUT > super::blossom::MEDIA_HTTP_READ_TIMEOUT);
+
+    // A 40 MiB encrypted blob matches the reported received-APK size band.
+    let body = Arc::new(vec![0x5a; 40 * 1024 * 1024]);
+    let (url, server) =
+        spawn_http_server_with_body_gap(body.clone(), Duration::from_millis(800)).await;
+    let reference = blob_reference_for_servers(&body, &[url]);
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let short =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1))
+            .with_read_timeout_for_test(Duration::from_millis(250));
+    let short_error = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &short)
+        .await
+        .expect_err("the shorter client timeout must interrupt the delayed body");
+    // The first yielded chunk may be coalesced with headers: either timeout
+    // branch is a download failure caused by the shorter HTTP read bound.
+    assert!(
+        matches!(&short_error, AppError::MediaDownloadFailed(detail) if detail == "request timed out" || detail == "body transfer failed"),
+        "expected a body-read failure, got {short_error:?}"
+    );
+
+    let viable =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1))
+            .with_read_timeout_for_test(Duration::from_secs(2));
+    let downloaded = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &viable)
+        .await
+        .expect("a progressing body must survive a gap below the native idle bound");
+    server.abort();
+    assert_eq!(downloaded.as_slice(), body.as_slice());
 }
 
 /// Expiring the shared deadline while a later locator is active must leave a
@@ -3092,12 +3202,20 @@ async fn policy_refusal_on_the_first_hop_stays_unfetchable() {
 
 /// Shared runtime/media fixture: valid v2 ciphertext with a deterministic nonce.
 pub(crate) fn attachment_worker_fixture(plaintext: &[u8]) -> (MediaAttachmentReference, Vec<u8>) {
+    attachment_worker_fixture_with_secret(plaintext, &[7; 32])
+}
+
+/// `attachment_worker_fixture` encrypted under a caller-chosen epoch secret.
+pub(crate) fn attachment_worker_fixture_with_secret(
+    plaintext: &[u8],
+    media_secret: &[u8],
+) -> (MediaAttachmentReference, Vec<u8>) {
     let hash: [u8; 32] = Sha256::digest(plaintext).into();
     let mime = "application/octet-stream";
     let name = "fixture.bin";
     let nonce = [3; 12];
     let key =
-        derive_media_file_key(&[7; 32], EncryptedMediaVersion::V2, &hash, mime, name).unwrap();
+        derive_media_file_key(media_secret, EncryptedMediaVersion::V2, &hash, mime, name).unwrap();
     let aad = media_aad(EncryptedMediaVersion::V2, &hash, mime, name);
     let mut encrypted = plaintext.to_vec();
     ChaCha20Poly1305::new_from_slice(&key)
@@ -3191,22 +3309,54 @@ async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_w
             assert_eq!(result.unwrap().plaintext, b"authenticated plaintext");
         }
     }
-    let (mut reference, _) = attachment_worker_fixture(b"plaintext");
-    let server = spawn_http_response(http_not_found_response());
-    reference.locators = vec![MediaLocator {
-        kind: BLOSSOM_LOCATOR_KIND_V1.into(),
-        value: format!("{server}/{}", reference.ciphertext_sha256),
-    }];
-    assert!(matches!(
-        download_encrypted_media_classified(
+}
+
+#[tokio::test]
+async fn automatic_attachment_stops_only_when_every_locator_reports_the_blob_missing() {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.into()];
+    let status = |line: &str| {
+        format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+    };
+    let missing = || vec![status("404 Not Found")];
+    let gone = || vec![status("410 Gone")];
+    let limited = || vec![status("429 Too Many Requests")];
+    // Server errors are retried once within the candidate.
+    let unavailable = || vec![status("503 Service Unavailable"); 2];
+    for (servers, expected_stop) in [
+        (vec![missing()], true),
+        (vec![gone()], true),
+        (vec![missing(), gone()], true),
+        (vec![limited()], false),
+        (vec![vec![status("403 Forbidden")]], false),
+        (vec![unavailable()], false),
+        (vec![missing(), limited()], false),
+        (vec![unavailable(), missing()], false),
+    ] {
+        let (mut reference, _) = attachment_worker_fixture(b"plaintext");
+        reference.locators = servers
+            .into_iter()
+            .map(|responses| MediaLocator {
+                kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+                value: format!(
+                    "{}/{}",
+                    spawn_http_responses(responses),
+                    reference.ciphertext_sha256
+                ),
+            })
+            .collect();
+        let result = download_encrypted_media_classified(
             reference,
             &[7; 32],
             &[],
             &allowed,
             &BlossomHttpTransport::new(true),
-            None
+            None,
         )
-        .await,
-        Err(AttachmentDownloadFailure::Retry(_))
-    ));
+        .await;
+        match result {
+            Err(AttachmentDownloadFailure::Stop(_)) => assert!(expected_stop),
+            Err(AttachmentDownloadFailure::Retry(_)) => assert!(!expected_stop),
+            other => panic!("unexpected classification: {other:?}"),
+        }
+    }
 }

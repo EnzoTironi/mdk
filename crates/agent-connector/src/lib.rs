@@ -16,6 +16,7 @@ mod media_roots;
 mod media_temp;
 mod messaging;
 mod reconcile_telemetry;
+mod relays;
 mod socket;
 mod stream;
 mod stream_session;
@@ -114,6 +115,17 @@ pub(crate) use agent_control::{
 /// (1024) so every message that could be re-queried after a single overflow is still tracked.
 pub(crate) const DELIVERED_INBOUND_CURSOR_CAPACITY: usize = 4096;
 pub(crate) const MAX_PROFILE_NAME_CHARS: usize = 80;
+/// Longest value the connector accepts for one optional kind-0 field (`about`,
+/// `picture`, `nip05`, `lud16`). Those fields are free text read from the control
+/// socket, so they are bounded like the name: generous for a bio, and far below
+/// anything that would turn one control request into a multi-KB profile event.
+pub(crate) const MAX_PROFILE_FIELD_CHARS: usize = 512;
+
+/// Inclusive bound on one relay URL a control request may publish. A relay URL
+/// is a routing handle, not free text: the bound keeps one request from
+/// publishing a multi-KB kind-10002/10050 entry.
+pub(crate) const MAX_RELAY_URL_CHARS: usize = 512;
+
 /// Default maximum concurrently served control-socket connections. The
 /// control plane is local and authenticated, but the threat model includes a
 /// prompt-injected/compromised gateway; each connection holds a spawned task
@@ -233,6 +245,18 @@ pub struct AgentConnector {
     #[cfg(test)]
     pub(crate) test_hooks: std::sync::Arc<test_support::ConnectorTestHooks>,
     relays: Vec<String>,
+    /// Per-account edit locks for relay-list mutations. Two control requests
+    /// that read the same published list would each publish a merge of it, and
+    /// the entry added by the loser would disappear even though both answered
+    /// success. Bounded by the number of local accounts, like the runtime's
+    /// follow-list locks.
+    relay_list_edits:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Dev/test gate for loopback relay URLs a control request may declare.
+    /// Same switch as the relay-plane gate; a production connector rejects a
+    /// `ws://` loopback entry here rather than letting one control request widen
+    /// its own reach (see `docs/marmot-architecture/overview/dial-safety.md`).
+    allow_loopback_relays: bool,
     connection_errors: Arc<AtomicU64>,
     /// Connections closed at accept time because the concurrency cap was hit.
     /// Kept separate from `connection_errors` so expected backpressure does
@@ -283,6 +307,8 @@ impl AgentConnector {
             #[cfg(test)]
             test_hooks: std::sync::Arc::new(test_support::ConnectorTestHooks::default()),
             relays,
+            relay_list_edits: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            allow_loopback_relays: config.allow_loopback_relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
             connections_refused: Arc::new(AtomicU64::new(0)),
             subscription_limiter: Arc::new(Semaphore::new(MAX_CONTROL_SUBSCRIPTIONS)),

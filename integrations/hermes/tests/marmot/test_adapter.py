@@ -264,6 +264,33 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
     async def start_server(self, handler):
         self.server = await asyncio.start_unix_server(handler, path=self.socket_path)
 
+    async def test_group_profile_update_sends_only_selected_fields(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(writer, {
+                "marmot_agent_control": "marmot.agent-control.v2",
+                "id": request["id"],
+                "type": "group_profile_updated",
+                "group_id_hex": request["group_id_hex"],
+                "message_ids_hex": ["33" * 32],
+            })
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        response = await client.group_profile_update(
+            "11" * 32, "22" * 16, description="",
+        )
+        self.assertEqual(response["type"], "group_profile_updated")
+        self.assertEqual(requests[0]["description"], "")
+        self.assertNotIn("name", requests[0])
+        self.assertEqual(requests[0]["group_id_hex"], "22" * 16)
+        with self.assertRaises(ValueError):
+            await client.group_profile_update("11" * 32, "22" * 16)
+
     async def test_send_final_writes_protocol_envelope_and_reads_response(self):
         requests = []
 
@@ -709,6 +736,159 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["account_id_hex"], "11" * 32)
         self.assertEqual(requests[0]["name"], "Hermes")
         self.assertEqual(requests[0]["display_name"], "Hermes Agent")
+
+    async def test_account_publish_profile_omits_fields_the_caller_does_not_name(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "profile_published",
+                    "account_id_hex": request["account_id_hex"],
+                    "name": request["name"],
+                    "display_name": request["display_name"],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        await client.account_publish_profile(
+            "11" * 32,
+            "Hermes",
+            "Hermes Agent",
+            about="Day family assistant.",
+            picture="https://example.com/avatar.png",
+        )
+        await client.account_publish_profile("11" * 32, "Hermes", "Hermes Agent")
+        await client.account_publish_profile("11" * 32, "Hermes", "Hermes Agent", about="")
+
+        self.assertEqual(requests[0].get("about"), "Day family assistant.")
+        self.assertEqual(requests[0].get("picture"), "https://example.com/avatar.png")
+
+        # An optional field the caller does not name keeps the account's published
+        # value, so it must be omitted from the request entirely: a null or an
+        # empty string would clear it instead.
+        for key in ("about", "picture", "nip05", "lud16"):
+            self.assertNotIn(key, requests[1])
+
+        # An empty value the caller does name is a clear, and is sent as one.
+        self.assertEqual(requests[2].get("about"), "")
+
+    async def test_account_relay_lists_writes_typed_read_request(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "relay_lists",
+                    "account_id_hex": request["account_id_hex"],
+                    "relay_lists": {
+                        "nip65": {
+                            "relays": ["wss://write.example"],
+                            "read_relays": ["wss://read.example", "wss://write.example"],
+                            "write_relays": ["wss://write.example"],
+                            "created_at": 1700000000,
+                        },
+                        "inbox": {
+                            "relays": ["wss://inbox.example"],
+                            "read_relays": [],
+                            "write_relays": [],
+                            "created_at": 0,
+                        },
+                    },
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        response = await client.account_relay_lists("11" * 32)
+
+        self.assertEqual(requests[0]["type"], "account_relay_lists")
+        self.assertEqual(requests[0]["account_id_hex"], "11" * 32)
+        self.assertEqual(response["relay_lists"]["nip65"]["write_relays"], ["wss://write.example"])
+
+    async def test_account_relay_list_edits_omit_a_direction_the_caller_does_not_name(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "relay_lists",
+                    "account_id_hex": request["account_id_hex"],
+                    "relay_lists": {
+                        "nip65": {"relays": [], "read_relays": [], "write_relays": [], "created_at": 1},
+                        "inbox": {"relays": [], "read_relays": [], "write_relays": [], "created_at": 1},
+                    },
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        await client.account_relay_list_add("11" * 32, "nip65", "wss://relay.example")
+        await client.account_relay_list_remove(
+            "11" * 32, "nip65", "wss://relay.example", direction="read"
+        )
+
+        self.assertEqual(requests[0]["type"], "account_relay_list_add")
+        self.assertEqual(requests[0]["relay_type"], "nip65")
+        self.assertEqual(requests[0]["url"], "wss://relay.example")
+        # An omitted direction keeps the connector's default instead of being
+        # sent as an empty string the connector would have to interpret.
+        self.assertNotIn("direction", requests[0])
+        self.assertEqual(requests[1]["type"], "account_relay_list_remove")
+        self.assertEqual(requests[1]["direction"], "read")
+
+    async def test_account_relay_list_edit_rejects_invalid_type_and_direction(self):
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client.account_relay_list_add("11" * 32, "dm", "wss://relay.example")
+        self.assertEqual(raised.exception.code, "invalid_relay_type")
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client.account_relay_list_add(
+                "11" * 32, "nip65", "wss://relay.example", direction="inbound"
+            )
+        self.assertEqual(raised.exception.code, "invalid_relay_direction")
+
+    async def test_account_relay_lists_rejects_a_malformed_response(self):
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "relay_lists",
+                    "account_id_hex": request["account_id_hex"],
+                    "relay_lists": {"nip65": {"relays": "wss://relay.example"}},
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client.account_relay_lists("11" * 32)
+        self.assertEqual(raised.exception.code, "protocol_error")
 
     async def test_send_agent_operation_event_writes_typed_operation_request(self):
         requests = []
@@ -7203,6 +7383,12 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])
         self.assertIs(history["handler"], self.adapter_module._marmot_history_tool)
         self.assertTrue(history["is_async"])
+        group_profile = next(tool for tool in ctx.tools if tool["name"] == "marmot_group_profile")
+        self.assertEqual(group_profile["toolset"], "platform")
+        self.assertEqual(group_profile["schema"]["required"], ["group_id_hex"])
+        self.assertFalse(group_profile["schema"]["additionalProperties"])
+        self.assertIs(group_profile["handler"], self.adapter_module._marmot_group_profile_tool)
+        self.assertTrue(group_profile["is_async"])
         reaction = next(tool for tool in ctx.tools if tool["name"] == "marmot_reaction")
         self.assertEqual(reaction["toolset"], "platform")
         self.assertEqual(reaction["schema"]["required"], ["action", "group_id_hex"])
@@ -7499,6 +7685,57 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["type"], "timeline_message")
         self.assertEqual(calls, [("11" * 32, "22" * 32, "33" * 32)])
+
+    async def test_group_profile_tool_preserves_omitted_fields_and_reports_admin_denial(self):
+        calls = []
+        module = self.adapter_module
+
+        class FakeClient:
+            async def group_profile_update(self, account_id_hex, group_id_hex, *, name, description):
+                calls.append((account_id_hex, group_id_hex, name, description))
+                if name == "Denied":
+                    raise module.AgentControlError(
+                        "only a group admin can make this change", code="not_group_admin"
+                    )
+                if name == "Uncertain":
+                    raise module.AgentControlError("timed out", code="timeout", retryable=True)
+                return {
+                    "type": "group_profile_updated",
+                    "group_id_hex": group_id_hex,
+                    "message_ids_hex": ["33" * 32],
+                }
+
+        class FakeAdapter:
+            client = FakeClient()
+
+            async def _ensure_account_id(self):
+                return "11" * 32
+
+        adapter = FakeAdapter()
+        module._remember_live_adapter(adapter)
+        group_id = "22" * 16
+        updated = json.loads(await module._marmot_group_profile_tool({
+            "group_id_hex": group_id, "description": "",
+        }))
+        self.assertTrue(updated["ok"])
+        self.assertEqual(calls[-1], ("11" * 32, group_id, None, ""))
+        denied = json.loads(await module._marmot_group_profile_tool({
+            "group_id_hex": group_id, "name": "Denied",
+        }))
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["error_code"], "not_group_admin")
+        uncertain = json.loads(await module._marmot_group_profile_tool({
+            "group_id_hex": group_id, "name": "Uncertain",
+        }))
+        self.assertFalse(uncertain["ok"])
+        self.assertTrue(uncertain["outcome_unknown"])
+        missing = json.loads(await module._marmot_group_profile_tool({"group_id_hex": group_id}))
+        self.assertFalse(missing["ok"])
+        oversized = json.loads(await module._marmot_group_profile_tool({
+            "group_id_hex": group_id, "name": "é" * 129,
+        }))
+        self.assertFalse(oversized["ok"])
+        self.assertEqual(len(calls), 3)
 
     async def test_marmot_reaction_tool_calls_live_adapter_for_add_and_matching_remove(self):
         calls = []

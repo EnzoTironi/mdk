@@ -20,8 +20,9 @@ use cgka_traits::engine::{GroupEvent, GroupStateChange};
 use cgka_traits::{EpochId, GroupId, MessageId};
 use marmot_account::AccountHome;
 use marmot_app::{
-    AccountSetupRequest, AppError, MarmotApp, MarmotAppEvent, MarmotAppRuntime, ReceivedMessage,
-    RuntimeAgentStreamMessage, RuntimeMessageReceived,
+    AccountRelayListBootstrap, AccountSetupRequest, AppError, MarmotApp, MarmotAppEvent,
+    MarmotAppRuntime, ReceivedMessage, RuntimeAgentStreamMessage, RuntimeMessageReceived,
+    UserProfileMetadata,
 };
 use nostr_relay_builder::MockRelay;
 use std::collections::HashSet;
@@ -32,6 +33,7 @@ use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep, timeout};
 
+use crate::account::ProfileUpdateFields;
 use crate::allowlist::{AllowlistRecord, AllowlistStore};
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
@@ -276,6 +278,106 @@ fn profile_name_validation_rejects_non_whitespace_control_characters() {
             ))
         ));
     }
+}
+
+#[test]
+fn profile_field_validation_bounds_free_text_and_rejects_control_characters() {
+    use crate::validation::validate_profile_field;
+
+    // An omitted field keeps the published value; an empty one clears it.
+    assert_eq!(validate_profile_field("about", None).unwrap(), None);
+    assert_eq!(
+        validate_profile_field("about", Some(String::new())).unwrap(),
+        Some(String::new())
+    );
+    assert_eq!(
+        validate_profile_field("about", Some("Day family assistant.".to_owned())).unwrap(),
+        Some("Day family assistant.".to_owned())
+    );
+
+    let longest = "a".repeat(crate::MAX_PROFILE_FIELD_CHARS);
+    assert!(validate_profile_field("about", Some(longest)).is_ok());
+    assert!(matches!(
+        validate_profile_field(
+            "about",
+            Some("a".repeat(crate::MAX_PROFILE_FIELD_CHARS + 1))
+        ),
+        Err(crate::ConnectorError::InvalidProfileField(
+            "about", "too_long"
+        ))
+    ));
+
+    for (field, value) in [
+        ("about", "Day\u{1b}[2Jfamily".to_owned()),
+        ("picture", "https://example.com/\u{7}avatar.png".to_owned()),
+        ("nip05", "holly\u{0}@example.com".to_owned()),
+        ("lud16", "holly@example.com\u{b}".to_owned()),
+    ] {
+        assert!(matches!(
+            validate_profile_field(field, Some(value)),
+            Err(crate::ConnectorError::InvalidProfileField(
+                _,
+                "control_characters"
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn connector_profile_publish_rejects_hostile_optional_fields_without_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // The name has its own validation; these four arrive straight from the socket
+    // and would otherwise reach kind:0 unchecked.
+    for fields in [
+        ProfileUpdateFields {
+            about: Some("a".repeat(crate::MAX_PROFILE_FIELD_CHARS + 1)),
+            ..ProfileUpdateFields::default()
+        },
+        ProfileUpdateFields {
+            picture: Some("https://example.com/\u{1b}avatar.png".to_owned()),
+            ..ProfileUpdateFields::default()
+        },
+    ] {
+        let error = connector
+            .publish_profile_response(
+                &account.account_id_hex,
+                "Hermes Agent".to_owned(),
+                Some("Hermes Agent".to_owned()),
+                fields,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_profile_field");
+    }
+
+    // A rejected publish must not leave a half-written profile on the relay.
+    app.refresh_profile_for_account_id(
+        &account.account_id_hex,
+        vec![crate::validation::endpoint(&relay_url)],
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.directory_entry_for_account_id(&account.account_id_hex)
+            .unwrap()
+            .and_then(|entry| entry.profile)
+            .is_none(),
+        "a rejected profile must not publish anything"
+    );
 }
 
 fn test_config(
@@ -3091,6 +3193,10 @@ async fn connector_socket_publishes_profile_metadata() {
             account_id_hex: account.account_id_hex.clone(),
             name: "  Hermes Agent  ".to_owned(),
             display_name: None,
+            about: None,
+            picture: None,
+            nip05: None,
+            lud16: None,
         },
     );
     write_frame(&mut client_write, &request).await.unwrap();
@@ -3131,6 +3237,294 @@ async fn connector_socket_publishes_profile_metadata() {
 }
 
 #[tokio::test]
+async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Hermes Agent".to_owned(),
+            Some("Hermes Agent".to_owned()),
+            ProfileUpdateFields {
+                about: Some("Day family assistant.".to_owned()),
+                picture: Some("https://example.com/avatar.png".to_owned()),
+                nip05: Some("holly@example.com".to_owned()),
+                lud16: Some("holly@example.com".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    // kind:0 is replaceable, so a publish that names only the display name must
+    // leave every other published field alone.
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Holly Day".to_owned(),
+            Some("Holly Day".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    app.refresh_profile_for_account_id(
+        &account.account_id_hex,
+        vec![crate::validation::endpoint(&relay_url)],
+    )
+    .await
+    .unwrap();
+    let profile = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("published profile");
+    assert_eq!(profile.name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.display_name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        profile.picture.as_deref(),
+        Some("https://example.com/avatar.png")
+    );
+    assert_eq!(profile.nip05.as_deref(), Some("holly@example.com"));
+    assert_eq!(profile.lud16.as_deref(), Some("holly@example.com"));
+}
+
+#[tokio::test]
+async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_read_relays_hold_none()
+{
+    let dir = tempfile::tempdir().unwrap();
+    // The account published through one relay; a later connector reads and
+    // publishes through another. Re-bootstrapping with new `--relay` values is
+    // exactly this shape (#1966): the profile exists, just not on the relays this
+    // request reads.
+    let published_relay = MockRelay::run().await.unwrap();
+    let published_url = published_relay.url().await.to_string();
+    let read_relay = MockRelay::run().await.unwrap();
+    let read_url = read_relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), published_url.clone());
+    let published_endpoint = crate::validation::endpoint(&published_url);
+
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            name: Some("Hermes Agent".to_owned()),
+            display_name: Some("Hermes Agent".to_owned()),
+            about: Some("Day family assistant.".to_owned()),
+            picture: Some("https://example.com/avatar.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(
+            vec![published_endpoint.clone()],
+            vec![published_endpoint.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    // The published profile reaches the local cache the way it does on a real
+    // device: a directory refresh remembers what the relay holds.
+    app.refresh_profile_for_account_id(&account.account_id_hex, vec![published_endpoint.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        app.directory_entry_for_account_id(&account.account_id_hex)
+            .unwrap()
+            .and_then(|entry| entry.profile)
+            .and_then(|profile| profile.about),
+        Some("Day family assistant.".to_owned()),
+        "cached profile before the read that finds nothing"
+    );
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![read_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // The read through the connector's relays finds no kind:0 for the account, so
+    // the locally cached profile is the only thing that can keep `about` and
+    // `picture` from being wiped by this publish.
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Holly Day".to_owned(),
+            Some("Holly Day".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    app.refresh_profile_for_account_id(
+        &account.account_id_hex,
+        vec![crate::validation::endpoint(&read_url)],
+    )
+    .await
+    .unwrap();
+    let profile = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("published profile");
+    assert_eq!(profile.name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.display_name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        profile.picture.as_deref(),
+        Some("https://example.com/avatar.png")
+    );
+    // The values above come from the second publish, not from the seeded one.
+    assert!(profile.created_at > 42);
+}
+
+#[tokio::test]
+async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_lagging_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    // A read relay can be *stale* rather than empty: it keeps serving the
+    // pre-edit kind:0 while the newer edit is already in the local directory
+    // cache. Starting from the relay's older copy republishes the fields it
+    // holds over the local edit, which is the same erasure from the other side.
+    let lagging_relay = MockRelay::run().await.unwrap();
+    let lagging_url = lagging_relay.url().await.to_string();
+    let current_relay = MockRelay::run().await.unwrap();
+    let current_url = current_relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), lagging_url.clone());
+    let lagging_endpoint = crate::validation::endpoint(&lagging_url);
+    let current_endpoint = crate::validation::endpoint(&current_url);
+
+    // What the lagging relay holds and will keep returning to the read below.
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            name: Some("Hermes Agent".to_owned()),
+            display_name: Some("Hermes Agent".to_owned()),
+            about: Some("Old about.".to_owned()),
+            picture: Some("https://example.com/old.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(
+            vec![lagging_endpoint.clone()],
+            vec![lagging_endpoint.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    // The newer edit, published where the lagging relay cannot see it. A
+    // profile's `created_at` is the event timestamp the relay hands back, so
+    // the lagging copy is at best same-second and never strictly newer.
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            name: Some("Hermes Agent".to_owned()),
+            display_name: Some("Hermes Agent".to_owned()),
+            about: Some("Day family assistant.".to_owned()),
+            picture: Some("https://example.com/new.png".to_owned()),
+            created_at: 4242,
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(
+            vec![current_endpoint.clone()],
+            vec![current_endpoint.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    // The newer edit reaches the cache the way it does on a real device: a
+    // directory refresh remembers what the current relay holds.
+    app.refresh_profile_for_account_id(&account.account_id_hex, vec![current_endpoint.clone()])
+        .await
+        .unwrap();
+    let cached = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("cached profile before the stale read");
+    assert_eq!(cached.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        cached.picture.as_deref(),
+        Some("https://example.com/new.png"),
+        "cached profile before the stale read"
+    );
+
+    // Pin the premise: the copy this publish reads is the older one, and the
+    // cache is not older than it.
+    let read_copy = app
+        .fetch_current_user_profile_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+        )
+        .await
+        .unwrap()
+        .expect("lagging relay copy");
+    assert_eq!(read_copy.about.as_deref(), Some("Old about."));
+    assert_eq!(
+        read_copy.picture.as_deref(),
+        Some("https://example.com/old.png")
+    );
+    assert!(cached.created_at >= read_copy.created_at);
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![lagging_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // This publish names no optional field, so everything it does not name must
+    // come from the newer cached edit and not from the older copy the read
+    // relay returns.
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Holly Day".to_owned(),
+            Some("Holly Day".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    // Read what the lagging relay now holds, straight from the relay.
+    let published = app
+        .fetch_current_user_profile_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+        )
+        .await
+        .unwrap()
+        .expect("published profile");
+    assert_eq!(published.name.as_deref(), Some("Holly Day"));
+    assert_eq!(published.display_name.as_deref(), Some("Holly Day"));
+    assert_eq!(published.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        published.picture.as_deref(),
+        Some("https://example.com/new.png")
+    );
+    assert!(published.created_at >= read_copy.created_at);
+}
+
+#[tokio::test]
 async fn connector_profile_lookup_distinguishes_existing_and_absent_profiles() {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -3164,6 +3558,7 @@ async fn connector_profile_lookup_distinguishes_existing_and_absent_profiles() {
             &account.account_id_hex,
             "Existing Agent".to_owned(),
             Some("Existing Agent".to_owned()),
+            ProfileUpdateFields::default(),
         )
         .await
         .unwrap();
@@ -6967,6 +7362,142 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
 }
 
 #[tokio::test]
+async fn connector_group_profile_update_preserves_fields_and_requires_current_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer = connector.account_home.create_account("peer").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&peer.label)
+        .await
+        .unwrap();
+    let group_id = connector
+        .runtime
+        .create_group(
+            &agent.label,
+            "Original",
+            std::slice::from_ref(&peer.label),
+            Some("Keep this description".into()),
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let update = |name, description| AgentControlRequest::GroupProfileUpdate {
+        account_id_hex: agent.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        name,
+        description,
+    };
+    let renamed = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "rename",
+        update(Some("Renamed".into()), None),
+    )
+    .await;
+    assert!(matches!(
+        renamed.payload,
+        AgentControlResponse::GroupProfileUpdated {
+            ref group_id_hex,
+            ref message_ids_hex,
+        } if group_id_hex == &hex::encode(group_id.as_slice()) && !message_ids_hex.is_empty()
+    ));
+    let changed = connector
+        .app
+        .groups(&agent.label)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .unwrap();
+    assert_eq!(changed.profile.name, "Renamed");
+    assert_eq!(changed.profile.description, "Keep this description");
+
+    let cleared = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "clear-description",
+        update(None, Some(String::new())),
+    )
+    .await;
+    assert!(matches!(
+        cleared.payload,
+        AgentControlResponse::GroupProfileUpdated { .. }
+    ));
+    let changed = connector
+        .app
+        .groups(&agent.label)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .unwrap();
+    assert_eq!(changed.profile.name, "Renamed");
+    assert_eq!(changed.profile.description, "");
+
+    let oversized = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "oversized-name",
+        update(Some("é".repeat(129)), None),
+    )
+    .await;
+    assert!(matches!(
+        oversized.payload,
+        AgentControlResponse::Error { ref code, retryable: false, .. } if code == "invalid_group_profile"
+    ));
+
+    connector
+        .runtime
+        .promote_admin(&agent.label, &group_id, &peer.account_id_hex)
+        .await
+        .unwrap();
+    connector
+        .runtime
+        .self_demote_admin(&agent.label, &group_id)
+        .await
+        .unwrap();
+    let denied = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "not-admin",
+        update(Some("Forbidden".into()), None),
+    )
+    .await;
+    assert!(matches!(
+        denied.payload,
+        AgentControlResponse::Error { ref code, retryable: false, .. } if code == "not_group_admin"
+    ));
+    let invalid = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "no-fields",
+        update(None, None),
+    )
+    .await;
+    assert!(matches!(
+        invalid.payload,
+        AgentControlResponse::Error { ref code, retryable: false, .. } if code == "invalid_group_profile"
+    ));
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn connector_group_create_rejects_invalid_inputs_without_creating_groups() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev/wn-agent.sock");
@@ -7331,4 +7862,466 @@ async fn connector_leave_group_case(block_cleanup: bool) {
     ));
     assert!(reopened.contains(&agent.account_id_hex, &missing).unwrap());
     connector.runtime.shutdown().await;
+}
+async fn mock_relay_url() -> (MockRelay, String) {
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    (relay, relay_url)
+}
+
+/// Publish one NIP-65 and one inbox list, each naming a second relay, so every
+/// entry a later edit must preserve is a real reachable endpoint.
+async fn publish_nip65_and_inbox(
+    app: &MarmotApp,
+    account: &marmot_account::AccountSummary,
+    relay_endpoint: cgka_traits::TransportEndpoint,
+    read_only_endpoint: cgka_traits::TransportEndpoint,
+    write_only_endpoint: cgka_traits::TransportEndpoint,
+    inbox_endpoint: cgka_traits::TransportEndpoint,
+) {
+    app.publish_account_nip65_relay_set(
+        &account.label,
+        vec![relay_endpoint.clone(), read_only_endpoint],
+        vec![relay_endpoint.clone(), write_only_endpoint],
+        vec![relay_endpoint.clone()],
+    )
+    .await
+    .unwrap();
+    app.publish_account_relay_list_kind(
+        &account.label,
+        "inbox",
+        vec![relay_endpoint.clone(), inbox_endpoint],
+        vec![relay_endpoint],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_write_relay, write_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let (_added_relay, added_url) = mock_relay_url().await;
+    let (_inbox_added_relay, inbox_added_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    publish_nip65_and_inbox(
+        &app,
+        &account,
+        relay_endpoint.clone(),
+        crate::validation::endpoint(&read_url),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&inbox_url),
+    )
+    .await;
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // kind 10002 is replaceable: adding one relay must keep the read-only,
+    // write-only and inbox entries the request never named.
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap();
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Inbox,
+            url: inbox_added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap();
+
+    let published = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![relay_endpoint.clone()],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    for expected in [&added_url, &read_url, &relay_url] {
+        assert!(
+            published
+                .nip65
+                .read_relays
+                .iter()
+                .any(|relay| relay == expected),
+            "read set should still hold {expected}"
+        );
+    }
+    for expected in [&relay_url, &write_url] {
+        assert!(
+            published
+                .nip65
+                .write_relays
+                .iter()
+                .any(|relay| relay == expected),
+            "write set should still hold {expected}"
+        );
+    }
+    for expected in [&inbox_url, &inbox_added_url] {
+        assert!(
+            published.inbox.relays.iter().any(|relay| relay == expected),
+            "inbox list should still hold {expected}"
+        );
+    }
+
+    // The relay being adopted must actually receive the event that names it: it
+    // is not in the account's pre-edit outbox, so the route has to include it.
+    let added_copy = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&added_url)],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("the added relay received the list naming it");
+    assert!(
+        added_copy
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &added_url)
+    );
+
+    // Removing one entry keeps the rest, in both list kinds. Replaceable events
+    // are second-resolution: a removal published in the same second as the
+    // addition cannot supersede it, so the removal waits for the next second.
+    sleep(Duration::from_millis(1_100)).await;
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: false,
+        })
+        .await
+        .unwrap();
+    let published = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![relay_endpoint.clone()],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert!(
+        !published
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &added_url)
+    );
+    assert!(
+        published
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &read_url)
+    );
+}
+
+#[tokio::test]
+async fn connector_relay_lists_reports_the_cached_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_write_relay, write_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    publish_nip65_and_inbox(
+        &app,
+        &account,
+        crate::validation::endpoint(&relay_url),
+        crate::validation::endpoint(&read_url),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&inbox_url),
+    )
+    .await;
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let response = connector
+        .relay_lists_response(&account.account_id_hex)
+        .unwrap();
+    let AgentControlResponse::RelayLists {
+        account_id_hex,
+        relay_lists,
+    } = response
+    else {
+        panic!("expected relay lists response, got {response:?}");
+    };
+    assert_eq!(account_id_hex, account.account_id_hex);
+    assert!(
+        relay_lists
+            .nip65
+            .write_relays
+            .iter()
+            .any(|relay| relay == &write_url)
+    );
+    assert!(
+        relay_lists
+            .inbox
+            .relays
+            .iter()
+            .any(|relay| relay == &inbox_url)
+    );
+    assert!(relay_lists.nip65.created_at > 0);
+    assert!(relay_lists.inbox.created_at > 0);
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_refuses_an_unconfirmed_published_list() {
+    let dir = tempfile::tempdir().unwrap();
+    // The relay the connector reads through holds no relay-list event, and the
+    // account has never published one: the read is unconfirmed, so the edit must
+    // refuse rather than publish a list built from nothing.
+    let (_relay, relay_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let error = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: relay_url,
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "relay_list_inconclusive");
+    assert!(error.retryable());
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_rejects_invalid_inputs_before_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    // Loopback relays stay a dev-only gate: this connector does not set it, so a
+    // `ws://` loopback entry is refused even though a local agent may well reach
+    // one. No relay is configured: validation precedes any relay read.
+    let mut config = test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    );
+    config.allow_loopback_relays = false;
+    let connector = AgentConnector::open(config).unwrap();
+
+    for url in [
+        "",
+        "not-a-relay",
+        "http://relay.example",
+        "wss://relay.example\u{1b}]8;;https://evil.example\u{7}",
+    ] {
+        let error = connector
+            .relay_list_edit_response(crate::relays::RelayListEdit {
+                account_id_hex: account.account_id_hex.clone(),
+                relay_type: agent_control::AgentControlRelayListType::Nip65,
+                url: url.to_owned(),
+                direction: agent_control::AgentControlRelayListDirection::Both,
+                add: true,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_relay_url", "url {url:?}");
+    }
+
+    let error = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: "ws://127.0.0.1:8080".to_owned(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_relay_url");
+
+    // The inbox list has no read/write roles, so a named direction is refused
+    // rather than silently ignored.
+    let error = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Inbox,
+            url: "wss://inbox.example".to_owned(),
+            direction: agent_control::AgentControlRelayListDirection::Read,
+            add: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_relay_list_edit");
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_lagging_relay, lagging_url) = mock_relay_url().await;
+    let (_current_relay, current_url) = mock_relay_url().await;
+    let (_old_entry_relay, old_entry_url) = mock_relay_url().await;
+    let (_current_entry_relay, current_entry_url) = mock_relay_url().await;
+    let (_added_relay, added_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), lagging_url.clone());
+    let lagging_endpoint = crate::validation::endpoint(&lagging_url);
+    let current_endpoint = crate::validation::endpoint(&current_url);
+
+    // The pre-edit list: read-only entries routed through the relay the
+    // connector will read through, and no write relay. That empty write set is
+    // what keeps the next publication off this relay, so it goes on serving this
+    // copy after the account has moved on.
+    app.publish_account_nip65_relay_set(
+        &account.label,
+        vec![
+            lagging_endpoint.clone(),
+            crate::validation::endpoint(&old_entry_url),
+        ],
+        Vec::new(),
+        vec![lagging_endpoint.clone()],
+    )
+    .await
+    .unwrap();
+
+    // Replaceable-event timestamps are second-resolution, so the newer list has
+    // to be published in a later second to supersede the cached copy anywhere.
+    sleep(Duration::from_millis(1_100)).await;
+
+    // The newer local edit, published where the lagging relay cannot see it.
+    app.publish_account_nip65_relay_set(
+        &account.label,
+        vec![
+            current_endpoint.clone(),
+            crate::validation::endpoint(&current_entry_url),
+        ],
+        vec![current_endpoint.clone()],
+        vec![current_endpoint.clone()],
+    )
+    .await
+    .unwrap();
+    let cached = app.account_relay_list_status(&account.label).unwrap();
+    assert!(
+        cached
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &current_entry_url),
+        "cached list before the stale read"
+    );
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![lagging_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    // Pin the premise: the read this publish makes returns the pre-edit copy,
+    // and the cache is not older than it.
+    let read_copy = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("lagging relay copy");
+    assert!(
+        read_copy
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &old_entry_url)
+    );
+    assert!(cached.nip65.created_at >= read_copy.nip65.created_at);
+
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap();
+
+    // What the lagging relay now holds is the newer list plus the edit, not the
+    // pre-edit entries that same relay was still serving.
+    let published = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("published relay list");
+    for expected in [&added_url, &current_entry_url] {
+        assert!(
+            published
+                .nip65
+                .read_relays
+                .iter()
+                .any(|relay| relay == expected),
+            "published list should hold {expected}"
+        );
+    }
+    assert!(
+        !published
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &old_entry_url),
+        "the pre-edit entries the lagging relay served must not come back"
+    );
 }

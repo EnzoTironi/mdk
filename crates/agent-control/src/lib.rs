@@ -131,6 +131,75 @@ impl<T> AgentControlEnvelope<T> {
     }
 }
 
+/// Which published account relay list a control request reads or edits.
+///
+/// Kind 10002 is the NIP-65 read/write relay map; kind 10050 is the Marmot
+/// inbox relay list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlRelayListType {
+    Nip65,
+    Inbox,
+}
+
+impl AgentControlRelayListType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nip65 => "nip65",
+            Self::Inbox => "inbox",
+        }
+    }
+}
+
+/// Which direction of a NIP-65 entry one edit applies to.
+///
+/// `Both` — the default when a request omits the field — publishes the relay
+/// unmarked, which NIP-65 clients read as read *and* write. The inbox list
+/// (kind 10050) has no directional roles and accepts only the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlRelayListDirection {
+    Read,
+    Write,
+    #[default]
+    Both,
+}
+
+impl AgentControlRelayListDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Both => "both",
+        }
+    }
+}
+
+/// One published account relay list.
+///
+/// For kind 10002, `relays` is the write-capable subset and the two directional
+/// sets carry the NIP-65 roles. For kind 10050, `relays` is the declared inbox
+/// set and the directional sets are empty.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlRelayList {
+    pub relays: Vec<String>,
+    #[serde(default)]
+    pub read_relays: Vec<String>,
+    #[serde(default)]
+    pub write_relays: Vec<String>,
+    /// Timestamp of the replaceable event this state came from. Zero means the
+    /// account has nothing published for this list.
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+/// Both account relay lists, as returned by a read or an edit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlRelayLists {
+    pub nip65: AgentControlRelayList,
+    pub inbox: AgentControlRelayList,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlRequest {
@@ -287,12 +356,59 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         name: String,
         display_name: Option<String>,
+        /// Optional kind-0 fields, mirroring `wn profile update`. An absent field
+        /// keeps the account's currently published value: the connector reads the
+        /// published profile and overlays these instead of replacing it.
+        #[serde(default)]
+        about: Option<String>,
+        #[serde(default)]
+        picture: Option<String>,
+        #[serde(default)]
+        nip05: Option<String>,
+        #[serde(default)]
+        lud16: Option<String>,
     },
     /// Resolve whether the selected account already has a valid published
     /// Nostr kind-0 profile. The connector returns a typed outcome so relay
     /// failures can never be mistaken for a confirmed absence.
     AccountProfileLookup {
         account_id_hex: String,
+    },
+    /// Read the selected account's relay lists from the connector's cached
+    /// directory state. No network read happens: `account_relay_list_add` and
+    /// `account_relay_list_remove` return the freshly published state.
+    AccountRelayLists {
+        account_id_hex: String,
+    },
+    /// Add one relay to one published account relay list.
+    ///
+    /// Kind 10002 and kind 10050 are *replaceable*, so the connector reads the
+    /// published list, overlays this one entry, and publishes the merge. A read
+    /// the connector cannot confirm is refused rather than published as a
+    /// partial replacement. Naming a direction an entry already has is a no-op;
+    /// naming one it lacks widens it, which is how an unmarked (read *and*
+    /// write) NIP-65 entry is expressed.
+    AccountRelayListAdd {
+        account_id_hex: String,
+        relay_type: AgentControlRelayListType,
+        url: String,
+        #[serde(default)]
+        direction: AgentControlRelayListDirection,
+    },
+    /// Remove one relay from one published account relay list.
+    ///
+    /// Same read-merge-publish contract as [`Self::AccountRelayListAdd`]. An
+    /// absent entry is a no-op that still republishes the confirmed list.
+    /// Removing only the read direction of a NIP-65 entry that still has a
+    /// writer is allowed; a removal that would leave the NIP-65 write set or the
+    /// inbox list empty is refused, because an account that cannot publish is
+    /// worse than a rejected edit.
+    AccountRelayListRemove {
+        account_id_hex: String,
+        relay_type: AgentControlRelayListType,
+        url: String,
+        #[serde(default)]
+        direction: AgentControlRelayListDirection,
     },
     SendAgentActivity {
         account_id_hex: String,
@@ -353,6 +469,17 @@ pub enum AgentControlRequest {
     GroupInfo {
         account_id_hex: String,
         group_id_hex: String,
+    },
+    /// Update authenticated group profile fields. Omitted fields keep their
+    /// current value; an empty string explicitly clears a field. Only a current
+    /// group admin can publish this MLS commit.
+    GroupProfileUpdate {
+        account_id_hex: String,
+        group_id_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     MaintenanceStatus {
         account_id_hex: String,
@@ -515,6 +642,10 @@ pub enum AgentControlResponse {
         status: AgentControlProfileLookupStatus,
         retryable: bool,
     },
+    RelayLists {
+        account_id_hex: String,
+        relay_lists: AgentControlRelayLists,
+    },
     FinalSent {
         message_ids_hex: Vec<String>,
         #[serde(default)]
@@ -562,6 +693,10 @@ pub enum AgentControlResponse {
         is_direct: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
+    },
+    GroupProfileUpdated {
+        group_id_hex: String,
+        message_ids_hex: Vec<String>,
     },
     MaintenanceStatus {
         status: AgentControlMaintenanceStatus,
@@ -1006,11 +1141,152 @@ mod tests {
 
     use crate::{
         AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlInvitePolicy,
-        AgentControlMediaUpload, AgentControlProfileLookupStatus, AgentControlRequest,
-        AgentControlResponse, AgentControlSendMaintenanceDisposition, AgentControlTimelineCursor,
-        MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
-        write_frame,
+        AgentControlMediaUpload, AgentControlProfileLookupStatus, AgentControlRelayList,
+        AgentControlRelayListDirection, AgentControlRelayListType, AgentControlRelayLists,
+        AgentControlRequest, AgentControlResponse, AgentControlSendMaintenanceDisposition,
+        AgentControlTimelineCursor, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, decode_frame,
+        encode_frame, read_envelope, read_frame, write_frame,
     };
+
+    #[test]
+    fn account_publish_profile_frames_round_trip_with_optional_fields() {
+        for optional in [false, true] {
+            let request = AgentControlEnvelope::request(
+                Some("profile-1".into()),
+                AgentControlRequest::AccountPublishProfile {
+                    account_id_hex: "11".repeat(32),
+                    name: "Holly Day".into(),
+                    display_name: None,
+                    about: optional.then(|| "Day family assistant.".into()),
+                    picture: optional.then(|| "https://example.com/avatar.png".into()),
+                    nip05: optional.then(|| "holly@example.com".into()),
+                    lud16: optional.then(|| "holly@example.com".into()),
+                },
+            );
+            let encoded = encode_frame(&request).unwrap();
+            let json: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "account_publish_profile");
+            assert_eq!(json["about"].is_null(), !optional);
+            assert_eq!(json["picture"].is_null(), !optional);
+            assert_eq!(json["nip05"].is_null(), !optional);
+            assert_eq!(json["lud16"].is_null(), !optional);
+            assert_eq!(
+                decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+
+        // A client that predates the optional fields sends none of them.
+        let legacy: Value = serde_json::json!({
+            "marmot_agent_control": crate::AGENT_CONTROL_PROTOCOL_V2,
+            "id": "profile-legacy",
+            "type": "account_publish_profile",
+            "account_id_hex": "11".repeat(32),
+            "name": "Holly Day",
+            "display_name": null,
+        });
+        let decoded: AgentControlRequest =
+            serde_json::from_value(legacy).expect("legacy account_publish_profile payload");
+        assert!(matches!(
+            decoded,
+            AgentControlRequest::AccountPublishProfile {
+                about: None,
+                picture: None,
+                nip05: None,
+                lud16: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn account_relay_list_frames_round_trip_with_optional_direction() {
+        for direction in [None, Some(AgentControlRelayListDirection::Read)] {
+            let request = AgentControlEnvelope::request(
+                Some("relays-1".into()),
+                AgentControlRequest::AccountRelayListAdd {
+                    account_id_hex: "11".repeat(32),
+                    relay_type: AgentControlRelayListType::Nip65,
+                    url: "wss://relay.example".into(),
+                    direction: direction.unwrap_or_default(),
+                },
+            );
+            let encoded = encode_frame(&request).unwrap();
+            let json: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "account_relay_list_add");
+            assert_eq!(json["relay_type"], "nip65");
+            assert_eq!(json["direction"], direction.unwrap_or_default().as_str());
+            assert_eq!(
+                decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+
+        // A client that predates `direction` sends none, which means both: the
+        // relay is published unmarked, as NIP-65 readers expect.
+        let legacy: Value = serde_json::json!({
+            "marmot_agent_control": crate::AGENT_CONTROL_PROTOCOL_V2,
+            "id": "relays-legacy",
+            "type": "account_relay_list_remove",
+            "account_id_hex": "11".repeat(32),
+            "relay_type": "inbox",
+            "url": "wss://inbox.example",
+        });
+        let decoded: AgentControlRequest =
+            serde_json::from_value(legacy).expect("legacy account_relay_list_remove payload");
+        assert!(matches!(
+            decoded,
+            AgentControlRequest::AccountRelayListRemove {
+                relay_type: AgentControlRelayListType::Inbox,
+                direction: AgentControlRelayListDirection::Both,
+                ..
+            }
+        ));
+
+        let read = AgentControlEnvelope::request(
+            Some("relays-2".into()),
+            AgentControlRequest::AccountRelayLists {
+                account_id_hex: "11".repeat(32),
+            },
+        );
+        let encoded = encode_frame(&read).unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["type"], "account_relay_lists");
+        assert_eq!(
+            decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+            read
+        );
+    }
+
+    #[test]
+    fn relay_lists_response_round_trips() {
+        let response = AgentControlResponse::RelayLists {
+            account_id_hex: "11".repeat(32),
+            relay_lists: AgentControlRelayLists {
+                nip65: AgentControlRelayList {
+                    relays: vec!["wss://write.example".into()],
+                    read_relays: vec!["wss://read.example".into(), "wss://write.example".into()],
+                    write_relays: vec!["wss://write.example".into()],
+                    created_at: 1_700_000_000,
+                },
+                inbox: AgentControlRelayList {
+                    relays: vec!["wss://inbox.example".into()],
+                    read_relays: Vec::new(),
+                    write_relays: Vec::new(),
+                    created_at: 0,
+                },
+            },
+        };
+        let encoded = encode_frame(&response).unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["type"], "relay_lists");
+        assert_eq!(json["relay_lists"]["nip65"]["created_at"], 1_700_000_000);
+        assert_eq!(json["relay_lists"]["inbox"]["created_at"], 0);
+        assert_eq!(
+            decode_frame::<AgentControlResponse>(&encoded).unwrap(),
+            response
+        );
+    }
 
     #[test]
     fn group_create_frames_round_trip_with_optional_fields() {
@@ -1074,6 +1350,49 @@ mod tests {
         assert_eq!(
             decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn group_profile_update_round_trips_partial_and_clear_fields() {
+        for (name, description) in [
+            (Some("New name".to_owned()), None),
+            (None, Some("New description".to_owned())),
+            (Some(String::new()), Some(String::new())),
+        ] {
+            let request = AgentControlEnvelope::request(
+                Some("profile-1".into()),
+                AgentControlRequest::GroupProfileUpdate {
+                    account_id_hex: "ab".repeat(32),
+                    group_id_hex: "cd".repeat(16),
+                    name: name.clone(),
+                    description: description.clone(),
+                },
+            );
+            let encoded = encode_frame(&request).unwrap();
+            let json: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "group_profile_update");
+            assert_eq!(json.get("name").is_some(), name.is_some());
+            assert_eq!(json.get("description").is_some(), description.is_some());
+            assert_eq!(
+                decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+
+        let response = AgentControlEnvelope::new(
+            Some("profile-1".into()),
+            AgentControlResponse::GroupProfileUpdated {
+                group_id_hex: "cd".repeat(16),
+                message_ids_hex: vec!["ef".repeat(32)],
+            },
+        );
+        let encoded = encode_frame(&response).unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["type"], "group_profile_updated");
+        assert_eq!(
+            decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
+            response
         );
     }
 
@@ -1741,6 +2060,10 @@ mod tests {
                     account_id_hex: account(),
                     name: "agent".to_owned(),
                     display_name: Some("Agent".to_owned()),
+                    about: None,
+                    picture: None,
+                    nip05: None,
+                    lud16: None,
                 },
                 "account_publish_profile",
             ),

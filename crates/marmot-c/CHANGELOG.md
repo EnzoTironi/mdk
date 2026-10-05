@@ -7,13 +7,50 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-02
+
+Recompile against the matching `marmot.h` and library: several signatures and
+record layouts changed. See the [client upgrade guide](../../docs/integration/0.12.0.md).
+
 ### Added
 
+- `marmot_group_app_component` / `marmot_group_app_component_free` and
+  `marmot_update_app_component` read and admin-update optional
+  application-owned group components. `MARMOT_STATUS_INVALID_APP_COMPONENT`
+  (95) reports invalid ids, required components and oversized state. (#1929)
+
+- `marmot_request_explicit_attachment` joins/promotes eligible attachment demand without resetting retry budgets, backoff or active deadlines. Requires the matching header and library; deliberate Retry/Download again remain separate operations.
+
+- `marmot_create_identity`, `marmot_create_identity_with_profile`,
+  `marmot_login`, `marmot_login_recovering_incomplete_setup`,
+  `marmot_publish_relay_lists` and `marmot_begin_onboarding` take a trailing
+  `inbox_relays`/`inbox_relays_len` array that sets the kind-10050 inbox list
+  separately from `default_relays`. Pass `NULL, 0` to keep declaring
+  `default_relays` in both lists. The signatures changed: recompile against the
+  matching header and library.
 - `marmot_poll_votes` returns a `MarmotPollVotePage` of each voter's effective
   poll selection, 1..=100 per page with a `(voted_at, voter)` cursor; all pages
   sum to the `MarmotPollProjection` tally. Free it with
   `marmot_poll_vote_page_free`; requires the matching regenerated header and
   library. (#2091)
+- `marmot_send_tagged_text`, `marmot_send_tagged_media`, and
+  `marmot_react_with_media` add application tags such as NIP-30 `emoji` to a
+  chat, media chat, or reaction. `MarmotMediaUploadRequest` gains trailing
+  `message_tags`/`message_tags_len` (NULL/0 for none), which changes its
+  layout; requires the matching regenerated header and library.
+- `MarmotConversationReaction` gains trailing nullable
+  `reaction_message_id_hex`, the earliest active kind-7 for that emoji; a
+  NIP-30 reaction's image is listed under it by `marmot_list_media`. Kind-9
+  conversation rows also keep NIP-30 `emoji` tags. Requires the matching
+  regenerated header and library.
+
+### Changed
+
+- `marmot_set_chat_muted` now allows direct mentions of the receiving account
+  through the durable mute in notification subscriptions. Ordinary traffic
+  stays silent and blocked senders remain suppressed; C hosts still apply
+  their own notification permission, channel, and foreground policy. No C ABI
+  layout changes. (marmot-protocol/whitenoise-android#2984)
 
 
 ## [0.11.0] - 2026-09-29
@@ -113,6 +150,19 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   optimization and Linux packaging are unchanged.
 
 ### Added
+
+- `marmot_group_app_component` and admin-only `marmot_update_app_component`
+  expose opaque optional group state for application-owned component IDs.
+  Applications allocate IDs at or above `0xf000`; every ID below that is
+  protocol space and is rejected, so a component the registry assigns later
+  can never collide with one an application already committed. Required
+  components cannot be updated through this API, and `data_len` is capped at
+  4096 bytes because the value is re-encoded into every later commit and every
+  Welcome. An absent component writes NULL to `*out` and still returns OK;
+  present empty data writes a record with zero length.
+  Release records with `marmot_group_app_component_free`. Invalid component IDs
+  return the appended `MARMOT_STATUS_INVALID_APP_COMPONENT` status (95).
+  Existing record layouts and status values are unchanged.
 
 - `MarmotClientOptions` and `marmot_client_new_with_configuration` combine relay
   policy, cursor persistence, client label and optional host secret storage.
@@ -339,7 +389,8 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.12.0...HEAD
+[0.12.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...marmotc-v0.12.0
 [0.11.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.10.4...marmotc-v0.11.0
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
 [0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16
