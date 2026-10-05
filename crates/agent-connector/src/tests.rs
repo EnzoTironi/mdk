@@ -1257,7 +1257,11 @@ async fn connector_socket_bind_reports_overlong_staging_path_before_creating_par
 async fn management_socket_can_exceed_the_budget_while_regular_control_still_fits() {
     use std::os::unix::ffi::OsStrExt;
 
-    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    // macOS spells /tmp through a symlink to world-writable /private/tmp.
+    // Use the real short base so the control bind tests socket length rather
+    // than the production rejection of an untrusted directory alias.
+    let short_temp_base = std::fs::canonicalize("/tmp").unwrap();
+    let dir = tempfile::tempdir_in(short_temp_base).unwrap();
     let probe = dir
         .path()
         .join("x")

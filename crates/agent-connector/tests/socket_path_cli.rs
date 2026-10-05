@@ -5,7 +5,10 @@
 fn socket_path_too_long_cli_reports_actionable_error_without_private_path() {
     use std::os::unix::ffi::OsStrExt;
 
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    // Keep the home short without passing macOS's /tmp directory alias into
+    // the private-home preparation path. Production alias checks stay intact.
+    let short_temp_base = std::fs::canonicalize("/tmp").unwrap();
+    let root = tempfile::tempdir_in(short_temp_base).unwrap();
     let probe = root.path().join("x").join("wn-agent.sock");
     let overflow = root.path().join("x".repeat(200)).join("wn-agent.sock");
     let limit = fs_private::validate_private_unix_socket_path(&overflow)
