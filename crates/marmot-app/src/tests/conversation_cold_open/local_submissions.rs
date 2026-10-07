@@ -849,6 +849,12 @@ async fn completion_write_failure_does_not_stall_later_submissions() {
                 .0,
         );
     }
+    h.relay.block_next_publish();
+    let runtime = MarmotAppRuntime::new(h.app.clone());
+    runtime.start().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), h.relay.wait_for_blocked_publish())
+        .await
+        .unwrap();
     let path = h.app.account_storage_path("alice");
     let keys = h.app.account_home().load_signing_keys("alice").unwrap();
     let key = h
@@ -865,8 +871,7 @@ async fn completion_write_failure_does_not_stall_later_submissions() {
     connection.execute_batch("CREATE TRIGGER fail_local_finish BEFORE UPDATE OF outcome_json ON local_message_submissions
         WHEN NEW.outcome_json IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected finish failure'); END;").unwrap();
     drop(connection);
-    let runtime = MarmotAppRuntime::new(h.app.clone());
-    runtime.start().await.unwrap();
+    h.relay.release_publish();
     let store = h.app.account_storage("alice").unwrap();
     let group = hex::encode(h.group.as_slice());
     // Three rows also prevent the initial maintenance tick from masking the bug.

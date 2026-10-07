@@ -341,7 +341,7 @@ impl AppClient {
         if !self.audit_v5_enabled() {
             return;
         }
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             group,
             None,
             AuditEventKind::RecoveryNeedChanged {
@@ -403,7 +403,7 @@ impl AppClient {
             bounded(obligations, RECOVERY_AUDIT_MAX_OBLIGATIONS);
         let (relay_urls, endpoint_count, endpoints_truncated) =
             bounded(endpoints, RECOVERY_AUDIT_MAX_ENDPOINTS);
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             None,
             Some(context.clone()),
             AuditEventKind::RecoveryAttemptStarted {
@@ -466,7 +466,7 @@ impl AppClient {
             required.extend(scope.required_endpoints.iter());
             admitted.extend(scope.admitted_endpoints.iter());
         }
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             None,
             Some(context.clone()),
             AuditEventKind::RecoveryAttemptFinished {
@@ -539,7 +539,7 @@ impl AppClient {
                 .then(|| storage.recovery_parking_streak(settled.id).ok())
                 .flatten()
                 .flatten();
-            self.runtime.session().record_audit_event(
+            let _ = self.runtime.session().record_audit_event(
                 obligation.group_id.as_ref(),
                 Some(context.clone()),
                 AuditEventKind::RecoveryObligationReassessed {
@@ -575,7 +575,7 @@ impl AppClient {
         }
         for report in reports {
             let summary = report.summary;
-            self.runtime.session().record_audit_event(
+            let _ = self.runtime.session().record_audit_event(
                 None,
                 None,
                 AuditEventKind::SubscriptionEoseRepaired {
@@ -630,7 +630,7 @@ impl AppClient {
         let since = std::mem::replace(&mut self.cursor_audit_placements, counts);
         // A replaced queue restarts its counters; report what it has.
         let delta = |now: u64, then: u64| if now >= then { now - then } else { now };
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             None,
             None,
             AuditEventKind::TransportCursorAdvanced {

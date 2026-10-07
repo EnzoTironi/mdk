@@ -26,6 +26,8 @@ tempfile.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
+# Isolated direct-witness source only; never enable in product artifacts.
+diagnostic-account-open-witness = []
 extensions-draft = ["openmls_traits/extensions-draft"]
 storage-format-benchmarks = []
 test-conformance-replay = []

@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
+#[cfg(feature = "test-policy-overrides")]
 #[path = "support/queued_artifact.rs"]
 mod queued_artifact;
 mod support;

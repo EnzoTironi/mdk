@@ -16,28 +16,10 @@ use sha2::{Digest, Sha256};
 
 const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
 const RELEASED_TRANSPORT_RECEIPT_CAPACITY: i64 = 8_192;
-const NORMALIZED_MESSAGE_STORAGE_FORMAT: i64 = 2;
-const MESSAGE_FORMAT_PROMOTION_BATCH_MAX: usize = 256;
 
-const MESSAGE_COLUMNS: &str =
-    "id, group_id, epoch, state, storage_format, record, payload, deferred_peel";
+const MESSAGE_COLUMNS: &str = "id, group_id, epoch, state, payload, deferred_peel";
 
-type MessageColumns = (
-    Vec<u8>,
-    Vec<u8>,
-    i64,
-    i64,
-    i64,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MessageFormatPromotionProgress {
-    pub promoted: usize,
-    pub has_more: bool,
-}
+type MessageColumns = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>, Option<Vec<u8>>);
 
 /// Logical blob/value sizes used by the storage-format benchmark rail.
 ///
@@ -117,8 +99,8 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         let message_value_bytes = conn
             .query_row_cached(
-                "SELECT length(id) + length(group_id) + coalesce(length(payload), 0) +
-                        coalesce(length(record), 0) + coalesce(length(deferred_peel), 0)
+                "SELECT length(id) + length(group_id) + length(payload) +
+                        coalesce(length(deferred_peel), 0)
                  FROM cgka_messages WHERE id = ?1",
                 params![message_id.as_slice()],
                 |row| row.get::<_, i64>(0),
@@ -142,88 +124,6 @@ impl SqliteAccountStorage {
                 StorageError::Backend(format!("invalid snapshot benchmark size: {error}"))
             })?,
         })
-    }
-
-    /// Promote at most `limit` legacy message rows to normalized format 2.
-    ///
-    /// The bounded batch is atomic and idempotent. A malformed row rolls the
-    /// whole batch back, so a caller never observes a skipped or half-promoted
-    /// prefix. Hosts may schedule repeated batches away from session-open
-    /// latency; this method emits no identifiers or payload data.
-    pub fn promote_legacy_message_rows(
-        &self,
-        limit: usize,
-    ) -> StorageResult<MessageFormatPromotionProgress> {
-        if limit == 0 || limit > MESSAGE_FORMAT_PROMOTION_BATCH_MAX {
-            return Err(StorageError::Backend(format!(
-                "message format promotion batch must be between 1 and {MESSAGE_FORMAT_PROMOTION_BATCH_MAX}"
-            )));
-        }
-        retry_on_busy(|| {
-            let mut conn = self.lock()?;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .storage()?;
-            let rows = {
-                let mut statement = tx
-                    .prepare_cached(&format!(
-                        "SELECT {MESSAGE_COLUMNS} FROM cgka_messages
-                         WHERE storage_format = 1
-                         ORDER BY insert_order
-                         LIMIT ?1"
-                    ))
-                    .storage()?;
-                statement
-                    .query_map(
-                        params![i64::try_from(limit).unwrap_or(i64::MAX)],
-                        message_columns,
-                    )
-                    .storage()?
-                    .collect::<Result<Vec<_>, _>>()
-                    .storage()?
-            };
-            let promoted = rows.len();
-            #[cfg(test)]
-            let mut promoted_so_far = 0;
-            for columns in rows {
-                let record = decode_message_columns(columns)?;
-                put_message_on_connection(&tx, None, &record)?;
-                #[cfg(test)]
-                {
-                    promoted_so_far += 1;
-                    promotion_crash_pause(promoted_so_far);
-                }
-            }
-            let has_more = tx
-                .query_row_cached(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM cgka_messages WHERE storage_format = 1
-                     )",
-                    [],
-                    |row| row.get(0),
-                )
-                .storage()?;
-            tx.commit().storage()?;
-            Ok(MessageFormatPromotionProgress { promoted, has_more })
-        })
-    }
-}
-
-#[cfg(test)]
-fn promotion_crash_pause(promoted: usize) {
-    let expected = promoted.to_string();
-    if std::env::var("MDK_STORAGE_TEST_PROMOTION_CRASH_AFTER").as_deref() != Ok(expected.as_str()) {
-        return;
-    }
-    let ready = std::env::var_os("MDK_STORAGE_TEST_CRASH_READY_FILE")
-        .expect("promotion crash ready-file path");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(ready)
-        .expect("create promotion crash ready file");
-    loop {
-        std::thread::park();
     }
 }
 
@@ -396,13 +296,10 @@ impl MessageStorage for SqliteAccountStorage {
         group_id: &GroupId,
     ) -> StorageResult<Vec<DeferredMessageMetadata>> {
         let conn = self.lock()?;
-        // length(BLOB) reads its size without copying it into Rust. Legacy
-        // format 1 has no independent metadata, so only those rows need the
-        // record blob; they promote through the existing bounded migration.
+        // length(BLOB) reads its size without copying the payload into Rust.
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, group_id, epoch, storage_format,
-                    CASE WHEN storage_format = 1 THEN record END,
+                "SELECT id, group_id, epoch,
                     CASE WHEN typeof(payload) = 'blob' THEN length(payload) END,
                     deferred_peel
              FROM cgka_messages WHERE group_id = ?1 AND state = ?2 AND epoch >= 0
@@ -420,48 +317,29 @@ impl MessageStorage for SqliteAccountStorage {
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(3)?,
                         row.get::<_, Option<Vec<u8>>>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                        row.get::<_, Option<Vec<u8>>>(6)?,
                     ))
                 },
             )
             .storage()?;
         rows.map(|row| {
-            let (id, group_id, epoch, format, record, payload_len, lifecycle) = row.storage()?;
-            match format {
-                1 => {
-                    let record = record.ok_or_else(|| {
-                        StorageError::Serialization(
-                            "legacy message row is missing its record blob".into(),
-                        )
-                    })?;
-                    Ok(DeferredMessageMetadata::from(deserialize::<MessageRecord>(
-                        &record,
-                    )?))
-                }
-                NORMALIZED_MESSAGE_STORAGE_FORMAT => Ok(DeferredMessageMetadata {
-                    id: MessageId::new(id),
-                    group_id: GroupId::new(group_id),
-                    epoch: EpochId(i64_to_u64(epoch)?),
-                    payload_len: usize::try_from(payload_len.ok_or_else(|| {
-                        StorageError::Serialization(
-                            "normalized message row is missing its payload blob".into(),
-                        )
-                    })?)
-                    .map_err(|_| {
-                        StorageError::Serialization("invalid deferred payload length".into())
-                    })?,
-                    deferred_peel: lifecycle
-                        .as_deref()
-                        .map(deserialize::<DeferredPeelLifecycle>)
-                        .transpose()?,
-                }),
-                version => Err(StorageError::Serialization(format!(
-                    "unsupported message storage format {version}"
-                ))),
-            }
+            let (id, group_id, epoch, payload_len, lifecycle) = row.storage()?;
+            Ok(DeferredMessageMetadata {
+                id: MessageId::new(id),
+                group_id: GroupId::new(group_id),
+                epoch: EpochId(i64_to_u64(epoch)?),
+                payload_len: usize::try_from(payload_len.ok_or_else(|| {
+                    StorageError::Serialization("message row is missing its payload blob".into())
+                })?)
+                .map_err(|_| {
+                    StorageError::Serialization("invalid deferred payload length".into())
+                })?,
+                deferred_peel: lifecycle
+                    .as_deref()
+                    .map(deserialize::<DeferredPeelLifecycle>)
+                    .transpose()?,
+            })
         })
         .collect()
     }
@@ -846,45 +724,28 @@ fn message_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageColumns> 
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
     );
     #[cfg(test)]
     FULL_MESSAGE_READS.with(|stats| {
         let (rows, bytes) = stats.get();
-        stats.set((
-            rows + 1,
-            bytes + columns.5.as_ref().map_or(0, Vec::len) + columns.6.as_ref().map_or(0, Vec::len),
-        ));
+        stats.set((rows + 1, bytes + columns.4.len()));
     });
     Ok(columns)
 }
 
 fn decode_message_columns(columns: MessageColumns) -> StorageResult<MessageRecord> {
-    let (id, group_id, epoch, state, storage_format, record, payload, deferred_peel) = columns;
-    match storage_format {
-        1 => deserialize(record.as_deref().ok_or_else(|| {
-            StorageError::Serialization("legacy message row is missing its record blob".to_owned())
-        })?),
-        NORMALIZED_MESSAGE_STORAGE_FORMAT => Ok(MessageRecord {
-            id: MessageId::new(id),
-            group_id: GroupId::new(group_id),
-            epoch: EpochId(i64_to_u64(epoch)?),
-            state: message_state_from_i64(state)?,
-            payload: payload.ok_or_else(|| {
-                StorageError::Serialization(
-                    "normalized message row is missing its payload blob".to_owned(),
-                )
-            })?,
-            deferred_peel: deferred_peel
-                .as_deref()
-                .map(deserialize::<DeferredPeelLifecycle>)
-                .transpose()?,
-        }),
-        version => Err(StorageError::Serialization(format!(
-            "unsupported message storage format {version}"
-        ))),
-    }
+    let (id, group_id, epoch, state, payload, deferred_peel) = columns;
+    Ok(MessageRecord {
+        id: MessageId::new(id),
+        group_id: GroupId::new(group_id),
+        epoch: EpochId(i64_to_u64(epoch)?),
+        state: message_state_from_i64(state)?,
+        payload,
+        deferred_peel: deferred_peel
+            .as_deref()
+            .map(deserialize::<DeferredPeelLifecycle>)
+            .transpose()?,
+    })
 }
 
 fn list_messages_on_connection(
@@ -927,8 +788,6 @@ fn message_columns_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Resul
         row.get(offset + 3)?,
         row.get(offset + 4)?,
         row.get(offset + 5)?,
-        row.get(offset + 6)?,
-        row.get(offset + 7)?,
     ))
 }
 
@@ -950,14 +809,12 @@ pub(super) fn put_message_on_connection(
     match insert_order {
         None => conn.execute_cached(
             "INSERT INTO cgka_messages (
-                 id, group_id, epoch, state, storage_format, record, payload, deferred_peel
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)
+                 id, group_id, epoch, state, payload, deferred_peel
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
                 group_id = excluded.group_id,
                 epoch = excluded.epoch,
                 state = excluded.state,
-                storage_format = excluded.storage_format,
-                record = NULL,
                 payload = excluded.payload,
                 deferred_peel = excluded.deferred_peel",
             params![
@@ -965,23 +822,20 @@ pub(super) fn put_message_on_connection(
                 record.group_id.as_slice(),
                 epoch_to_i64(record.epoch)?,
                 message_state_to_i64(record.state),
-                NORMALIZED_MESSAGE_STORAGE_FORMAT,
                 &record.payload,
                 deferred_peel,
             ],
         ),
         Some(insert_order) => conn.execute_cached(
             "INSERT INTO cgka_messages (
-                 insert_order, id, group_id, epoch, state, storage_format,
-                 record, payload, deferred_peel
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
+                 insert_order, id, group_id, epoch, state, payload, deferred_peel
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 insert_order,
                 record.id.as_slice(),
                 record.group_id.as_slice(),
                 epoch_to_i64(record.epoch)?,
                 message_state_to_i64(record.state),
-                NORMALIZED_MESSAGE_STORAGE_FORMAT,
                 &record.payload,
                 deferred_peel,
             ],
@@ -1020,56 +874,25 @@ fn state_query_params(
     Ok(params)
 }
 
-/// Update normalized rows without reading or rewriting their payload. A legacy
-/// row is decoded once and promoted atomically so subsequent state flips use
-/// the scalar fast path.
+/// Update scalar state without reading or rewriting the payload.
 fn update_message_state_on_connection(
     conn: &rusqlite::Connection,
     id: &MessageId,
     new_state: MessageState,
 ) -> StorageResult<()> {
-    let storage_format: i64 = conn
-        .query_row_cached(
-            "SELECT storage_format FROM cgka_messages WHERE id = ?1",
-            params![id.as_slice()],
-            |row| row.get(0),
-        )
-        .optional()
-        .storage()?
-        .ok_or(StorageError::NotFound)?;
-    let changed = if storage_format == NORMALIZED_MESSAGE_STORAGE_FORMAT {
-        conn.execute_cached(
+    let changed = conn
+        .execute_cached(
             "UPDATE cgka_messages
-             SET state = ?1,
-                 deferred_peel = CASE WHEN ?1 = ?2 THEN deferred_peel ELSE NULL END
-             WHERE id = ?3",
+         SET state = ?1,
+             deferred_peel = CASE WHEN ?1 = ?2 THEN deferred_peel ELSE NULL END
+         WHERE id = ?3",
             params![
                 message_state_to_i64(new_state),
                 message_state_to_i64(MessageState::PeelDeferred),
-                id.as_slice(),
+                id.as_slice()
             ],
         )
-        .storage()?
-    } else if storage_format == 1 {
-        let columns = conn
-            .query_row_cached(
-                &format!("SELECT {MESSAGE_COLUMNS} FROM cgka_messages WHERE id = ?1"),
-                params![id.as_slice()],
-                message_columns,
-            )
-            .storage()?;
-        let mut record = decode_message_columns(columns)?;
-        record.state = new_state;
-        if new_state != MessageState::PeelDeferred {
-            record.deferred_peel = None;
-        }
-        put_message_on_connection(conn, None, &record)?;
-        1
-    } else {
-        return Err(StorageError::Serialization(format!(
-            "unsupported message storage format {storage_format}"
-        )));
-    };
+        .storage()?;
     if changed == 0 {
         return Err(StorageError::NotFound);
     }
@@ -1161,8 +984,8 @@ fn pending_authority_upgrade(existing: &[u8], incoming: &GroupEvent) -> StorageR
 #[cfg(test)]
 mod tests {
     use super::INGRESS_DEDUP_MARKER_CAPACITY;
+    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, mid, sample_group, sample_message};
-    use crate::{SqliteAccountStorage, serialize};
     use cgka_traits::engine::GroupEvent;
     use cgka_traits::message::{DeferredPeelLifecycle, MessageState};
     use cgka_traits::storage::{
@@ -1470,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_metadata_preserves_legacy_and_normalized_rows_after_reopen() {
+    fn deferred_metadata_preserves_current_rows_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.db");
         let key = crate::SqlCipherKey::new("synthetic metadata regression").unwrap();
@@ -1493,25 +1316,7 @@ mod tests {
                 live_context_attempts: index as u32,
                 last_live_context_fingerprint: Some([id; 32]),
             });
-            if index == 1 {
-                store
-                    .lock()
-                    .unwrap()
-                    .execute(
-                        "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                        rusqlite::params![
-                            message.id.as_slice(),
-                            message.group_id.as_slice(),
-                            message.epoch.0 as i64,
-                            super::message_state_to_i64(message.state),
-                            serialize(&message).unwrap()
-                        ],
-                    )
-                    .unwrap();
-            } else {
-                store.put_message(&message).unwrap();
-            }
+            store.put_message(&message).unwrap();
             expected.push(cgka_traits::message::DeferredMessageMetadata::from(message));
         }
         let mut unrelated = sample_message(mid(4), gid(2), 0);
@@ -1519,11 +1324,6 @@ mod tests {
         store.put_message(&unrelated).unwrap();
         store.close().unwrap();
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert_eq!(
-            store.list_deferred_message_metadata(&gid(1)).unwrap(),
-            expected
-        );
-        store.promote_legacy_message_rows(2).unwrap();
         assert_eq!(
             store.list_deferred_message_metadata(&gid(1)).unwrap(),
             expected
@@ -1674,32 +1474,24 @@ mod tests {
 
     #[cfg(feature = "storage-format-benchmarks")]
     #[test]
-    fn storage_format_bench_sizes_accepts_legacy_message_rows() {
+    fn storage_format_bench_sizes_measures_current_message_rows() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 0, 0);
         let message = sample_message(mid(1), group.id.clone(), 0);
-        let record = serialize(&message).unwrap();
         store.put_group(&group).unwrap();
+        store.put_message(&message).unwrap();
         store
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
-                 VALUES (?1, ?2, 0, 0, ?3)",
-                rusqlite::params![message.id.as_slice(), group.id.as_slice(), record],
-            )
+            .create_group_snapshot(&group.id, "current-size")
             .unwrap();
-        store
-            .create_group_snapshot(&group.id, "legacy-size")
-            .unwrap();
-
         let sizes = store
             .storage_format_bench_sizes(&group.id, &message.id)
-            .expect("legacy row size is defined");
+            .unwrap();
         assert_eq!(
             sizes.message_value_bytes,
-            u64::try_from(message.id.as_slice().len() + group.id.as_slice().len() + record.len())
-                .unwrap()
+            u64::try_from(
+                message.id.as_slice().len() + group.id.as_slice().len() + message.payload.len()
+            )
+            .unwrap()
         );
         assert!(sizes.largest_snapshot_bytes > 0);
     }
@@ -1711,148 +1503,32 @@ mod tests {
         let message = sample_message(mid(1), gid(1), 0);
         store.put_message(&message).unwrap();
 
-        let before: (i64, bool, Vec<u8>) = store
+        let before: Vec<u8> = store
             .lock()
             .unwrap()
             .query_row(
-                "SELECT storage_format, record IS NULL, payload
+                "SELECT payload
                  FROM cgka_messages WHERE id = ?1",
                 rusqlite::params![message.id.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(before, (2, true, message.payload.clone()));
-
-        store
-            .update_message_state(&message.id, MessageState::Processed)
-            .unwrap();
-        let after: (i64, bool, Vec<u8>) = store
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT storage_format, record IS NULL, payload
-                 FROM cgka_messages WHERE id = ?1",
-                rusqlite::params![message.id.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(after, before, "state update must not rewrite payload bytes");
-    }
-
-    #[test]
-    fn legacy_row_reads_and_promotes_on_state_update() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
-        let message = sample_message(mid(1), gid(1), 0);
-        store
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
-                 VALUES (?1, ?2, 0, 1, ?3)",
-                rusqlite::params![
-                    message.id.as_slice(),
-                    message.group_id.as_slice(),
-                    serialize(&message).unwrap(),
-                ],
-            )
-            .unwrap();
-        assert_eq!(store.get_message(&message.id).unwrap(), message);
-
-        store
-            .update_message_state(&message.id, MessageState::Processed)
-            .unwrap();
-        let promoted = store.get_message(&message.id).unwrap();
-        assert_eq!(promoted.state, MessageState::Processed);
-        assert_eq!(promoted.payload, message.payload);
-        let format: (i64, bool, bool) = store
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT storage_format, record IS NULL, payload IS NOT NULL
-                 FROM cgka_messages WHERE id = ?1",
-                rusqlite::params![message.id.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(format, (2, true, true));
-    }
-
-    #[test]
-    fn bounded_legacy_promotion_converges_in_atomic_batches() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
-        for index in 1..=3 {
-            let message = sample_message(mid(index), gid(1), 0);
-            store
-                .lock()
-                .unwrap()
-                .execute(
-                    "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
-                     VALUES (?1, ?2, 0, 1, ?3)",
-                    rusqlite::params![
-                        message.id.as_slice(),
-                        message.group_id.as_slice(),
-                        serialize(&message).unwrap(),
-                    ],
-                )
-                .unwrap();
-        }
-
-        assert_eq!(
-            store.promote_legacy_message_rows(2).unwrap(),
-            super::MessageFormatPromotionProgress {
-                promoted: 2,
-                has_more: true,
-            }
-        );
-        assert_eq!(
-            store.promote_legacy_message_rows(2).unwrap(),
-            super::MessageFormatPromotionProgress {
-                promoted: 1,
-                has_more: false,
-            }
-        );
-        assert_eq!(
-            store.promote_legacy_message_rows(2).unwrap(),
-            super::MessageFormatPromotionProgress {
-                promoted: 0,
-                has_more: false,
-            }
-        );
-    }
-
-    #[test]
-    fn malformed_legacy_promotion_rolls_back_the_whole_batch() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
-        let valid = sample_message(mid(1), gid(1), 0);
-        for (id, record) in [
-            (mid(1), serialize(&valid).unwrap()),
-            (mid(2), b"not-json".to_vec()),
-        ] {
-            store
-                .lock()
-                .unwrap()
-                .execute(
-                    "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
-                     VALUES (?1, ?2, 0, 1, ?3)",
-                    rusqlite::params![id.as_slice(), gid(1).as_slice(), record],
-                )
-                .unwrap();
-        }
-
-        assert!(store.promote_legacy_message_rows(2).is_err());
-        let legacy_count: i64 = store
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM cgka_messages WHERE storage_format = 1",
-                [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(legacy_count, 2);
+        assert_eq!(before, message.payload);
+
+        store
+            .update_message_state(&message.id, MessageState::Processed)
+            .unwrap();
+        let after: Vec<u8> = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT payload
+                 FROM cgka_messages WHERE id = ?1",
+                rusqlite::params![message.id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before, "state update must not rewrite payload bytes");
     }
 
     #[test]

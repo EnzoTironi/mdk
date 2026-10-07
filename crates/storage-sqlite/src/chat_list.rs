@@ -200,12 +200,6 @@ fn direct_row_is_reusable(row: &ChatListRow) -> bool {
         && row.leave_requested_at_ms.is_none()
 }
 
-fn indexable_group_id_hex(group_id_hex: &str) -> bool {
-    hex::decode(group_id_hex)
-        .ok()
-        .is_some_and(|bytes| !bytes.is_empty())
-}
-
 fn roster_is_direct_with_peer(members: &[String], local: &str, peer: &str) -> bool {
     let ids = members
         .iter()
@@ -501,38 +495,6 @@ impl SqliteAccountStorage {
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()
-    }
-
-    /// Direct groups that still have no peer-index rows.
-    ///
-    /// Used only by the once-per-open upgrade backfill. Steady-state lookup
-    /// does not call this. Malformed or empty group-id hex is omitted so a
-    /// corrupt row cannot keep the completion marker unset.
-    pub fn unindexed_direct_conversation_group_ids(&self) -> StorageResult<Vec<String>> {
-        let conn = self.lock()?;
-        let mut statement = conn
-            .prepare_cached(
-                "SELECT ag.group_id_hex
-                 FROM account_groups AS ag
-                 JOIN chat_list_rows AS row ON row.group_id_hex = ag.group_id_hex
-                 WHERE TRIM(row.group_name) = ''
-                   AND ag.member_count = 2
-                   AND NOT EXISTS (
-                        SELECT 1 FROM direct_conversation_members AS dcm
-                        WHERE dcm.group_id_hex = ag.group_id_hex
-                   )
-                 ORDER BY ag.group_id_hex",
-            )
-            .storage()?;
-        let group_ids = statement
-            .query_map([], |row| row.get(0))
-            .storage()?
-            .collect::<Result<Vec<String>, _>>()
-            .storage()?;
-        Ok(group_ids
-            .into_iter()
-            .filter(|group_id_hex| indexable_group_id_hex(group_id_hex))
-            .collect())
     }
 
     /// Pin or unpin one unarchived local chat and return the complete

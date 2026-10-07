@@ -62,9 +62,10 @@ The runtime owns these local SQLite stores:
 
 - **Per-account session database** (`accounts/<label>/session.sqlite`, SQLCipher): authoritative protocol and recovery
   state plus app projections: joined groups, app-component profile/image/admin/Nostr-routing projections, pending invite
-  confirmation state, seen relay events, and sent/received message projections. It has a numbered migration history.
-  The older `accounts/<label>/app.sqlite3` legacy projection database is imported once (tracked by the
-  `legacy-account-projection-v1` marker) and then superseded.
+  confirmation state, seen relay events, and sent/received message projections. A direct current-schema installer
+  commits the complete schema, seeds and the single `current_account_schema_v1` marker atomically. Reopen validates
+  the current schema and retains current rows. Historical account databases and projection imports are refused;
+  coordinated prelaunch resets require an explicitly registered disposable account/session resource.
 - **Per-account directory cache** (`accounts/<label>/app-cache.sqlite3`, SQLCipher): the Nostr user directory —
   local-account links, profile metadata, follow-list caches, bounded search-graph edges, discovered user relay lists,
   and KeyPackages. A root-level `app-cache.sqlite3` is a legacy location that is migrated and then removed.
@@ -78,8 +79,7 @@ holds durable installation settings that are not disposable. The per-account cac
 `app_cache_schema_migrations` ledger and refuses versions newer than the binary supports. Each migration commits its
 schema/data changes and ledger row atomically; version 1 validates and adopts existing unversioned tables and converts
 legacy JSON records without discarding directory or search data. Invalid shapes or migration names fail closed. The
-shared store still initializes tables without a numbered ledger; neither tier uses the session database's migration
-version.
+shared store has its independent `shared_schema_migrations` ledger; neither tier uses the session schema marker.
 
 ## Account bootstrap and KeyPackages
 

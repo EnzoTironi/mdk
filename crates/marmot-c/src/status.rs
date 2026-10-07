@@ -89,7 +89,6 @@ pub enum MarmotStatus {
     GroupSendQueueFull = 54,
     CreatedGroupProjectionUnavailable = 55,
     InvalidCachedIdentityPage = 56,
-    DirectConversationIndexNotReady = 57,
     GroupUnrecoverableRepairRequired = 58,
     AccountWorkerBusy = 59,
     AccountWorkerResponseTimedOut = 60,
@@ -262,9 +261,6 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         }
         MarmotKitError::InvalidCachedIdentityPage { .. } => MarmotStatus::InvalidCachedIdentityPage,
         MarmotKitError::ChatPresentationNotReady => MarmotStatus::ChatPresentationNotReady,
-        MarmotKitError::DirectConversationIndexNotReady => {
-            MarmotStatus::DirectConversationIndexNotReady
-        }
         MarmotKitError::GroupUnrecoverableRepairRequired { .. } => {
             MarmotStatus::GroupUnrecoverableRepairRequired
         }
@@ -357,7 +353,6 @@ mod tests {
             MarmotKitError::GroupHydrationPending {
                 group_id_hex: "aa".into(),
             },
-            MarmotKitError::DirectConversationIndexNotReady,
             MarmotKitError::ChatPresentationNotReady,
             MarmotKitError::InvalidChatPin {
                 details: "d".into(),

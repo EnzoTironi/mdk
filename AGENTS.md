@@ -19,7 +19,7 @@ Nested `AGENTS.md` files add rules for their subtree. Read the nearest one befor
 | App message Markdown display parsing | `crates/marmot-markdown/AGENTS.md` |
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
 | Private file/dir/socket creation helpers | `crates/fs-private/AGENTS.md` |
-| SQLite storage | `crates/storage-sqlite/AGENTS.md` (`src/migrations/`, `src/openmls_storage/`, `src/storage/`, `src/storage/snapshots/` have their own) |
+| SQLite storage | `crates/storage-sqlite/AGENTS.md` (`src/account_schema/`, `src/openmls_storage/`, `src/storage/`, `src/storage/snapshots/` have their own) |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
 | QUIC agent text stream previews | `crates/transport-quic-stream/AGENTS.md` |

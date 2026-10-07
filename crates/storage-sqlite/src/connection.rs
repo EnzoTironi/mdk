@@ -1,5 +1,5 @@
 use crate::openmls_storage::SqliteOpenMlsStorage;
-use crate::{SqliteResultExt, migrations};
+use crate::{SqliteResultExt, account_schema};
 use cgka_traits::storage::{
     KeyPackageBundleStorage, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
 };
@@ -14,6 +14,90 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
 use std::time::Duration;
 use zeroize::Zeroizing;
+
+/// Numeric, inline-only stages for the separately bound diagnostic source.
+#[cfg(feature = "diagnostic-account-open-witness")]
+#[derive(Clone, Copy)]
+#[repr(u64)]
+pub enum DiagnosticOpenPhase {
+    PrivateFiles = 12,
+    RusqliteOpen = 13,
+    CipherPragmas = 14,
+    KeyPragma = 15,
+    AuthenticatedSchema = 16,
+    OperationalPreWal = 17,
+    Wal = 18,
+    Migrations = 19,
+}
+
+/// Closed substeps of the current account schema installer.
+#[cfg(feature = "diagnostic-account-open-witness")]
+#[derive(Clone, Copy)]
+#[repr(u64)]
+pub enum DiagnosticMigrationStep {
+    Begin = 6,
+    Apply = 7,
+    LedgerInsert = 8,
+    Commit = 9,
+}
+
+#[cfg(feature = "diagnostic-account-open-witness")]
+#[derive(Clone, Copy)]
+pub enum DiagnosticOpenEvent {
+    Storage(DiagnosticOpenPhase),
+    Migration {
+        version: i64,
+        step: DiagnosticMigrationStep,
+    },
+}
+
+/// Borrowed for one synchronous call. It cannot be retained or sent to another
+/// thread. The diagnostic observer must not block, allocate a history, or panic.
+#[cfg(feature = "diagnostic-account-open-witness")]
+pub type DiagnosticOpenObserver<'a> = &'a dyn Fn(DiagnosticOpenEvent, u64);
+
+#[cfg(feature = "diagnostic-account-open-witness")]
+pub(crate) struct DiagnosticOpenBoundary<'a> {
+    observer: Option<DiagnosticOpenObserver<'a>>,
+    event: DiagnosticOpenEvent,
+    returned: bool,
+}
+
+#[cfg(feature = "diagnostic-account-open-witness")]
+impl<'a> DiagnosticOpenBoundary<'a> {
+    pub(crate) fn enter(
+        observer: Option<DiagnosticOpenObserver<'a>>,
+        event: DiagnosticOpenEvent,
+    ) -> Self {
+        let boundary = Self {
+            observer,
+            event,
+            returned: false,
+        };
+        if let Some(observer) = observer {
+            observer(event, 1);
+        }
+        boundary
+    }
+
+    pub(crate) fn returned(mut self) {
+        if let Some(observer) = self.observer {
+            observer(self.event, 2);
+        }
+        self.returned = true;
+    }
+}
+
+#[cfg(feature = "diagnostic-account-open-witness")]
+impl Drop for DiagnosticOpenBoundary<'_> {
+    fn drop(&mut self) {
+        if !self.returned
+            && let Some(observer) = self.observer
+        {
+            observer(self.event, if std::thread::panicking() { 4 } else { 3 });
+        }
+    }
+}
 
 /// Closed storage boundaries. Observers must only aggregate timings; they must
 /// not access storage or block on I/O, since a connection may still be held.
@@ -1025,9 +1109,60 @@ impl SqliteAccountStorage {
         key: &SqlCipherKey,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
-        let path = path.as_ref();
+        Self::open_encrypted_impl(
+            path.as_ref(),
+            key,
+            options,
+            #[cfg(feature = "diagnostic-account-open-witness")]
+            None,
+        )
+    }
+
+    /// Diagnostic source only. Uses the same algorithm/defaults as normal open.
+    #[cfg(feature = "diagnostic-account-open-witness")]
+    pub fn open_encrypted_with_diagnostic_observer(
+        path: impl AsRef<Path>,
+        key: &SqlCipherKey,
+        observer: Option<DiagnosticOpenObserver<'_>>,
+    ) -> StorageResult<Self> {
+        Self::open_encrypted_impl(
+            path.as_ref(),
+            key,
+            SqliteStorageOptions::default(),
+            observer,
+        )
+    }
+
+    fn open_encrypted_impl(
+        path: &Path,
+        key: &SqlCipherKey,
+        options: SqliteStorageOptions,
+        #[cfg(feature = "diagnostic-account-open-witness")] observer: Option<
+            DiagnosticOpenObserver<'_>,
+        >,
+    ) -> StorageResult<Self> {
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        let boundary = DiagnosticOpenBoundary::enter(
+            observer,
+            DiagnosticOpenEvent::Storage(DiagnosticOpenPhase::PrivateFiles),
+        );
         ensure_private_db_files(path)?;
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        boundary.returned();
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        let boundary = DiagnosticOpenBoundary::enter(
+            observer,
+            DiagnosticOpenEvent::Storage(DiagnosticOpenPhase::RusqliteOpen),
+        );
         let connection = rusqlite::Connection::open(path).storage()?;
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        boundary.returned();
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        if observer.is_some() {
+            return Self::from_unkeyed_encrypted_connection_observed(
+                connection, key, options, observer,
+            );
+        }
         Self::from_unkeyed_encrypted_connection_with_options(connection, key, options)
     }
 
@@ -1036,19 +1171,81 @@ impl SqliteAccountStorage {
         key: &SqlCipherKey,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
+        Self::from_unkeyed_encrypted_connection_observed(
+            connection,
+            key,
+            options,
+            #[cfg(feature = "diagnostic-account-open-witness")]
+            None,
+        )
+    }
+
+    fn from_unkeyed_encrypted_connection_observed(
+        connection: rusqlite::Connection,
+        key: &SqlCipherKey,
+        options: SqliteStorageOptions,
+        #[cfg(feature = "diagnostic-account-open-witness")] observer: Option<
+            DiagnosticOpenObserver<'_>,
+        >,
+    ) -> StorageResult<Self> {
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        let boundary = DiagnosticOpenBoundary::enter(
+            observer,
+            DiagnosticOpenEvent::Storage(DiagnosticOpenPhase::CipherPragmas),
+        );
         apply_cipher_pragmas(&connection, &options)?;
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        boundary.returned();
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        if observer.is_some() {
+            apply_sqlcipher_key_observed(&connection, key, observer)?;
+            return Self::from_connection_observed(connection, options, observer);
+        }
         apply_sqlcipher_key(&connection, key)?;
         Self::from_connection_with_options(connection, options)
     }
 
     pub(crate) fn from_connection_with_options(
-        mut connection: rusqlite::Connection,
+        connection: rusqlite::Connection,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
+        Self::from_connection_observed(
+            connection,
+            options,
+            #[cfg(feature = "diagnostic-account-open-witness")]
+            None,
+        )
+    }
+
+    fn from_connection_observed(
+        mut connection: rusqlite::Connection,
+        options: SqliteStorageOptions,
+        #[cfg(feature = "diagnostic-account-open-witness")] observer: Option<
+            DiagnosticOpenObserver<'_>,
+        >,
+    ) -> StorageResult<Self> {
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        if observer.is_some() {
+            apply_operational_pragmas_observed(&connection, &options, observer)?;
+        } else {
+            apply_operational_pragmas(&connection, &options)?;
+        }
+        #[cfg(not(feature = "diagnostic-account-open-witness"))]
         apply_operational_pragmas(&connection, &options)?;
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
         let migration_started = std::time::Instant::now();
-        let migrations_applied = migrations::run_all(&mut connection)?;
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        let boundary = DiagnosticOpenBoundary::enter(
+            observer,
+            DiagnosticOpenEvent::Storage(DiagnosticOpenPhase::Migrations),
+        );
+        let migrations_applied = account_schema::install(
+            &mut connection,
+            #[cfg(feature = "diagnostic-account-open-witness")]
+            observer,
+        )?;
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        boundary.returned();
         let migration_duration = migration_started.elapsed();
         let connection = SharedConnection::new(connection);
         let openmls = SqliteOpenMlsStorage::new(connection.clone());
@@ -1122,12 +1319,41 @@ pub(crate) fn ensure_private_db_files(path: &Path) -> StorageResult<()> {
 }
 
 fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) -> StorageResult<()> {
+    apply_sqlcipher_key_observed(
+        connection,
+        key,
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        None,
+    )
+}
+
+fn apply_sqlcipher_key_observed(
+    connection: &rusqlite::Connection,
+    key: &SqlCipherKey,
+    #[cfg(feature = "diagnostic-account-open-witness")] observer: Option<
+        DiagnosticOpenObserver<'_>,
+    >,
+) -> StorageResult<()> {
+    #[cfg(feature = "diagnostic-account-open-witness")]
+    let boundary = DiagnosticOpenBoundary::enter(
+        observer,
+        DiagnosticOpenEvent::Storage(DiagnosticOpenPhase::KeyPragma),
+    );
     connection
         .pragma_update(None, "key", key.as_secret_str())
         .storage()?;
+    #[cfg(feature = "diagnostic-account-open-witness")]
+    boundary.returned();
+    #[cfg(feature = "diagnostic-account-open-witness")]
+    let boundary = DiagnosticOpenBoundary::enter(
+        observer,
+        DiagnosticOpenEvent::Storage(DiagnosticOpenPhase::AuthenticatedSchema),
+    );
     let _: i64 = connection
         .query_row_cached("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
         .storage()?;
+    #[cfg(feature = "diagnostic-account-open-witness")]
+    boundary.returned();
     Ok(())
 }
 
@@ -1156,6 +1382,26 @@ fn apply_operational_pragmas(
     connection: &rusqlite::Connection,
     options: &SqliteStorageOptions,
 ) -> StorageResult<()> {
+    apply_operational_pragmas_observed(
+        connection,
+        options,
+        #[cfg(feature = "diagnostic-account-open-witness")]
+        None,
+    )
+}
+
+fn apply_operational_pragmas_observed(
+    connection: &rusqlite::Connection,
+    options: &SqliteStorageOptions,
+    #[cfg(feature = "diagnostic-account-open-witness")] observer: Option<
+        DiagnosticOpenObserver<'_>,
+    >,
+) -> StorageResult<()> {
+    #[cfg(feature = "diagnostic-account-open-witness")]
+    let boundary = DiagnosticOpenBoundary::enter(
+        observer,
+        DiagnosticOpenEvent::Storage(DiagnosticOpenPhase::OperationalPreWal),
+    );
     connection
         .busy_timeout(Duration::from_millis(options.busy_timeout_ms))
         .storage()?;
@@ -1176,10 +1422,19 @@ fn apply_operational_pragmas(
     connection
         .pragma_update(None, "synchronous", options.synchronous.as_pragma())
         .storage()?;
+    #[cfg(feature = "diagnostic-account-open-witness")]
+    boundary.returned();
+    #[cfg(feature = "diagnostic-account-open-witness")]
+    let boundary = DiagnosticOpenBoundary::enter(
+        observer,
+        DiagnosticOpenEvent::Storage(DiagnosticOpenPhase::Wal),
+    );
     let journal_mode = format!("PRAGMA journal_mode = {}", options.journal_mode.as_pragma());
     let _: String = connection
         .query_row(&journal_mode, [], |row| row.get(0))
         .storage()?;
+    #[cfg(feature = "diagnostic-account-open-witness")]
+    boundary.returned();
     Ok(())
 }
 
@@ -2582,7 +2837,7 @@ mod tests {
         let path = dir.path().join("migration-summary.sqlite");
         let key = SqlCipherKey::new("42".repeat(32)).unwrap();
         let first = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert!(first.migration_summary().0 > 0);
+        assert_eq!(first.migration_summary().0, 1);
         first.close().unwrap();
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(reopened.migration_summary().0, 0);

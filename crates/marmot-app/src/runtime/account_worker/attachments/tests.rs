@@ -340,7 +340,7 @@ async fn download_without_engine_and_retain(
             0
         );
     }
-    let _fault_connection = outgoing_faults.then(|| {
+    let fault_connection = outgoing_faults.then(|| {
         let connection = retention_fault_connection(&app);
         let tag = reference.imeta_tag();
         storage.record_app_event(&StoredAppEvent {
@@ -461,6 +461,15 @@ async fn download_without_engine_and_retain(
         storage.attachment_worker_demands(32).unwrap().is_empty(),
         "invalid sibling was acknowledged"
     );
+    // Keep the injected maintenance faults through acquisition and its receipts,
+    // then restore the closed baseline before the cold account admission.
+    if let Some(connection) = fault_connection {
+        connection
+            .execute_batch(
+                "DROP TRIGGER fail_outgoing_prune; DROP TRIGGER fail_outgoing_promotion;",
+            )
+            .unwrap();
+    }
     drop(client);
     drop(storage);
     drop(app);

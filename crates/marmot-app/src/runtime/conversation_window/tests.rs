@@ -1283,7 +1283,7 @@ async fn cold_capture_does_not_force_group_hydration() {
         .await
         .unwrap();
     assert_eq!(
-        client.runtime.session().unhydrated_group_ids(),
+        client.runtime.session().unhydrated_group_ids().unwrap(),
         vec![f.group.clone()]
     );
     let result = capture_conversation(
@@ -1294,7 +1294,7 @@ async fn cold_capture_does_not_force_group_hydration() {
     );
     assert!(matches!(result, Err(ConversationWindowError::NotReady)));
     assert_eq!(
-        client.runtime.session().unhydrated_group_ids(),
+        client.runtime.session().unhydrated_group_ids().unwrap(),
         vec![f.group.clone()]
     );
     drop(client);

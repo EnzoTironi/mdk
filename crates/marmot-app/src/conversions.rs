@@ -339,26 +339,6 @@ pub(crate) fn stored_app_event_from_projection(
     }
 }
 
-pub(crate) fn stored_app_event_from_message_record(record: &AppMessageRecord) -> StoredAppEvent {
-    StoredAppEvent {
-        group_id_hex: record.group_id_hex.clone(),
-        message_id_hex: record.message_id_hex.clone(),
-        source_message_id_hex: None,
-        direction: record.direction.clone(),
-        sender: record.sender.clone(),
-        plaintext: record.plaintext.clone(),
-        kind: record.kind,
-        tags: record.tags.clone(),
-        source_epoch: record.source_epoch,
-        recorded_at: record.recorded_at,
-        received_at: record.received_at,
-        origin_commit_id: None,
-        // Legacy-import records predate moderation deletes, so none carries a
-        // grant.
-        moderation_grant: false,
-    }
-}
-
 pub(crate) fn notification_settings_from_account(
     settings: AccountNotificationSettings,
 ) -> NotificationSettings {

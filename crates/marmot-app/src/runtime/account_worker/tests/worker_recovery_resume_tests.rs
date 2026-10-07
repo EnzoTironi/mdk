@@ -204,3 +204,150 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
     drop(client);
     runtime.shutdown_and_close().await.unwrap();
 }
+
+#[tokio::test]
+async fn closed_epoch_pin_recovers_before_the_next_queued_read_and_send() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup = app.client("alice").await.unwrap();
+    let group_id = setup.create_group("worker epoch pin", &[]).await.unwrap();
+    let current_epoch = setup.group_mls_state(&group_id).unwrap().epoch;
+    drop(setup);
+
+    let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let commands = runtime.accounts().worker_commands("alice").await.unwrap();
+    let subscriptions_before = relay.subscription_count();
+    let group_message_attempts_before = relay.group_message_attempt_count();
+    let reference = MediaAttachmentReference {
+        locators: vec![crate::MediaLocator {
+            kind: "blossom-v1".into(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x44_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x44_u8; 32]),
+        plaintext_sha256: hex::encode([0x12_u8; 32]),
+        nonce_hex: hex::encode([0x23_u8; 12]),
+        file_name: "epoch.png".into(),
+        media_type: "image/png".into(),
+        version: "encrypted-media-v2".into(),
+        source_epoch: current_epoch + 1,
+        dim: None,
+        thumbhash: None,
+    };
+    let (respond, refused) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::SendAppEvent {
+            enqueued_at: Instant::now(),
+            group_id: group_id.clone(),
+            intent: AppMessageIntent::Media {
+                message_tags: vec![],
+                attachments: vec![reference],
+                caption: Some("refused epoch reference".into()),
+            },
+            respond,
+        })
+        .unwrap();
+    let (respond, read) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::GroupMlsState {
+            group_id: group_id.clone(),
+            respond,
+        })
+        .unwrap();
+    let (respond, sent) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::SendMessage {
+            enqueued_at: Instant::now(),
+            queued: None,
+            group_id: group_id.clone(),
+            payload: b"valid after epoch refusal".to_vec(),
+            respond,
+        })
+        .unwrap();
+
+    let error = timeout(Duration::from_secs(10), refused)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, AppError::MediaReferenceStaleEpoch {
+        source_epoch, current_epoch: observed,
+    } if source_epoch == current_epoch + 1 && observed == current_epoch));
+    let state = timeout(Duration::from_secs(10), read)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.epoch, current_epoch);
+    let summary = timeout(Duration::from_secs(10), sent)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.published, 1);
+    assert_eq!(
+        relay.group_message_attempt_count(),
+        group_message_attempts_before + 1
+    );
+    assert!(
+        relay.subscription_count() > subscriptions_before,
+        "the closed owner must retire its SDK context and reactivate the replacement"
+    );
+    let messages = app.messages("alice").unwrap();
+    let valid = messages
+        .iter()
+        .filter(|message| message.plaintext == "valid after epoch refusal" && !message.invalidated)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(valid.len(), 1);
+    let refused_rows = messages
+        .iter()
+        .filter(|message| message.plaintext == "refused epoch reference")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(refused_rows.len(), 1);
+    assert!(refused_rows[0].invalidated);
+
+    runtime
+        .accounts()
+        .workers
+        .lock()
+        .await
+        .remove(&account.account_id_hex)
+        .unwrap()
+        .shutdown()
+        .await;
+    let reopened = app.client("alice").await.unwrap();
+    assert!(!reopened.runtime.session().is_closed());
+    assert_eq!(
+        reopened.group_mls_state(&group_id).unwrap().epoch,
+        current_epoch
+    );
+    let retained = app
+        .messages("alice")
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.plaintext == "valid after epoch refusal" && !message.invalidated)
+        .collect::<Vec<_>>();
+    assert_eq!(retained, valid);
+    let retained_refusal = app
+        .messages("alice")
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.plaintext == "refused epoch reference")
+        .collect::<Vec<_>>();
+    assert_eq!(retained_refusal, refused_rows);
+    assert_eq!(
+        relay.group_message_attempt_count(),
+        group_message_attempts_before + 1
+    );
+    drop(reopened);
+    runtime.shutdown().await;
+}

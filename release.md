@@ -251,54 +251,24 @@ The GitHub workflow repeats the release builds on clean runners. Local builds ca
 
 ## Storage-Format Changes
 
-For a release that adds a `storage-sqlite` migration or changes an opaque
-storage artifact:
+For a release that changes the current account schema or an opaque storage artifact:
 
-1. Link the format definition and compatibility evidence from
+1. Link the format definition and qualification evidence from
    `docs/marmot-architecture/storage-format-v2.md` in the release notes.
-2. Verify an older fixture opens and upgrades once, a current fixture reopens
-   without rewriting, and the prior binary refuses the new migration before
-   reading or writing account tables. The current migration runner's downgrade
-   guard must remain a typed `StorageError::UnsupportedSchemaVersion`; a pinned
-   previously shipped binary may retain its older error wrapper, but it must
-   still refuse before application-table access.
-3. Run crash/failure-injection tests at every multi-row transformation or
-   artifact replacement boundary. Schema migrations are transactional;
-   background promotion work must additionally be row-idempotent and bounded.
-4. State explicitly that downgrade across the migration is unsupported. The
-   remedies are to re-upgrade or restore a pre-upgrade account database/export;
-   never advise manually removing migration rows.
-5. Recommend a pre-upgrade backup/export for the migration-47 cohort. Although
-   it preserves legacy row bytes and defers per-row format promotion, its
-   transactional table rebuild physically copies the complete message history.
-   Before promoting the release cohort, capture the stable `MDK_BENCH` output
-   from a representative large-account run:
+2. Update the direct account baseline and all current callers as one coordinated unit.
+   Verify fresh install count one, current reopen count zero, complete schema/typed seed equality,
+   current-domain writes retained on reopen, and old/future/foreign/malformed refusal.
+3. Run failure and owned process-interruption tests at baseline commit and current multi-row
+   artifact replacement boundaries. Current artifact promotion remains bounded and transactional.
+4. Bind any coordinated prelaunch reset to the actual registered disposable account-device
+   resources through the runtime owner. Do not invent paths, synthesize historical ledger rows
+   or delete migration markers to force admission. Independent shared/directory contracts stay separate.
+5. Keep automatic account open free of VACUUM. Page reclamation belongs to explicit keyed-connection
+   maintenance with measured duration and space requirements.
+6. Ship native libraries, generated bindings and headers as one synchronized cohort. Preserve existing
+   current blob-format contracts and numeric C status assignments. Version changes remain a separate
+   manual release operation.
 
-   ```sh
-   MDK_STORAGE_OPS_ROWS=2048 just bench-storage-upgrade
-   ```
-
-   The 2026-09-01 baseline used 2,048 rows and peaked at 4.01 times the starting
-   database footprint, needing 3.01 times that footprint as additional
-   temporary space. Migration took 4,676 ms, gradual promotion took 4,584 ms,
-   and the slowest 32-row promotion batch took 92 ms. Release notes should
-   require at least 3.25 times the account database size free before upgrade
-   and explain that the estimate must be refreshed if the format or journal
-   policy changes.
-6. Do not run `VACUUM` during automatic account open. If page reclamation is
-   useful, expose it as explicit keyed-connection maintenance and report its
-   expected duration and temporary free-space requirement.
-7. Ship the change as one synchronized cohort via `just release-all <version>`
-   so MDK, wn-agent, and MarmotKit agree on the database boundary. Call out
-   migration 47, unsupported downgrade, the backup remedy, and gradual
-   post-readiness promotion in every applicable release note. Workspace and
-   package version changes remain a separate manual release operation.
-
-Storage migrations do not require a workspace version bump during feature
-development. The eventual release version remains a manual release operation.
-
-Before pushing, run `just fast-ci`. Let GitHub CI run the full `just ci` test
-matrix.
 
 ## Whole-Workspace Release
 

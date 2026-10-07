@@ -191,8 +191,8 @@ revision/checkpoint through that scheduler as recovery for a missed wakeup; even
 
 ## Upgrade and rollout
 
-Use new numbered account/shared migrations after the current highest migrations; do not reserve a number now or
-change workspace versions as feature work. Schema migrations add representations and markers transactionally; seed
+Account changes update the direct current baseline and current callers atomically. Shared-store changes retain their
+independent numbered migration contract. Do not change workspace versions as feature work. Seed
 existing directory rows with revision zero. First account preparation hydrates its dependencies directly, so it does
 not need an all-directory rewrite to manufacture historical revisions.
 

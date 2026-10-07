@@ -29,8 +29,8 @@ group snapshots and rollback must be atomic across Marmot records and group-scop
 - `shared.rs` — `SqliteSharedStorage`, a separate, non-account-scoped database for cross-identity state: the
   public-directory user cache and presentation, relay-telemetry, usage-diagnostics and audit-log settings, and the
   telemetry install id.
-- `migrations.rs` + `migrations/` — account/session migration runner and numbered bodies; `shared/migrations.rs` —
-  the independent shared-store runner.
+- `account_schema.rs` + `account_schema/` — direct current account/session schema, seeds and behavioral tests;
+  `shared/migrations.rs` — the independent shared-store runner.
 
 The complete module map is in [`AGENTS.md`](AGENTS.md).
 
@@ -67,12 +67,14 @@ ON, `trusted_schema=OFF`, `temp_store=MEMORY`, and terminal close. See the
 
 ## Migrations
 
-Account/session schema changes are Rust migrations: the ordered registry lives in `src/migrations.rs` and bodies in
-numbered files like `src/migrations/0001_initial_schema.rs`. Each has a monotonically increasing version, a matching
-padded name, and an `apply` function run inside a SQLite transaction, which can execute DDL, rewrite rows, or perform
-larger data-shape changes. Applied migrations are recorded in `cgka_schema_migrations`; opening an encrypted database
-applies missing migrations after SQLCipher keying and before storage handles are exposed. Message rows follow
-[storage format v2](../../docs/marmot-architecture/storage-format-v2.md).
+Account/session storage installs the direct current schema from `src/account_schema/current.sql` inside one
+immediate write transaction. The sole marker is `1 / current_account_schema_v1` in `cgka_schema_migrations`.
+A truly empty database installs once; an exact current marker and schema reopen without rewriting rows. Old,
+future, malformed, foreign and partial schemas are refused. Historical account/session schemas require a
+coordinated external reset of an explicitly bound disposable account-device bundle; the installer does not
+upgrade, backfill, repair or reset them. Storage handles are exposed only after commit. Message rows use one
+normalized payload/lifecycle representation; independent payload, wire and snapshot encodings retain their
+[artifact-local contracts](../../docs/marmot-architecture/storage-format-v2.md).
 
 The three app database categories have independent histories, and no runner reads another store's ledger:
 
@@ -99,8 +101,8 @@ No full-data audit mode is reintroduced. SQLite errors keep extended result code
 classification without SQLite's database-controlled message. Fixture provenance and assurance limits:
 [`src/shared/fixtures/README.md`](src/shared/fixtures/README.md).
 
-Account-database compatibility fixtures are described in [`fixtures/README.md`](fixtures/README.md). Old binaries
-refuse an upgraded schema; downgrading a binary requires a pre-upgrade backup.
+Current native schema/seed parity and baseline rollback/refusal tests are described in
+[`fixtures/README.md`](fixtures/README.md). Numbered account-upgrade fixtures are retired.
 
 ## Recovery semantics
 
@@ -123,9 +125,9 @@ the `mls_write_generation` contract for cached `MlsGroup` objects is unchanged.
 
 **Deferred recovery preparation.** `MessageStorage::list_deferred_message_metadata` preserves insertion order and exact
 encoded payload lengths while omitting payload blobs. The engine uses it for sweep preparation and readiness, then
-fetches full records only for selected attempts, retirement, or bounded lifecycle normalization. Legacy format-1 rows
-still need their record blob until bounded promotion converts them. The default trait implementation remains
-compatible with other backends.
+fetches full records only for selected attempts, retirement, or bounded lifecycle normalization. Current message rows
+use the sole normalized payload/lifecycle authority; historical row decoding and promotion are retired. The default
+trait implementation remains usable by other backends.
 
 ## Conversation reads
 
@@ -137,7 +139,7 @@ inputs, draft descriptors, and persisted controls in one deferred read. `Storage
 public storage calls under one deferred transaction, enforcing and restoring SQLite query-only mode even when nested.
 See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
 
-Selected composer reads and revision-checked mutations share the encrypted draft tables; migration 0073 tracks legacy
+Selected composer reads and revision-checked mutations share the encrypted draft tables; current triggers track legacy
 writes too, and queued/fanout acceptance clears only its submitted revision atomically. See the
 [draft contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).
 
@@ -189,17 +191,14 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   rows need owner-managed reclamation once no ticket or grant can reference them. An unbounded `since = None` includes
   older retained input, so its retirement must invalidate proof. The owner must use finite automatic goals, preserve
   uncovered older-history debt, and never silently clip an explicit full-history request to the retention floor.
-- **Migrations.** 0092 replaced the overflow and epoch-demand tables while keeping their Rust storage methods as
-  adapters; 0093 added the route-policy snapshot, a unique explicit-history row, and a receipt-journal invalidation
-  flag, preserving populated obligations, loss evidence, retry state, receipts, maintenance, inventory, and cursors.
-  Unexpected duplicate explicit rows make migration fail atomically; no demand is silently discarded. Later
-  migrations add stall observations, recovery comparison, the loss `created_at` bound, and history notices.
+- **Current schema.** Recovery obligations, loss evidence, retry state, receipts, maintenance, inventory and cursors
+  share the direct baseline. Current domain transactions preserve the same uniqueness and authority constraints;
+  the installer never transforms old applied databases.
 
 ## Tests and benchmarks
 
 ```sh
 cargo test -p storage-sqlite
-just bench-storage-upgrade   # ignored file-backed format v1 -> v2 operational benchmark
 ```
 
 **Deferred recovery preparation benchmark** (opt-in, paired, encrypted temporary files):

@@ -74,13 +74,13 @@ fn generated_journeys_are_deterministic_legal_canonical_ir() {
 
 #[tokio::test]
 async fn report_runner_executes_and_preserves_both_journey_profiles() {
-    let target = std::fs::canonicalize(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"),
-    )
-    .expect("workspace target exists while tests run");
+    let executable = std::env::current_exe().expect("locate journey test executable");
+    let target = executable
+        .parent()
+        .expect("journey test executable directory");
     let output = tempfile::Builder::new()
         .prefix("stateful-journey-")
-        .tempdir_in(&target)
+        .tempdir_in(target)
         .expect("private report output under target");
     let summary = run_report(&ReportArgs {
         input: ReportInput::GeneratedFamily {
@@ -140,7 +140,7 @@ async fn report_runner_executes_and_preserves_both_journey_profiles() {
 
     let replay_output = tempfile::Builder::new()
         .prefix("stateful-journey-replay-")
-        .tempdir_in(&target)
+        .tempdir_in(target)
         .expect("private replay output under target");
     let replay = run_report(&ReportArgs {
         input: ReportInput::GeneratedInputs {

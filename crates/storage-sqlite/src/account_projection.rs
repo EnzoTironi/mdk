@@ -1313,62 +1313,6 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// Write index rows only while the group is still unindexed.
-    ///
-    /// Used by the once-per-open upgrade backfill so a stale roster cannot
-    /// overwrite a newer projection save that already populated the index.
-    /// Returns `true` when this call inserted rows.
-    pub fn fill_unindexed_direct_conversation_members(
-        &self,
-        group_id_hex: &str,
-        member_ids_hex: &[String],
-    ) -> StorageResult<bool> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let already_indexed = conn
-                .query_row_cached(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM direct_conversation_members WHERE group_id_hex = ?1
-                     )",
-                    params![group_id_hex],
-                    |row| row.get::<_, bool>(0),
-                )
-                .storage()?;
-            if already_indexed {
-                return Ok(false);
-            }
-            replace_direct_conversation_members_tx(
-                &conn,
-                group_id_hex,
-                Some(member_ids_hex),
-                member_ids_hex.len() == 2,
-            )?;
-            Ok(true)
-        })
-    }
-
-    /// Empty the peer index and clear its completion marker.
-    ///
-    /// Used by upgrade-race tests to recreate the first open after migration
-    /// 50: Direct groups exist, but `direct_conversation_members` is empty and
-    /// the once-only backfill has not been recorded.
-    pub fn reset_direct_conversation_members_backfill(
-        &self,
-        marker_name: &str,
-    ) -> StorageResult<()> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            conn.execute_cached("DELETE FROM direct_conversation_members", [])
-                .storage()?;
-            conn.execute_cached(
-                "DELETE FROM account_import_markers WHERE name = ?1",
-                params![marker_name],
-            )
-            .storage()?;
-            Ok(())
-        })
-    }
-
     /// Transactionally removes all app-local data for one group without touching
     /// the stored MLS/OpenMLS group state. This is the storage primitive for the
     /// local delete/wipe UX: it drops the chat-list/account projection, plaintext
@@ -1993,32 +1937,6 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// `group_id_hex` of every `account_groups` row whose `self_membership` is
-    /// `'member'`. Used only while the account-wide migration marker is absent.
-    ///
-    /// The column cannot distinguish its legacy preserving default from an
-    /// explicit `Member` write. The account-open caller therefore reads the
-    /// whole candidate set before writing any classification and records the
-    /// marker only after every candidate roster was readable; steady-state
-    /// membership events run after startup hydration and own later changes.
-    pub fn account_group_ids_defaulting_to_member(&self) -> StorageResult<Vec<String>> {
-        let conn = self.lock()?;
-        let mut statement = conn
-            .prepare_cached(
-                "SELECT group_id_hex
-                 FROM account_groups
-                 WHERE self_membership = 'member'
-                 ORDER BY group_id_hex",
-            )
-            .storage()?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?;
-        Ok(ids)
-    }
-
     /// Authoritative `account_groups.self_membership` for one group row.
     pub fn group_self_membership(
         &self,
@@ -2284,33 +2202,6 @@ impl SqliteAccountStorage {
             );
         }
         Ok(outcome)
-    }
-
-    pub fn account_import_marker(&self, name: &str) -> StorageResult<bool> {
-        let exists = self
-            .lock()?
-            .query_row_cached(
-                "SELECT 1 FROM account_import_markers WHERE name = ?1",
-                params![name],
-                |_| Ok(()),
-            )
-            .optional()
-            .storage()?
-            .is_some();
-        Ok(exists)
-    }
-
-    pub fn mark_account_import_complete(&self, name: &str) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "INSERT INTO account_import_markers (name, completed_at_unix_seconds)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(name) DO UPDATE SET
-                    completed_at_unix_seconds = excluded.completed_at_unix_seconds",
-                params![name, unix_now_seconds_i64()],
-            )
-            .storage()?;
-        Ok(())
     }
 
     pub fn notification_settings(
@@ -3400,11 +3291,7 @@ pub fn clamp_to_max_future_skew(timestamp: u64, now: u64, max_future_skew_secs: 
 /// - `(None, None)` — nothing to persist; stays `None`.
 /// - `(None, Some(snapshot))` — a fresh store adopts the snapshot cursor,
 ///   clamped to `now + max_future_skew_secs`. The clamp is load-bearing here:
-///   the legacy-import migration (marmot-app's
-///   `migrate_legacy_account_projection_if_needed`) writes a legacy-loaded
-///   state into a brand-new store through this arm, and a pre-clamp-era legacy
-///   projection can carry a cursor poisoned above the ceiling (mdk#182).
-///   Adopting it raw would persist that poison.
+///   a current snapshot can carry a future cursor. Adopting it raw would persist that poison.
 /// - `(Some(stored), None)` — a save that never learned a cursor is
 ///   cursor-neutral: the stored value passes through unchanged, never clamped
 ///   or otherwise moved. Healing a poisoned stored value is the job of a save

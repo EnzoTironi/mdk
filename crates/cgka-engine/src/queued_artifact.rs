@@ -173,6 +173,7 @@ impl<S: StorageProvider> Engine<S> {
             if &stored.group_id != group_id
                 || &stored.id != message_id
                 || projection.kind != expected_kind
+                || projection.source_epoch != Some(stored.epoch.0)
                 || &exact.id != message_id
             {
                 return Err(EngineError::QueuedIntentRecoveryFailed);
@@ -243,7 +244,9 @@ mod tests {
     use super::*;
     use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
     use cgka_traits::engine::{CgkaEngine, CreateGroupRequest};
-    use cgka_traits::storage::{OutboundFanoutStorage, OutboundIntentStorage, StorageError};
+    use cgka_traits::storage::{
+        MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, StorageError,
+    };
     use cgka_traits::transport::TransportEnvelope;
     use cgka_traits::{
         OutboundApplicationMessage, OutboundFanout, TransportEndpoint, TransportEndpointFailure,
@@ -920,6 +923,47 @@ mod tests {
         assert_eq!(
             reopened.queued_intent_by_pending.get(&pending),
             Some(&(group, row.id))
+        );
+    }
+    #[tokio::test]
+    async fn pending_binding_refuses_a_mirror_epoch_that_disagrees_with_wire() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let mut original = engine(&storage);
+        let group = group(&mut original).await;
+        let row = original
+            .prepare_queued_outbound_intent(
+                group.clone(),
+                SendIntent::SelfUpdate {
+                    group_id: group.clone(),
+                },
+                0,
+            )
+            .unwrap();
+        storage.put_queued_outbound_intent(&row).unwrap();
+        let prepared = prepare(&storage, &mut original, &group);
+        let [SendResult::GroupEvolution { msg, pending, .. }] = prepared.as_slice() else {
+            panic!("one pending commit");
+        };
+        let before = storage.list_queued_outbound_intents(&group).unwrap();
+        let exact_fanout = storage.outbound_fanout(&msg.id).unwrap().unwrap();
+        let mut stored = storage.get_message(&msg.id).unwrap();
+        stored.epoch = cgka_traits::types::EpochId(stored.epoch.0 + 1);
+        storage.put_message(&stored).unwrap();
+        assert!(matches!(
+            original.checked_queued_artifact_bindings(&group),
+            Err(EngineError::QueuedIntentRecoveryFailed)
+        ));
+        assert_eq!(
+            original.pending_origin_message_id(*pending).unwrap(),
+            msg.id
+        );
+        assert_eq!(
+            storage.list_queued_outbound_intents(&group).unwrap(),
+            before
+        );
+        assert_eq!(
+            storage.outbound_fanout(&msg.id).unwrap().unwrap(),
+            exact_fanout
         );
     }
 }

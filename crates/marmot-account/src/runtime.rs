@@ -391,6 +391,16 @@ impl MaintenanceActivity {
             .saturating_add(previous.failed_transitions);
     }
 }
+macro_rules! prepare_local {
+    ($owner:expr, $session:ident => $future:expr) => {
+        $owner.prepare_local(|$session| {
+            $future
+                .now_or_never()
+                .ok_or(cgka_traits::EngineError::LocalPreparationPending)?
+        })
+    };
+}
+
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -420,6 +430,22 @@ where
     R: TransportRoutingPolicy,
     K: KeyPackagePublisher,
 {
+    /// Local preparation must finish in one poll on the connection owner
+    /// thread. A suspended signer/peeler is not supported by this boundary.
+    /// Rollback consumes the session's Engine; reopening is mandatory.
+    fn prepare_local<T: LocalSessionEffects>(
+        &mut self,
+        prepare: impl FnOnce(&mut AccountDeviceSession) -> cgka_session::SessionResult<T>,
+    ) -> AccountResult<T> {
+        let routing = &self.routing;
+        let created_at_ms = self.wall_clock.now().0.saturating_mul(1_000);
+        self.session.with_local_preparation(|session| {
+            let prepared = prepare(session)?;
+            stage_local_effects(session, routing, prepared.local_effects(), created_at_ms)?;
+            Ok(prepared)
+        })
+    }
+
     pub fn new(session: AccountDeviceSession, adapter: A, routing: R, key_packages: K) -> Self {
         Self {
             session,
@@ -486,8 +512,11 @@ where
         Ok(self.session.group_record(group_id)?)
     }
 
-    pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
-        self.session.epoch_state(group_id)
+    pub fn epoch_state(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<cgka_traits::EpochState>> {
+        Ok(self.session.epoch_state(group_id)?)
     }
 
     pub fn disband_request(
@@ -520,13 +549,15 @@ where
     /// Stored groups that failed session-open hydration and were skipped
     /// (mdk#151 / #417), paired with their coarse quarantine reason.
     /// Backs the application's per-group recovery surface (mdk#426).
-    pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
-        self.session.quarantined_groups()
+    pub fn quarantined_groups(
+        &self,
+    ) -> AccountResult<Vec<(GroupId, GroupHydrationQuarantineReason)>> {
+        Ok(self.session.quarantined_groups()?)
     }
 
     /// Number of currently quarantined groups without cloning their identities.
-    pub fn quarantined_group_count(&self) -> usize {
-        self.session.quarantined_group_count()
+    pub fn quarantined_group_count(&self) -> AccountResult<usize> {
+        Ok(self.session.quarantined_group_count()?)
     }
 
     /// Re-attempt hydration of a single quarantined group. `Ok(true)` if it
@@ -1520,7 +1551,7 @@ where
             tracing::warn!(target: TRACE_TARGET, method = "run_due_maintenance",
                 error_kind = "source_authority_retry", "source authority remains retryable");
         }
-        let recovered = self.session.drain();
+        let recovered = self.prepare_local(|session| session.drain())?;
         if !recovered.is_empty() {
             let recovered = self.publish_session_effects(recovered).await?;
             output.absorb_account_effects(recovered);
@@ -1909,7 +1940,7 @@ where
                 .has_pending_convergence_inputs(&obligation.group_id)?
                 || self
                     .session
-                    .quarantined_groups()
+                    .quarantined_groups()?
                     .iter()
                     .any(|(group_id, _)| group_id == &obligation.group_id)
             {
@@ -2138,7 +2169,8 @@ where
         &mut self,
         request: CreateGroupRequest,
     ) -> AccountResult<(GroupId, AccountDeviceEffects)> {
-        let CreateGroupEffects { group_id, effects } = self.session.create_group(request).await?;
+        let CreateGroupEffects { group_id, effects } =
+            prepare_local!(self, session => session.create_group(request))?;
         let effects = self.publish_session_effects(effects).await?;
         Ok((group_id, effects))
     }
@@ -2189,14 +2221,12 @@ where
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
-        Ok(self
-            .session
-            .create_group_with_optional_app_components_and_audit_context(
-                request,
-                optional_app_components,
-                context,
-            )
-            .await?)
+        Ok(prepare_local!(self, session => session
+        .create_group_with_optional_app_components_and_audit_context(
+            request,
+            optional_app_components,
+            context,
+        ))?)
     }
 
     /// Publish effects returned by
@@ -2216,7 +2246,7 @@ where
             _ => None,
         };
         let accept_started = Instant::now();
-        let effects = self.session.send(intent).await?;
+        let effects = prepare_local!(self, session => session.send(intent))?;
         let local_accept_duration = accept_started.elapsed();
         let publish_started = Instant::now();
         let mut output = self.publish_session_effects(effects).await?;
@@ -2242,10 +2272,8 @@ where
             _ => None,
         };
         let accept_started = Instant::now();
-        let effects = self
-            .session
-            .send_with_audit_context(intent, context.clone())
-            .await?;
+        let effects = prepare_local!(self, session => session
+            .send_with_audit_context(intent, context.clone()))?;
         let local_accept_duration = accept_started.elapsed();
         let publish_started = Instant::now();
         let mut output = self
@@ -2282,10 +2310,8 @@ where
             )
             .into());
         }
-        let session_effects = self
-            .session
-            .send_with_audit_context(intent, context)
-            .await?;
+        let session_effects = prepare_local!(self, session => session
+            .send_with_audit_context(intent, context))?;
         classify_prepared_session_send(session_effects)
     }
 
@@ -2303,7 +2329,7 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(prepared_effects, &mut queue);
 
-        let rollback_effects = self.session.publish_failed(pending).await?;
+        let rollback_effects = prepare_local!(self, session => session.publish_failed(pending))?;
         output
             .pending
             .push(PendingResolution::RolledBack { pending });
@@ -2439,10 +2465,8 @@ where
         context: AuditEventContext,
     ) -> AccountResult<AccountDeviceEffects> {
         let accept_started = Instant::now();
-        let effects = self
-            .session
-            .queue_app_message_with_audit_context(group_id.clone(), payload, context.clone())
-            .await?;
+        let effects = prepare_local!(self, session => session
+            .queue_app_message_with_audit_context(group_id.clone(), payload, context.clone()))?;
         let local_accept_duration = accept_started.elapsed();
         let publish_started = Instant::now();
         let mut output = self
@@ -2494,9 +2518,9 @@ where
         // observable while the queued-intent drain stays ordered behind the
         // frozen fanout.
         let effects = if blocked_groups.contains(group_id) {
-            self.session.advance_convergence_inputs(group_id).await?
+            prepare_local!(self, session => session.advance_convergence_inputs(group_id))?
         } else {
-            self.session.advance_convergence(group_id).await?
+            prepare_local!(self, session => session.advance_convergence(group_id))?
         };
         output.extend(self.publish_session_effects(effects).await?);
         Ok(output)
@@ -2605,7 +2629,7 @@ where
     /// to trigger a drain (mdk#426). Publishes any incidental transport
     /// work the same way `ingest_delivery` does.
     pub async fn drain(&mut self) -> AccountResult<AccountDeviceEffects> {
-        let effects = self.session.drain();
+        let effects = self.prepare_local(|session| session.drain())?;
         let mut output = self.publish_session_effects(effects).await?;
         let resumed = self.resume_outbound_fanouts().await?;
         output.extend(resumed);
@@ -2631,7 +2655,7 @@ where
             return Err(AccountError::WrongAccountDelivery);
         }
         let started = Instant::now();
-        let ingested = self.session.ingest_delivery(delivery).await;
+        let ingested = prepare_local!(self, session => session.ingest_delivery(delivery));
         observe(
             AccountIngestPhase::Engine,
             started.elapsed(),
@@ -2809,7 +2833,7 @@ where
                     && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
                     && self
                         .session
-                        .regenerated_queued_intent_for_message(fanout.message_id())
+                        .regenerated_queued_intent_for_message(fanout.message_id())?
                         .is_none()
                 {
                     self.session.delete_outbound_fanout(fanout.message_id())?;
@@ -2857,7 +2881,7 @@ where
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
                 let queued_intent = self
                     .session
-                    .regenerated_queued_intent_for_message(fanout.message_id());
+                    .regenerated_queued_intent_for_message(fanout.message_id())?;
                 self.resolve_regenerated_queued_intent(
                     queued_intent,
                     PublishStatus {
@@ -2880,7 +2904,7 @@ where
                 output.fanout.push(outcome);
                 let queued_intent = self
                     .session
-                    .regenerated_queued_intent_for_message(fanout.message_id());
+                    .regenerated_queued_intent_for_message(fanout.message_id())?;
                 self.resolve_regenerated_queued_intent(
                     queued_intent,
                     PublishStatus {
@@ -2890,7 +2914,7 @@ where
                 );
                 if self
                     .session
-                    .regenerated_queued_intent_for_message(fanout.message_id())
+                    .regenerated_queued_intent_for_message(fanout.message_id())?
                     .is_none()
                 {
                     self.session.delete_outbound_fanout(fanout.message_id())?;
@@ -3189,63 +3213,22 @@ where
         }
     }
 
-    /// Confirm a published commit, retrying on transient backend contention.
-    ///
-    /// `confirm_published` is the apply half of publish-before-apply: by the
-    /// time it runs the commit is already on the wire, so abandoning it on a
-    /// transient `SQLITE_BUSY` would leave the local device behind an epoch the
-    /// group has accepted — a self-inflicted fork seam. The engine's confirm
-    /// path is structured to be retry-safe (the in-memory state-machine
-    /// transition only runs after its durable storage transaction commits), so
-    /// re-running after a lock blip converges. The backend already blocks up to
-    /// its `busy_timeout` per attempt; these few extra attempts cover the rare
-    /// case where contention outlives that window. A non-transient error, or
-    /// exhausted attempts, propagates as before.
-    async fn confirm_published_retrying(
+    /// Confirm a published commit within the local preparation transaction.
+    /// Confirmation also freezes any queued output it produces. A refusal
+    /// consumes the Engine; the host reopens and resumes the durable fanout.
+    async fn confirm_published_locally(
         &mut self,
         pending: PendingStateRef,
     ) -> AccountResult<SessionEffects> {
-        const MAX_CONFIRM_ATTEMPTS: u32 = 4;
-        let mut attempt = 0;
-        loop {
-            match self.session.confirm_published(pending).await {
-                Ok(effects) => return Ok(effects),
-                Err(e) if e.is_transient() && attempt + 1 < MAX_CONFIRM_ATTEMPTS => {
-                    attempt += 1;
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        method = "confirm_published_retrying",
-                        attempt,
-                        "confirm hit a transient backend lock; retrying"
-                    );
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        prepare_local!(self, session => session.confirm_published(pending))
     }
 
-    async fn confirm_published_fanout_retrying(
+    async fn confirm_published_fanout_locally(
         &mut self,
         pending: PendingStateRef,
         fanout: &mut OutboundFanout,
     ) -> AccountResult<SessionEffects> {
-        const MAX_CONFIRM_ATTEMPTS: u32 = 4;
-        let mut attempt = 0;
-        loop {
-            match self.session.confirm_published_fanout(pending, fanout).await {
-                Ok(effects) => return Ok(effects),
-                Err(e) if e.is_transient() && attempt + 1 < MAX_CONFIRM_ATTEMPTS => {
-                    attempt += 1;
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        method = "confirm_published_fanout_retrying",
-                        attempt,
-                        "fanout confirm hit a transient backend lock; retrying"
-                    );
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        prepare_local!(self, session => session.confirm_published_fanout(pending, fanout))
     }
 
     async fn publish_pending(
@@ -3256,6 +3239,17 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
+        if let [message] = messages.as_slice()
+            && let Some(fanout) = self
+                .session
+                .outbound_fanouts()?
+                .into_iter()
+                .find(|fanout| fanout.message_id() == &message.id)
+        {
+            validate_existing_fanout(&self.session, &fanout, message, Some(pending), &[], None)?;
+            Box::pin(self.drive_outbound_fanout(fanout, output, queue, context)).await?;
+            return Ok(());
+        }
         let maintenance_evolution = messages.len() == 1
             && self
                 .session
@@ -3277,7 +3271,7 @@ where
                     .iter()
                     .any(|target| target.state == TransportFanoutAttemptState::Accepted)
             {
-                let effects = self.confirm_published_retrying(pending).await?;
+                let effects = self.confirm_published_locally(pending).await?;
                 output
                     .pending
                     .push(PendingResolution::Confirmed { pending });
@@ -3304,7 +3298,7 @@ where
             }
 
             if all_published || any_accepted {
-                let effects = self.confirm_published_retrying(pending).await?;
+                let effects = self.confirm_published_locally(pending).await?;
                 output
                     .pending
                     .push(PendingResolution::Confirmed { pending });
@@ -3314,7 +3308,7 @@ where
                     self.finish_transport_fanout(&message_id, output).await?;
                 }
             } else if !ambiguous_exposure && !retry_deferred {
-                let effects = self.session.publish_failed(pending).await?;
+                let effects = prepare_local!(self, session => session.publish_failed(pending))?;
                 output
                     .pending
                     .push(PendingResolution::RolledBack { pending });
@@ -3328,7 +3322,7 @@ where
         // remaining targets continue as an independent durable obligation.
         let mut messages = messages.into_iter();
         let Some(message) = messages.next() else {
-            let effects = self.session.publish_failed(pending).await?;
+            let effects = prepare_local!(self, session => session.publish_failed(pending))?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -3350,7 +3344,7 @@ where
     ) -> AccountResult<()> {
         let mut welcomes = welcomes.into_iter();
         let Some(first_welcome) = welcomes.next() else {
-            let effects = self.confirm_published_retrying(pending).await?;
+            let effects = self.confirm_published_locally(pending).await?;
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });
@@ -3514,6 +3508,23 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
+        if let Some(fanout) = self
+            .session
+            .outbound_fanouts()?
+            .into_iter()
+            .find(|fanout| fanout.message_id() == &commit.id)
+        {
+            validate_existing_fanout(
+                &self.session,
+                &fanout,
+                &commit,
+                Some(pending),
+                &welcomes,
+                None,
+            )?;
+            Box::pin(self.drive_outbound_fanout(fanout, output, queue, context)).await?;
+            return Ok(());
+        }
         let commit_id = commit.id.clone();
         let maintenance_evolution = self
             .session
@@ -3531,7 +3542,7 @@ where
                 .publish_legacy_one(commit, output, context.clone())
                 .await?;
             if commit_status.met_required_acks || commit_status.accepted_by_any_endpoint {
-                let effects = self.confirm_published_retrying(pending).await?;
+                let effects = self.confirm_published_locally(pending).await?;
                 output
                     .pending
                     .push(PendingResolution::Confirmed { pending });
@@ -3542,7 +3553,7 @@ where
                 return Ok(());
             }
             if !commit_status.possible_ambiguous_exposure && !commit_status.retry_deferred {
-                let effects = self.session.publish_failed(pending).await?;
+                let effects = prepare_local!(self, session => session.publish_failed(pending))?;
                 output
                     .pending
                     .push(PendingResolution::RolledBack { pending });
@@ -3818,6 +3829,28 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
+        if let Some(fanout) = self
+            .session
+            .outbound_fanouts()?
+            .into_iter()
+            .find(|fanout| fanout.message_id() == &message.id)
+        {
+            let pending = continuation
+                .as_ref()
+                .map(|continuation| continuation.pending);
+            let welcomes = continuation.as_ref().map_or(&[][..], |continuation| {
+                continuation.post_confirmation_welcomes.as_slice()
+            });
+            validate_existing_fanout(
+                &self.session,
+                &fanout,
+                &message,
+                pending,
+                welcomes,
+                application_message.as_ref(),
+            )?;
+            return Box::pin(self.drive_outbound_fanout(fanout, output, queue, context)).await;
+        }
         let stage_started = application_message.as_ref().map(|_| Instant::now());
         let (pending, pending_kind, post_confirmation_welcomes) = match continuation {
             Some(continuation) => (
@@ -3910,7 +3943,7 @@ where
         } else {
             let queued_intent = self
                 .session
-                .regenerated_queued_intent_for_message(&message.id);
+                .regenerated_queued_intent_for_message(&message.id)?;
             let status = self.publish_legacy_one(message, output, context).await?;
             self.resolve_regenerated_queued_intent(queued_intent, status);
             Ok(status)
@@ -3924,7 +3957,7 @@ where
         queue: &mut VecDeque<PublishWork>,
     ) -> AccountResult<()> {
         if let Some(pending) = pending {
-            let effects = self.session.publish_failed(pending).await?;
+            let effects = prepare_local!(self, session => session.publish_failed(pending))?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -3940,6 +3973,13 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
+        if fanout.request().account_id != self.session.self_id()
+            || fanout
+                .application_message()
+                .is_some_and(|application| fanout.group_id() != Some(&application.group_id))
+        {
+            return Err(cgka_traits::EngineError::QueuedIntentRecoveryFailed.into());
+        }
         let outcome = fanout.outcome();
         // A receipt persisted before cancellation can still be below quorum.
         // Finish that pass before releasing its Welcome continuation. Once a
@@ -4086,7 +4126,7 @@ where
                     met_required_acks: report.met_required_acks(),
                     transport: Some(publish_wire_metadata(&fanout.request().message)),
                 },
-            );
+            )?;
             output.reports.push(report);
             self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
                 .await?;
@@ -4176,13 +4216,13 @@ where
         }
         let queued_intent = self
             .session
-            .regenerated_queued_intent_for_message(fanout.message_id());
+            .regenerated_queued_intent_for_message(fanout.message_id())?;
         self.resolve_regenerated_queued_intent(queued_intent, status);
         output.fanout.push(fanout_outcome.clone());
         if fanout_outcome.fanout_complete
             && self
                 .session
-                .regenerated_queued_intent_for_message(fanout.message_id())
+                .regenerated_queued_intent_for_message(fanout.message_id())?
                 .is_none()
             && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
             && !(fanout_outcome.accepted_targets > 0 && fanout.application_message().is_some())
@@ -4205,7 +4245,7 @@ where
                 .pending_ref()
                 .expect("confirmation-required fanout retains pending ref");
             let effects = self
-                .confirm_published_fanout_retrying(pending, fanout)
+                .confirm_published_fanout_locally(pending, fanout)
                 .await?;
             output
                 .pending
@@ -4216,7 +4256,8 @@ where
             && !fanout.possible_exposure()
             && let Some(pending) = fanout.pending_ref()
         {
-            let effects = self.session.publish_failed_fanout(pending, fanout).await?;
+            let effects =
+                prepare_local!(self, session => session.publish_failed_fanout(pending, fanout))?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -4292,7 +4333,7 @@ where
         };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
-        let v5_welcome_identity = if self.session.audit_v5_enabled() {
+        let v5_welcome_identity = if self.session.audit_v5_enabled()? {
             match &message.envelope {
                 TransportEnvelope::Welcome { recipient } => publish_context
                     .v5_welcome_refs
@@ -4344,7 +4385,7 @@ where
                                     elapsed_us: None,
                                 },
                             ),
-                        );
+                        )?;
                     }
                     self.session.record_audit_event(
                         None,
@@ -4361,7 +4402,7 @@ where
                             detail: None,
                             transport: Some(wire),
                         },
-                    );
+                    )?;
                     output.failures.push(PublishFailure {
                         message_id,
                         reason: e.to_string(),
@@ -4389,7 +4430,7 @@ where
                 required_acks: required_acks as u64,
                 transport: Some(wire.clone()),
             },
-        );
+        )?;
         let fanout = if let Some(fanout) = existing_fanout {
             fanout
         } else {
@@ -4524,7 +4565,7 @@ where
                     required_acks,
                     accepted_before_count,
                 }),
-            );
+            )?;
         }
 
         Ok(PreparedLegacyPublish::Network(Box::new(
@@ -4604,7 +4645,7 @@ where
                     &retry_endpoints,
                     accepted_before,
                     required_acks,
-                );
+                )?;
                 self.session.record_audit_event(
                     target_group_id.as_ref(),
                     Some(publish_context),
@@ -4620,7 +4661,7 @@ where
                         detail: None,
                         transport: Some(wire),
                     },
-                );
+                )?;
                 output.failures.push(PublishFailure {
                     message_id,
                     reason: error.to_string(),
@@ -4652,7 +4693,7 @@ where
             &retry_endpoints,
             accepted_total,
             required_acks,
-        );
+        )?;
         let published = accepted_total >= required_acks.max(1);
         let accepted_by_any_endpoint = accepted_total > 0;
         self.session.record_audit_event(
@@ -4680,7 +4721,7 @@ where
                 met_required_acks: published,
                 transport: Some(wire.clone()),
             },
-        );
+        )?;
         if !published {
             self.session.record_audit_event(
                 target_group_id.as_ref(),
@@ -4697,7 +4738,7 @@ where
                     detail: None,
                     transport: Some(wire),
                 },
-            );
+            )?;
             output.failures.push(PublishFailure {
                 message_id: report.message_id.clone(),
                 reason: "insufficient publish acknowledgements".into(),
@@ -4729,12 +4770,12 @@ where
         attempted: &[TransportEndpoint],
         accepted_total: usize,
         required_acks: usize,
-    ) {
+    ) -> AccountResult<()> {
         let Some((_, outer, attempt_id, _, group_ref)) = identity else {
-            return;
+            return Ok(());
         };
         let Ok(required_acks) = u32::try_from(required_acks) else {
-            return;
+            return Ok(());
         };
         let mut results = Vec::new();
         let mut source_count = 0usize;
@@ -4804,7 +4845,9 @@ where
                 retained_state,
                 elapsed_us: None,
             }),
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -5197,6 +5240,197 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
     )
+}
+
+trait LocalSessionEffects {
+    fn local_effects(&self) -> &SessionEffects;
+}
+impl LocalSessionEffects for SessionEffects {
+    fn local_effects(&self) -> &SessionEffects {
+        self
+    }
+}
+impl LocalSessionEffects for CreateGroupEffects {
+    fn local_effects(&self) -> &SessionEffects {
+        &self.effects
+    }
+}
+impl LocalSessionEffects for IngestEffects {
+    fn local_effects(&self) -> &SessionEffects {
+        &self.effects
+    }
+}
+
+/// Validate effect associations without changing frozen route or attempt state.
+fn validate_existing_fanout(
+    session: &AccountDeviceSession,
+    fanout: &OutboundFanout,
+    message: &TransportMessage,
+    pending: Option<PendingStateRef>,
+    welcomes: &[TransportMessage],
+    application: Option<&OutboundApplicationMessage>,
+) -> AccountResult<()> {
+    let kind = pending
+        .map(|pending| session.pending_fanout_kind(pending))
+        .transpose()?;
+    let origin = if kind == Some(FanoutPendingKind::CreateGroup) {
+        None
+    } else {
+        pending
+            .map(|pending| session.pending_origin_message_id(pending))
+            .transpose()?
+    };
+    let group = match pending {
+        Some(pending) => Some(session.pending_group_id(pending)?),
+        None => session
+            .regenerated_queued_intent_for_message(&message.id)?
+            .map(|intent| intent.group_id),
+    };
+    if fanout.request().account_id != session.self_id()
+        || fanout.request().message != *message
+        || fanout.pending_ref() != pending
+        || fanout.pending_kind() != kind
+        || fanout.pending_origin_message_id() != origin.as_ref()
+        || group
+            .as_ref()
+            .is_some_and(|group| fanout.group_id() != Some(group))
+        || application.is_some_and(|app| fanout.group_id() != Some(&app.group_id))
+        || fanout.application_message() != application
+        || fanout.stored_post_confirmation_welcomes() != welcomes
+    {
+        return Err(cgka_traits::EngineError::QueuedIntentRecoveryFailed.into());
+    }
+    Ok(())
+}
+
+/// Freeze every regenerated queued artifact before releasing its effect.
+fn stage_local_effects<R: TransportRoutingPolicy>(
+    session: &AccountDeviceSession,
+    routing: &R,
+    effects: &SessionEffects,
+    created_at_ms: u64,
+) -> AccountResult<()> {
+    for work in &effects.publish {
+        let mut artifacts = Vec::new();
+        match work {
+            PublishWork::ApplicationMessage {
+                msg,
+                group_id,
+                app_event_id,
+                source_epoch,
+                retention,
+                authority,
+                ..
+            } => {
+                artifacts.push((
+                    msg,
+                    None,
+                    Vec::new(),
+                    Some(OutboundApplicationMessage {
+                        group_id: group_id.clone(),
+                        app_event_id: app_event_id.clone(),
+                        source_epoch: *source_epoch,
+                        retention: *retention,
+                        authority: *authority,
+                    }),
+                ));
+            }
+            PublishWork::Proposal { msg, .. } => artifacts.push((msg, None, Vec::new(), None)),
+            PublishWork::GroupEvolution {
+                msg,
+                pending,
+                welcomes,
+            } => {
+                artifacts.push((msg, Some(*pending), welcomes.clone(), None));
+            }
+            PublishWork::AutoPublish { msg, pending } => {
+                artifacts.push((msg, Some(*pending), Vec::new(), None))
+            }
+            PublishWork::FoundingGroupCreated { welcomes } => {
+                for welcome in welcomes {
+                    artifacts.push((welcome, None, Vec::new(), None));
+                }
+            }
+            PublishWork::GroupCreated { welcomes, pending } => {
+                for welcome in welcomes {
+                    artifacts.push((welcome, Some(*pending), Vec::new(), None));
+                }
+            }
+        }
+        for (message, pending, welcomes, application) in artifacts {
+            let queued_group = match pending {
+                Some(pending) => Some(session.pending_group_id(pending)?),
+                None => session
+                    .regenerated_queued_intent_for_message(&message.id)?
+                    .map(|intent| intent.group_id),
+            };
+            let Some(queued_group) = queued_group else {
+                continue;
+            };
+            if session
+                .queued_intent_for_artifact(&queued_group, &message.id)?
+                .is_none()
+            {
+                continue;
+            }
+            if let Some(existing) = session
+                .outbound_fanouts()?
+                .into_iter()
+                .find(|fanout| fanout.message_id() == &message.id)
+            {
+                if existing.group_id() != Some(&queued_group) {
+                    return Err(cgka_traits::EngineError::QueuedIntentRecoveryFailed.into());
+                }
+                validate_existing_fanout(
+                    session,
+                    &existing,
+                    message,
+                    pending,
+                    &welcomes,
+                    application.as_ref(),
+                )?;
+                continue;
+            }
+            let target = routing.publish_target(message)?;
+            let required_acks = routing.required_acks(&target);
+            let kind = pending
+                .map(|pending| session.pending_fanout_kind(pending))
+                .transpose()?;
+            let group = match pending {
+                Some(pending) => Some(session.pending_group_id(pending)?),
+                None if matches!(message.envelope, TransportEnvelope::Welcome { .. }) => {
+                    Some(session.stored_sent_welcome(&message.id)?.0)
+                }
+                None => None,
+            };
+            let origin = if kind == Some(FanoutPendingKind::CreateGroup) {
+                None
+            } else {
+                pending
+                    .map(|pending| session.pending_origin_message_id(pending))
+                    .transpose()?
+            };
+            let mut fanout = OutboundFanout::stage_with_post_confirmation_welcomes(
+                TransportPublishRequest {
+                    account_id: session.self_id(),
+                    message: message.clone(),
+                    target,
+                    required_acks,
+                },
+                pending,
+                group,
+                created_at_ms,
+                origin,
+                kind,
+                welcomes,
+            )?;
+            if let Some(application) = application {
+                fanout.set_application_message(application)?;
+            }
+            session.put_outbound_fanout(&fanout)?;
+        }
+    }
+    Ok(())
 }
 
 fn classify_prepared_session_send(

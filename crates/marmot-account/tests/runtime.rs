@@ -2436,7 +2436,7 @@ async fn unhydrated_group_does_not_abort_periodic_maintenance_for_other_groups()
     assert_eq!(listed.len(), 2);
     let (unhydrated, live) = (listed[0].clone(), listed[1].clone());
     assert!(reopened.ensure_group_hydrated(&live).unwrap());
-    assert_eq!(reopened.unhydrated_group_ids(), vec![unhydrated]);
+    assert_eq!(reopened.unhydrated_group_ids().unwrap(), vec![unhydrated]);
 
     let mut runtime = AccountDeviceRuntime::new(
         reopened,
@@ -2502,7 +2502,10 @@ async fn unhydrated_group_obligation_does_not_abort_the_sweep_for_other_groups()
     assert_eq!(listed.len(), 2);
     let (unhydrated, live) = (listed[0].clone(), listed[1].clone());
     assert!(reopened.ensure_group_hydrated(&live).unwrap());
-    assert_eq!(reopened.unhydrated_group_ids(), vec![unhydrated.clone()]);
+    assert_eq!(
+        reopened.unhydrated_group_ids().unwrap(),
+        vec![unhydrated.clone()]
+    );
 
     // The stuck obligation is created first, so the created_at sort puts it
     // ahead of the one the sweep owes real work.
@@ -4095,7 +4098,7 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
     );
 
     // The group is queryable via the recovery surface...
-    let quarantined = runtime.quarantined_groups();
+    let quarantined = runtime.quarantined_groups().unwrap();
     assert_eq!(quarantined.len(), 1);
     assert_eq!(quarantined[0].0, broken_group);
     assert_eq!(

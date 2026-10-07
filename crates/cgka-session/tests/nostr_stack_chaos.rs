@@ -1,7 +1,5 @@
 mod support;
 
-use std::path::Path;
-
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
@@ -941,12 +939,11 @@ impl ScriptRng {
 }
 
 fn write_report(report: &StackChaosReport) {
-    let target_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/session-stack-chaos")
-        .canonicalize()
-        .unwrap_or_else(|_| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/session-stack-chaos")
-        });
+    let executable = std::env::current_exe().expect("locate chaos test executable");
+    let target_dir = executable
+        .parent()
+        .expect("chaos test executable directory")
+        .join("session-stack-chaos");
     std::fs::create_dir_all(&target_dir).expect("create chaos report directory");
     let path = target_dir.join(format!("{}-{:x}.json", report.name, report.seed));
     std::fs::write(

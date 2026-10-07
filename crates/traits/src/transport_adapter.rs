@@ -506,6 +506,11 @@ impl OutboundFanout {
                 .contains(&FanoutTargetStatus::PossiblyExposed)
     }
 
+    /// Immutable stored continuation, including after release.
+    pub fn stored_post_confirmation_welcomes(&self) -> &[TransportMessage] {
+        &self.post_confirmation_welcomes
+    }
+
     pub fn pending_post_confirmation_welcomes(&self) -> &[TransportMessage] {
         if self.post_confirmation_welcomes_pending {
             &self.post_confirmation_welcomes

@@ -726,6 +726,15 @@ impl ScriptedPushRelayClient {
             .collect()
     }
 
+    pub(crate) fn group_message_attempt_count(&self) -> usize {
+        self.attempted_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .count()
+    }
+
     pub(crate) fn block_next_publish(&self) {
         self.block_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3878,14 +3887,19 @@ async fn media_send_epoch_pin_body() {
     // The optimistic local row is retracted the same way as any failed
     // publish: invalidated in place, never left looking sent.
     let rows = app.messages("alice").unwrap();
+    assert_eq!(rows.len(), 1);
     assert!(
         rows.iter().all(|row| row.invalidated),
         "the optimistic row must be retracted, got {rows:?}"
     );
+    assert!(client.runtime.session().is_closed());
+    drop(client);
+    let mut client = app.client("alice").await.unwrap();
+    assert!(!client.runtime.session().is_closed());
     assert_eq!(
         client.group_mls_state(&group_id).unwrap().epoch,
         current_epoch,
-        "the refusal must not disturb the group"
+        "the refusal must not disturb the persisted group"
     );
 
     // A reference from the current epoch still goes out through the same path,
@@ -4137,17 +4151,65 @@ async fn account_local_ready_before_subscribe_body() {
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     relay.block_next_subscribe();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+    let witness = Arc::new(crate::account_state_witness::Witness::new());
+    let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    app.account_state_witness = Some(witness.clone());
     let runtime = MarmotAppRuntime::new(app);
 
-    tokio::time::timeout(
+    // Diagnostic-only replacement for the first timeout expression in
+    // account_local_ready_before_subscribe_body. Apply only in a separately
+    // bound diagnostic copy; preserve every later original assertion and call.
+    let readiness_started = std::time::Instant::now();
+    witness.arm(readiness_started);
+    let readiness = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         runtime.reconcile_accounts(),
     )
-    .await
-    .expect("local account readiness must not wait for relay registration")
-    .unwrap();
+    .await;
+    let readiness_elapsed_us = readiness_started.elapsed().as_micros();
+    let account_state_snapshot = witness.snapshot();
+    account_state_snapshot.print();
+    let snapshot = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    eprintln!(
+        "readiness_diag result timeout={} elapsed_us={}",
+        u8::from(readiness.is_err()),
+        readiness_elapsed_us
+    );
+    for row in snapshot.runtime_operations {
+        use crate::RuntimePerformanceOperation as Op;
+        if matches!(
+            row.operation,
+            Op::LifecycleLockWait
+                | Op::AccountStartup
+                | Op::AccountStartupSpawned
+                | Op::AccountStartupOpenQueued
+                | Op::AccountStartupAccountState
+                | Op::AccountStartupSessionOpen
+                | Op::AccountStartupClientRestore
+                | Op::AccountStartupReadyHandoff
+        ) {
+            eprintln!(
+                "readiness_diag stage={} started={} completed={} successes={} failures={} cancelled={} timeouts={} in_flight={} oldest_ms={} untracked={}",
+                row.operation.as_str(),
+                row.started,
+                row.completed,
+                row.successes,
+                row.failures,
+                row.cancelled,
+                row.timeouts,
+                row.in_flight,
+                row.oldest_tracked_in_flight_ms,
+                row.untracked_in_flight
+            );
+        }
+    }
+    readiness
+        .expect("local account readiness must not wait for relay registration")
+        .unwrap();
     assert_eq!(runtime.accounts().managed_accounts().unwrap().len(), 1);
     assert!(
         tokio::time::timeout(
@@ -5530,6 +5592,789 @@ async fn failed_leave_push_compensation_body() {
         "a failed leave must compensate by re-publishing the current registration"
     );
     runtime.shutdown().await;
+}
+
+async fn failed_leave_compensation_fixture(
+    audited: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<ScriptedPushRelayClient>,
+    MarmotApp,
+    AppClient,
+    GroupId,
+    PushRegistration,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+    assert_eq!(
+        home.account(&npub_for_account_id_lossy(&account.account_id_hex))
+            .unwrap(),
+        account
+    );
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    if audited {
+        app.set_audit_log_settings(AuditLogSettings { enabled: true })
+            .unwrap();
+    }
+    let mut client = app.client(&account.label).await.unwrap();
+    let group_id = client.create_group("failed leave", &[]).await.unwrap();
+    app.set_native_push_enabled(&account.label, true).unwrap();
+    let registered = client
+        .upsert_and_share_push_registration(
+            PushPlatform::Fcm,
+            "opaque-token",
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        registered.share.status,
+        PushRegistrationShareStatus::Complete
+    );
+    (dir, relay, app, client, group_id, registered.registration)
+}
+
+fn assert_admin_leave_refusal(result: Result<SendSummary, AppError>) {
+    assert!(matches!(
+        result,
+        Err(AppError::Account(marmot_account::AccountError::Session(
+            cgka_session::SessionError::Engine(
+                cgka_traits::EngineError::AdminCannotSelfRemove { .. }
+            )
+        )))
+    ));
+}
+
+#[test]
+fn directly_owned_failed_leave_compensates_without_releasing_identity_or_owner() {
+    run_composed_app_runtime_test("direct-failed-leave-compensation", || async {
+        use cgka_traits::storage::AccountDeviceSignerStorage;
+        let (_dir, _relay, app, mut client, group_id, registration) =
+            failed_leave_compensation_fixture(true).await;
+        let label = client.state.label.clone();
+        let other_group = client.create_group("other live group", &[]).await.unwrap();
+        client.share_push_registration().await.unwrap();
+        let identity = client.runtime.session().self_id();
+        let signer = app
+            .account_storage(&label)
+            .unwrap()
+            .account_device_signer(&identity)
+            .unwrap()
+            .unwrap();
+        let members = client.runtime.members(&group_id).unwrap();
+        let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let other_members = client.runtime.members(&other_group).unwrap();
+        let other_epoch = client.group_mls_state(&other_group).unwrap().epoch;
+        let transport_signer = client.transport_signer.clone();
+        let peel_slot = client.audit_v5_peel_slot.as_ref().unwrap().clone();
+        let subscription = client.adapter.account_subscription_attempt().await;
+        let rows_before = recorded_audit_rows(&app).len();
+
+        assert_admin_leave_refusal(client.leave_group(&group_id).await);
+        assert!(!client.runtime.session().is_closed());
+        assert_eq!(client.runtime.session().self_id(), identity);
+        assert_eq!(
+            app.account_storage(&label)
+                .unwrap()
+                .account_device_signer(&identity)
+                .unwrap()
+                .unwrap(),
+            signer
+        );
+        assert_eq!(client.runtime.members(&group_id).unwrap(), members);
+        assert_eq!(client.group_mls_state(&group_id).unwrap().epoch, epoch);
+        assert_eq!(client.runtime.members(&other_group).unwrap(), other_members);
+        assert_eq!(
+            client.group_mls_state(&other_group).unwrap().epoch,
+            other_epoch
+        );
+        assert!(Arc::ptr_eq(&transport_signer, &client.transport_signer));
+        assert!(Arc::ptr_eq(
+            &peel_slot,
+            client.audit_v5_peel_slot.as_ref().unwrap()
+        ));
+        assert_eq!(
+            client.adapter.account_subscription_attempt().await,
+            subscription
+        );
+        assert!(
+            app.pending_push_registration_removals(&label)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            app.pending_push_registration_shares(
+                &label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            app.group_push_tokens(&label, &hex::encode(group_id.as_slice()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            app.client(&label).await,
+            Err(AppError::AccountSessionBusy)
+        ));
+        assert!(matches!(
+            app.client(&npub_for_account_id_lossy(&hex::encode(
+                identity.as_slice()
+            )))
+            .await,
+            Err(AppError::AccountSessionBusy)
+        ));
+        let rows = recorded_audit_rows(&app);
+        assert!(rows.len() > rows_before);
+        assert!(
+            rows.iter()
+                .all(|row| row["event"]["type"] != "recording_session_stopped")
+        );
+        let (_, sent) = client
+            .send_app_event(
+                &group_id,
+                AppMessageIntent::Chat {
+                    content: "healthy after refused leave".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sent.accept_disposition,
+            cgka_traits::SendAcceptDisposition::Published
+        );
+    });
+}
+
+#[test]
+fn failed_leave_unavailable_compensation_remains_durable_for_cold_reopen() {
+    run_composed_app_runtime_test("failed-leave-unavailable-compensation", || async {
+        let (_dir, relay, app, mut client, group_id, registration) =
+            failed_leave_compensation_fixture(false).await;
+        let label = client.state.label.clone();
+        let group_hex = hex::encode(group_id.as_slice());
+        // Removal is acknowledged; only the compensation publication fails.
+        relay.script([true, false]);
+        assert_admin_leave_refusal(client.leave_group(&group_id).await);
+        assert!(
+            app.pending_push_registration_removals(&label)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            app.pending_push_registration_shares(
+                &label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms
+            )
+            .unwrap(),
+            vec![group_hex.clone()]
+        );
+        assert!(
+            app.group_push_tokens(&label, &group_hex)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            app.client(&label).await,
+            Err(AppError::AccountSessionBusy)
+        ));
+        drop(client);
+        let mut reopened = app.client(&label).await.unwrap();
+        reopened.share_push_registration().await.unwrap();
+        assert!(
+            app.pending_push_registration_shares(
+                &label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(app.group_push_tokens(&label, &group_hex).unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn cancelled_failed_leave_caller_does_not_release_the_compensation_owner() {
+    run_composed_app_runtime_test("cancelled-failed-leave-compensation", || async {
+        let (_dir, relay, app, client, group_id, registration) =
+            failed_leave_compensation_fixture(false).await;
+        let label = client.state.label.clone();
+        drop(client);
+        let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
+        runtime.reconcile_accounts().await.unwrap();
+        relay.block_next_publishes(2);
+        let owned_runtime = runtime.clone();
+        let owned_group = group_id.clone();
+        let owned_label = label.clone();
+        let caller =
+            tokio::spawn(
+                async move { owned_runtime.leave_group(&owned_label, &owned_group).await },
+            );
+        tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publishes(1))
+            .await
+            .unwrap();
+        relay.release_publish();
+        tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publishes(2))
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            app.client(&label).await,
+            Err(AppError::AccountSessionBusy)
+        ));
+        let account = app.account_home().account(&label).unwrap();
+        assert!(matches!(
+            app.client(&npub_for_account_id_lossy(&account.account_id_hex))
+                .await,
+            Err(AppError::AccountSessionBusy)
+        ));
+        assert_eq!(
+            app.pending_push_registration_shares(
+                &label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(
+            app.group_push_tokens(&label, &hex::encode(group_id.as_slice()))
+                .unwrap()
+                .is_empty()
+        );
+        relay.release_publish();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.group_members(&label, &group_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            app.pending_push_registration_shares(
+                &label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            app.group_push_tokens(&label, &hex::encode(group_id.as_slice()))
+                .unwrap()
+                .len(),
+            1
+        );
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn failed_leave_compensation_keeps_detached_welcome_publication_reserved() {
+    run_composed_app_runtime_test("failed-leave-detached-welcome", || async {
+        let (_dir, relay, app, mut client, leave_group, _) =
+            failed_leave_compensation_fixture(false).await;
+        let bob = app.account_home().create_account("bob").unwrap();
+        remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        {
+            let mut bob_client = app.client("bob").await.unwrap();
+            bob_client.publish_key_package().await.unwrap();
+        }
+        // Retain a genuine founding Welcome before its network phase succeeds.
+        relay.script([false]);
+        client
+            .create_group("pending Welcome", &[&bob.account_id_hex])
+            .await
+            .unwrap();
+        let recovery = client
+            .prepare_pending_welcome_delivery_recovery_best_effort()
+            .expect("genuine engine-retained Welcome remains retryable");
+        let ids = recovery.message_ids().to_vec();
+        assert_eq!(ids.len(), 1);
+        relay.block_next_publish();
+        let publication = tokio::spawn(recovery.run());
+        tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish())
+            .await
+            .unwrap();
+        let welcome_id = hex::encode(ids[0].as_slice());
+        let attempts_before = relay
+            .attempted_event_ids()
+            .iter()
+            .filter(|id| *id == &welcome_id)
+            .count();
+        assert_admin_leave_refusal(client.leave_group(&leave_group).await);
+        // Another retry must still skip the exact request owned by the task.
+        let no_duplicate = client
+            .prepare_pending_welcome_delivery_recovery_best_effort()
+            .unwrap();
+        assert!(no_duplicate.message_ids().is_empty());
+        assert_eq!(
+            relay
+                .attempted_event_ids()
+                .iter()
+                .filter(|id| *id == &welcome_id)
+                .count(),
+            attempts_before
+        );
+        relay.release_publish();
+        let completed = tokio::time::timeout(Duration::from_secs(5), publication)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .finish_pending_welcome_delivery_recovery_best_effort(completed)
+            .await;
+        assert!(
+            client
+                .runtime
+                .outstanding_welcome_deliveries()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            relay
+                .published_event_ids()
+                .iter()
+                .filter(|id| *id == &welcome_id)
+                .count(),
+            1
+        );
+    });
+}
+
+async fn assert_failed_leave_replacement_retains_owner_and_compensation(
+    app: &MarmotApp,
+    client: &AppClient,
+    label: &str,
+    group_id: &GroupId,
+    registration: &PushRegistration,
+) {
+    let account = app.account_home().account(label).unwrap();
+    assert_eq!(
+        app.account_home()
+            .account(&npub_for_account_id_lossy(&account.account_id_hex))
+            .unwrap(),
+        account
+    );
+    assert!(client.runtime.session().is_closed());
+    assert!(matches!(
+        client.runtime.members(group_id),
+        Err(marmot_account::AccountError::Engine(
+            cgka_traits::EngineError::SessionClosed
+        ))
+    ));
+    assert_eq!(client._session_guard.label, account.label);
+    assert!(Arc::ptr_eq(
+        &client._session_guard.owners,
+        &app.account_session_owners
+    ));
+    assert!(
+        app.account_session_owners
+            .lock()
+            .unwrap()
+            .contains(&account.label)
+    );
+    assert!(
+        app.pending_push_registration_removals(label)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        app.pending_push_registration_shares(
+            label,
+            &registration.token_fingerprint,
+            registration.updated_at_ms,
+        )
+        .unwrap(),
+        vec![hex::encode(group_id.as_slice())]
+    );
+    assert!(
+        app.group_push_tokens(label, &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        app.client(label).await,
+        Err(AppError::AccountSessionBusy)
+    ));
+    assert!(matches!(
+        app.client(&npub_for_account_id_lossy(&account.account_id_hex))
+            .await,
+        Err(AppError::AccountSessionBusy)
+    ));
+}
+
+fn failed_leave_fixture_sql_connection(app: &MarmotApp, label: &str) -> rusqlite::Connection {
+    let path = app.account_storage_path(label);
+    let keys = app.account_home().load_signing_keys(label).unwrap();
+    let key = app
+        .sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+}
+
+#[derive(Clone, Debug)]
+struct ProofRefusingExternalAccountSigner {
+    inner: TestExternalAccountSigner,
+    refuse_proof: Arc<std::sync::atomic::AtomicBool>,
+    proof_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl transport_nostr_peeler::MarmotNostrSigner for ProofRefusingExternalAccountSigner {
+    fn get_public_key(
+        &self,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::get_public_key(&self.inner)
+    }
+
+    fn sign_event(
+        &self,
+        unsigned: nostr::prelude::UnsignedEvent,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::sign_event(&self.inner, unsigned)
+    }
+
+    fn nip04_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        content: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_encrypt(&self.inner, public_key, content)
+    }
+
+    fn nip04_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_decrypt(&self.inner, public_key, payload)
+    }
+
+    fn nip44_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        content: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_encrypt(&self.inner, public_key, content)
+    }
+
+    fn nip44_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_decrypt(&self.inner, public_key, payload)
+    }
+}
+
+impl cgka_engine::account_identity_proof::AccountIdentityProofSigner
+    for ProofRefusingExternalAccountSigner
+{
+    fn sign_account_identity_proof(
+        &self,
+        request: &cgka_engine::account_identity_proof::AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        self.proof_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.refuse_proof.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(EXTERNAL_SIGNER_REJECTED.to_owned());
+        }
+        cgka_engine::account_identity_proof::AccountIdentityProofSigner::sign_account_identity_proof(
+            &self.inner,
+            request,
+        )
+    }
+}
+
+#[test]
+fn failed_leave_external_proof_refusal_keeps_compensation_closed_and_owned() {
+    run_composed_app_runtime_test("failed-leave-external-proof-refusal", || async {
+        use cgka_traits::storage::AccountDeviceSignerStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let keys = nostr::prelude::Keys::generate();
+        let account = home
+            .add_external_signer_account(&keys.public_key().to_hex())
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relays_and_account_home(
+            dir.path(),
+            vec!["wss://relay.example".into()],
+            home,
+        )
+        .with_test_relay_client(relay.clone());
+        let refuse_proof = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let proof_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        app.register_external_signer(
+            &account.account_id_hex,
+            ProofRefusingExternalAccountSigner {
+                inner: TestExternalAccountSigner { keys },
+                refuse_proof: refuse_proof.clone(),
+                proof_calls: proof_calls.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut client = app.client(&account.label).await.unwrap();
+        let group_id = client
+            .create_group("external refused leave", &[])
+            .await
+            .unwrap();
+        app.set_native_push_enabled(&account.label, true).unwrap();
+        let registration = client
+            .upsert_and_share_push_registration(
+                PushPlatform::Fcm,
+                "opaque-token",
+                &nostr::prelude::Keys::generate().public_key().to_hex(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registration.share.status,
+            PushRegistrationShareStatus::Complete
+        );
+        let identity = client.runtime.session().self_id();
+        let storage = app.account_storage(&account.label).unwrap();
+        let binding = storage.account_device_signer(&identity).unwrap().unwrap();
+        let calls_before = proof_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(calls_before > 0);
+        let publications_before = relay.published_event_ids().len();
+
+        // The host still signs real Nostr operations, but declines the new proof.
+        refuse_proof.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_admin_leave_refusal(client.leave_group(&group_id).await);
+        assert_eq!(
+            proof_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before + 1
+        );
+        assert_eq!(relay.published_event_ids().len(), publications_before + 1);
+        assert_failed_leave_replacement_retains_owner_and_compensation(
+            &app,
+            &client,
+            &account.label,
+            &group_id,
+            &registration.registration,
+        )
+        .await;
+        assert_eq!(
+            proof_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before + 1
+        );
+        assert_eq!(
+            storage.account_device_signer(&identity).unwrap().unwrap(),
+            binding
+        );
+        drop(client);
+        assert!(matches!(
+            app.client(&account.label).await,
+            Err(AppError::ExternalSignerRejected)
+        ));
+        assert!(
+            !app.account_session_owners
+                .lock()
+                .unwrap()
+                .contains(&account.label)
+        );
+        assert_eq!(
+            proof_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before + 2
+        );
+        assert_eq!(
+            app.pending_push_registration_shares(
+                &account.label,
+                &registration.registration.token_fingerprint,
+                registration.registration.updated_at_ms,
+            )
+            .unwrap(),
+            vec![hex::encode(group_id.as_slice())]
+        );
+
+        refuse_proof.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut reopened = app.client(&account.label).await.unwrap();
+        assert!(!reopened.runtime.session().is_closed());
+        assert_eq!(reopened.runtime.session().self_id(), identity);
+        assert_eq!(
+            storage.account_device_signer(&identity).unwrap().unwrap(),
+            binding
+        );
+        reopened.share_push_registration().await.unwrap();
+        assert!(
+            app.pending_push_registration_shares(
+                &account.label,
+                &registration.registration.token_fingerprint,
+                registration.registration.updated_at_ms,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            app.group_push_tokens(&account.label, &hex::encode(group_id.as_slice()))
+                .unwrap()
+                .len(),
+            1
+        );
+    });
+}
+
+#[test]
+fn failed_leave_target_hydration_quarantine_keeps_compensation_closed_and_owned() {
+    run_composed_app_runtime_test("failed-leave-target-quarantine", || async {
+        let (_dir, relay, app, mut client, group_id, registration) =
+            failed_leave_compensation_fixture(false).await;
+        let label = client.state.label.clone();
+        let connection = failed_leave_fixture_sql_connection(&app, &label);
+        let original: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM cgka_groups WHERE id = ?1",
+                [group_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut corrupted: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        corrupted["protocol_profile"] =
+            serde_json::to_value(cgka_traits::group::ProtocolProfile::Legacy).unwrap();
+        let corrupted = serde_json::to_vec(&corrupted).unwrap();
+        assert!(corrupted != original);
+        let publications_before = relay.published_event_ids().len();
+        relay.block_next_publish();
+        let result = {
+            let leave = client.leave_group(&group_id);
+            tokio::pin!(leave);
+            tokio::select! {
+                _ = &mut leave => panic!("leave must await the held real removal publication"),
+                blocked = tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish()) => blocked.unwrap(),
+            }
+            assert_eq!(
+                app.pending_push_registration_removals(&label)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            // Deliberately corrupt only this synthetic row after removal was prepared.
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE cgka_groups SET record = ?1 WHERE id = ?2",
+                        rusqlite::params![&corrupted, group_id.as_slice()],
+                    )
+                    .unwrap(),
+                1
+            );
+            relay.release_publish();
+            leave.await
+        };
+        assert_admin_leave_refusal(result);
+        assert_eq!(relay.published_event_ids().len(), publications_before + 1);
+        let stored: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM cgka_groups WHERE id = ?1",
+                [group_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored == corrupted);
+        assert_failed_leave_replacement_retains_owner_and_compensation(
+            &app,
+            &client,
+            &label,
+            &group_id,
+            &registration,
+        )
+        .await;
+        drop(client);
+        let quarantined = app.client(&label).await.unwrap();
+        assert_eq!(
+            quarantined.quarantined_groups().unwrap(),
+            vec![AppQuarantinedGroup {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                reason: AppGroupHydrationQuarantineReason::MemberValidationFailed,
+            }]
+        );
+        assert_eq!(
+            app.pending_push_registration_shares(
+                &label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms,
+            )
+            .unwrap(),
+            vec![hex::encode(group_id.as_slice())]
+        );
+        assert_eq!(relay.published_event_ids().len(), publications_before + 1);
+        drop(quarantined);
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE cgka_groups SET record = ?1 WHERE id = ?2",
+                    rusqlite::params![&original, group_id.as_slice()],
+                )
+                .unwrap(),
+            1
+        );
+        let restored: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM cgka_groups WHERE id = ?1",
+                [group_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(restored == original);
+        let mut reopened = app.client(&label).await.unwrap();
+        assert!(reopened.quarantined_groups().unwrap().is_empty());
+        reopened.share_push_registration().await.unwrap();
+        assert!(
+            app.pending_push_registration_shares(
+                &label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            app.group_push_tokens(&label, &hex::encode(group_id.as_slice()))
+                .unwrap()
+                .len(),
+            1
+        );
+    });
 }
 
 #[test]
@@ -11502,193 +12347,6 @@ fn notification_settings_default_local_notifications_on_for_new_account() {
     assert_eq!(settings.account_id_hex, account.account_id_hex);
     assert!(settings.local_notifications_enabled);
     assert!(!settings.native_push_enabled);
-}
-
-#[test]
-fn legacy_account_projection_imports_once_into_account_storage() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    let account = home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let keys = app.account_home().load_signing_keys("alice").unwrap();
-    let legacy_path = app.legacy_account_projection_path("alice");
-    let legacy_key = app
-        .sqlcipher_key(
-            "alice",
-            &keys,
-            &legacy_path,
-            SqlcipherDatabaseKind::AccountProjection,
-        )
-        .unwrap();
-    let mut legacy = LegacyAccountProjectionDb::open(legacy_path.clone(), &legacy_key).unwrap();
-    let group = AppGroupRecord::new(
-        "aa".to_owned(),
-        AppGroupNostrRoutingComponent::new(
-            NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
-        )
-        .unwrap(),
-        "legacy".to_owned(),
-        String::new(),
-        AppGroupImageInput::default(),
-        AppGroupAdminPolicyComponent::new(Vec::new()),
-        AppGroupMessageRetentionComponent::disabled(),
-    );
-    legacy
-        .save_state(&AccountState {
-            label: "alice".to_owned(),
-            seen_events: vec!["seen".to_owned()],
-            last_transport_timestamp: Some(1_700_000_100),
-            groups: vec![group],
-        })
-        .unwrap();
-    legacy
-        .record_message(&AppMessageProjection {
-            authority: None,
-            message_id_hex: "legacy-message".to_owned(),
-            source_message_id_hex: None,
-            direction: "received".to_owned(),
-            group_id_hex: "aa".to_owned(),
-            sender: account.account_id_hex.clone(),
-            plaintext: "from legacy".to_owned(),
-            kind: 9,
-            tags: Vec::new(),
-            source_epoch: None,
-            retention: None,
-            recorded_at: Some(1_700_000_101),
-            origin_commit_id: None,
-            moderation_grant: false,
-        })
-        .unwrap();
-    legacy
-        .set_native_push_enabled("alice", &account.account_id_hex, true)
-        .unwrap();
-    legacy
-        .set_local_notifications_enabled("alice", &account.account_id_hex, false)
-        .unwrap();
-    legacy
-        .upsert_push_registration(
-            PushRegistration {
-                account_ref: "alice".to_owned(),
-                account_id_hex: account.account_id_hex.clone(),
-                platform: PushPlatform::Apns,
-                token_fingerprint: "fingerprint".to_owned(),
-                server_pubkey_hex: "bb".repeat(32),
-                relay_hint: Some("wss://relay.example".to_owned()),
-                created_at_ms: 10,
-                updated_at_ms: 11,
-                last_shared_at_ms: None,
-            },
-            vec![1, 2, 3],
-        )
-        .unwrap();
-    legacy
-        .upsert_group_push_token(&GroupPushTokenRecord {
-            group_id_hex: "aa".to_owned(),
-            member_id_hex: account.account_id_hex.clone(),
-            leaf_index: 7,
-            platform: PushPlatform::Apns,
-            token_fingerprint: "fingerprint".to_owned(),
-            server_pubkey_hex: "bb".repeat(32),
-            relay_hint: None,
-            encrypted_token: vec![9, 8, 7],
-            owner_ts: 0,
-            owner_sig: String::new(),
-            updated_at_ms: 12,
-        })
-        .unwrap();
-
-    let groups = app.groups("alice").unwrap();
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].profile.name, "legacy");
-    let messages = app.messages("alice").unwrap();
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].plaintext, "from legacy");
-    let settings = app.notification_settings("alice").unwrap();
-    assert!(!settings.local_notifications_enabled);
-    assert!(settings.native_push_enabled);
-    assert!(app.push_registration("alice").unwrap().is_some());
-    assert_eq!(app.group_push_tokens("alice", "aa").unwrap().len(), 1);
-
-    legacy
-        .record_message(&AppMessageProjection {
-            authority: None,
-            message_id_hex: "post-marker".to_owned(),
-            source_message_id_hex: None,
-            direction: "received".to_owned(),
-            group_id_hex: "aa".to_owned(),
-            sender: account.account_id_hex,
-            plaintext: "should stay legacy-only".to_owned(),
-            kind: 9,
-            tags: Vec::new(),
-            source_epoch: None,
-            retention: None,
-            recorded_at: Some(1_700_000_102),
-            origin_commit_id: None,
-            moderation_grant: false,
-        })
-        .unwrap();
-    assert_eq!(app.messages("alice").unwrap().len(), 1);
-}
-
-#[test]
-fn legacy_account_projection_clamps_poisoned_transport_cursor_on_import() {
-    // mdk#182 end-to-end: a pre-clamp-era legacy account projection can carry a
-    // transport cursor poisoned far above `now + skew`. The one-shot import
-    // (`migrate_legacy_account_projection_if_needed`) writes that legacy state
-    // into a brand-new account store through `save_account_projection_state`,
-    // which must clamp the adopted cursor to `now + skew` instead of persisting
-    // the poison. The storage-layer twin
-    // (`account_projection_state_clamps_poisoned_snapshot_into_fresh_store`)
-    // covers the same save arm directly; this test drives the real migration.
-    let now_secs = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let keys = app.account_home().load_signing_keys("alice").unwrap();
-    let legacy_path = app.legacy_account_projection_path("alice");
-    let legacy_key = app
-        .sqlcipher_key(
-            "alice",
-            &keys,
-            &legacy_path,
-            SqlcipherDatabaseKind::AccountProjection,
-        )
-        .unwrap();
-    let mut legacy = LegacyAccountProjectionDb::open(legacy_path.clone(), &legacy_key).unwrap();
-
-    let now_before = now_secs();
-    let poisoned = now_before + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
-    legacy
-        .save_state(&AccountState {
-            label: "alice".to_owned(),
-            seen_events: Vec::new(),
-            last_transport_timestamp: Some(poisoned),
-            groups: Vec::new(),
-        })
-        .unwrap();
-
-    // First account access runs the one-shot legacy import.
-    app.groups("alice").unwrap();
-    let now_after = now_secs();
-
-    let skew = TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs();
-    let cursor = app
-        .account_storage("alice")
-        .unwrap()
-        .load_account_projection_state("alice", MAX_SEEN_EVENT_IDS)
-        .unwrap()
-        .last_transport_timestamp
-        .expect("imported cursor must survive the migration save");
-    assert!(
-        (now_before + skew..=now_after + skew).contains(&cursor),
-        "legacy import must clamp a poisoned transport cursor to now + skew, got {cursor}"
-    );
 }
 
 /// Reproduce repeated overflow verdicts at the account queue boundary. These are
@@ -19882,127 +20540,6 @@ fn close_storage_waits_for_an_open_that_is_already_in_flight() {
     drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
 }
 
-/// Legacy account projection import opens a short-lived raw SQLite connection
-/// after the cached account storage has already been returned. That entire
-/// window must count as an in-flight storage open; otherwise terminal close can
-/// return and release the root lease immediately before the migration reopens
-/// the legacy database in the shared container.
-#[test]
-fn close_storage_waits_for_legacy_projection_import() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
-    let home = AccountHome::open(root);
-    home.create_account("legacy-racing").unwrap();
-    let app = MarmotApp::try_with_relays_and_account_home_and_config(
-        root,
-        Vec::new(),
-        AccountHome::open(root),
-        MarmotAppConfig::default(),
-    )
-    .unwrap();
-
-    let keys = app
-        .account_home()
-        .load_signing_keys("legacy-racing")
-        .unwrap();
-    let legacy_path = app.legacy_account_projection_path("legacy-racing");
-    let legacy_key = app
-        .sqlcipher_key(
-            "legacy-racing",
-            &keys,
-            &legacy_path,
-            SqlcipherDatabaseKind::AccountProjection,
-        )
-        .unwrap();
-    let receipt = hex::encode([42_u8; 32]);
-    {
-        let mut legacy = LegacyAccountProjectionDb::open(legacy_path, &legacy_key).unwrap();
-        let mut state = legacy.load_state("legacy-racing").unwrap();
-        state.seen_events.push(receipt.clone());
-        legacy.save_state(&state).unwrap();
-    }
-
-    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let hook_entered = std::sync::Arc::clone(&entered);
-    let hook_release = std::sync::Arc::clone(&release);
-    app.set_legacy_projection_open_hook_for_test(std::sync::Arc::new(move || {
-        hook_entered.wait();
-        hook_release.wait();
-    }));
-
-    let migrating_app = app.clone();
-    // Exercise exactly the guarded import. The broader ensure_account_state
-    // performs another storage access after this guard drops; terminal close
-    // may legitimately win that later access and return StorageError::Closed.
-    let migration = std::thread::spawn(move || {
-        migrating_app.migrate_legacy_account_projection_if_needed("legacy-racing")
-    });
-    entered.wait();
-
-    let closing_app = app.clone();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-    let closer = std::thread::spawn(move || {
-        // Signal from inside the thread, immediately before the call. Without
-        // this the timeout assertion below would also pass if the thread had
-        // simply not been scheduled yet, which proves nothing about the import
-        // window holding the close off.
-        started_tx.send(()).unwrap();
-        let result = closing_app.close_storage();
-        closed_tx.send(()).unwrap();
-        result
-    });
-    // Do not assert while either thread is outstanding. Even a broken close
-    // must release the importer and join both SQLite users before unwinding.
-    let close_started = started_rx.recv();
-    let close_was_blocked = matches!(
-        closed_rx.recv_timeout(std::time::Duration::from_millis(250)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-    );
-    let lease_was_held = matches!(
-        MarmotRootRuntimeLease::try_acquire(root),
-        Err(AppError::RuntimeBusy)
-    );
-
-    release.wait();
-    let migration_result = migration.join();
-    let close_result = closer.join();
-    close_started.expect("the closing thread should reach close_storage");
-    assert!(
-        close_was_blocked,
-        "terminal close must wait for the legacy database import window",
-    );
-    assert!(lease_was_held, "the root lease must cover the import");
-    migration_result
-        .unwrap()
-        .expect("the guarded import must finish");
-    close_result
-        .unwrap()
-        .expect("close must finish after import");
-    assert!(app.storage_is_closed());
-    drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
-
-    // Closing waits for the entire import, including its durable completion
-    // marker. Verify both the imported data and the marker after encrypted reopen.
-    let reopened =
-        MarmotApp::with_relays_and_account_home(root, Vec::new(), AccountHome::open(root));
-    let storage = reopened.account_storage("legacy-racing").unwrap();
-    assert!(
-        storage
-            .account_import_marker(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)
-            .unwrap()
-    );
-    assert_eq!(
-        storage
-            .load_account_projection_state("legacy-racing", MAX_SEEN_EVENT_IDS)
-            .unwrap()
-            .seen_events,
-        vec![receipt]
-    );
-    reopened.close_storage().unwrap();
-}
-
 /// Concurrent `close_storage` callers must serialize: no caller may return
 /// while another is still closing connections, or the host gets a lock-free
 /// answer that is not yet true.
@@ -21441,125 +21978,12 @@ fn reconcile_repairs_stale_three_member_count_on_two_member_direct() {
     );
 }
 
-async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() {
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    home.create_account("bob").unwrap();
-    let bob_id = home.account("bob").unwrap().account_id_hex;
-    let app =
-        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
-    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
-    let group_id_hex;
-    {
-        let mut bob = app.client("bob").await.unwrap();
-        bob.publish_key_package().await.unwrap();
-        let mut alice = app.client("alice").await.unwrap();
-        let group_id = alice.create_group("", &[bob_id.as_str()]).await.unwrap();
-        group_id_hex = hex::encode(group_id.as_slice());
-    }
-
-    let mut state = app.load_state("alice").unwrap();
-    let torn = state
-        .groups
-        .iter_mut()
-        .find(|group| group.group_id_hex == group_id_hex)
-        .expect("direct group");
-    torn.member_count = Some(3);
-    torn.direct_member_ids_hex = None;
-    app.save_state(&state).unwrap();
-    app.reset_direct_conversation_members_backfill_for_test("alice")
-        .unwrap();
-
-    {
-        let _alice = app.client("alice").await.unwrap();
-    }
-    assert!(
-        app.account_import_marker("alice", crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER)
-            .unwrap(),
-        "3-to-2 tear must let the peer-index backfill complete"
-    );
-
-    let runtime = MarmotAppRuntime::new(app.clone());
-    runtime.start().await.unwrap();
-    let found = runtime
-        .existing_direct_conversation("alice", &bob_id)
-        .await
-        .expect("lookup after 3-to-2 repair")
-        .expect("reusable direct must be found");
-    assert_eq!(found.group_id_hex, group_id_hex);
-    runtime.shutdown().await;
-}
-
 #[test]
 fn reconcile_repairs_stale_two_member_count_on_three_member_group() {
     run_composed_app_runtime_test(
         "reconcile-stale-two-count",
         reconcile_repairs_stale_two_member_count_on_three_member_group_body,
     );
-}
-
-async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    home.create_account("bob").unwrap();
-    home.create_account("carol").unwrap();
-    let alice_id = home.account("alice").unwrap().account_id_hex;
-    let bob_id = home.account("bob").unwrap().account_id_hex;
-    let carol_id = home.account("carol").unwrap().account_id_hex;
-    let app =
-        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
-    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
-    remember_test_member_inbox(&app, &carol_id, "wss://relay.example");
-    let group_id_hex;
-    {
-        let mut bob = app.client("bob").await.unwrap();
-        bob.publish_key_package().await.unwrap();
-        let mut carol = app.client("carol").await.unwrap();
-        carol.publish_key_package().await.unwrap();
-        let mut alice = app.client("alice").await.unwrap();
-        let group_id = alice
-            .create_group("", &[bob_id.as_str(), carol_id.as_str()])
-            .await
-            .unwrap();
-        group_id_hex = hex::encode(group_id.as_slice());
-    }
-
-    let mut state = app.load_state("alice").unwrap();
-    let torn = state
-        .groups
-        .iter_mut()
-        .find(|group| group.group_id_hex == group_id_hex)
-        .expect("three-member group");
-    torn.member_count = Some(2);
-    torn.direct_member_ids_hex = Some(vec![alice_id.clone(), bob_id.clone()]);
-    app.save_state(&state).unwrap();
-    app.reset_direct_conversation_members_backfill_for_test("alice")
-        .unwrap();
-
-    {
-        let _alice = app.client("alice").await.unwrap();
-    }
-    assert!(
-        app.account_import_marker("alice", crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER)
-            .unwrap(),
-        "2-to-3 tear must not leave the peer-index backfill incomplete"
-    );
-
-    let runtime = MarmotAppRuntime::new(app.clone());
-    runtime.start().await.unwrap();
-    let found = runtime
-        .existing_direct_conversation("alice", &bob_id)
-        .await
-        .expect("lookup after 2-to-3 repair");
-    assert!(
-        found.is_none(),
-        "a three-member conversation must not be reused as a direct"
-    );
-    runtime.shutdown().await;
 }
 
 /// The storage release is the durable boundary; no engine event is delivered
@@ -22188,8 +22612,8 @@ async fn diagnostics_maintenance_reuses_failed_obligation_levels_across_ticks() 
         assert_eq!(summary.failures, 1);
         assert_eq!(client.maintenance_failed_backlog, 1);
         assert_eq!(
-            client.runtime.quarantined_group_count(),
-            client.quarantined_groups().len()
+            client.runtime.quarantined_group_count().unwrap(),
+            client.quarantined_groups().unwrap().len()
         );
     }
 }
@@ -22347,7 +22771,7 @@ fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
         storage.put_group(&damaged).unwrap();
         let mut alice = app.client("alice").await.unwrap();
         assert_eq!(
-            alice.quarantined_groups().len(),
+            alice.quarantined_groups().unwrap().len(),
             1,
             "fixture must enter real hydration quarantine"
         );
@@ -23041,4 +23465,171 @@ fn group_create_relay_options_preserve_defaults_and_enforce_host_safety() {
             Err(AppError::InvalidNostrRouting(_))
         ));
     }
+}
+
+async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() {
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    let group_id_hex;
+    {
+        let mut bob = app.client("bob").await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        let group_id = alice.create_group("", &[bob_id.as_str()]).await.unwrap();
+        group_id_hex = hex::encode(group_id.as_slice());
+    }
+
+    let mut state = app.load_state("alice").unwrap();
+    let torn = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .expect("direct group");
+    torn.member_count = Some(3);
+    torn.direct_member_ids_hex = None;
+    app.save_state(&state).unwrap();
+
+    {
+        let _alice = app.client("alice").await.unwrap();
+    }
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let found = runtime
+        .existing_direct_conversation("alice", &bob_id)
+        .await
+        .expect("lookup after 3-to-2 repair")
+        .expect("reusable direct must be found");
+    assert_eq!(found.group_id_hex, group_id_hex);
+    runtime.shutdown().await;
+}
+
+async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    home.create_account("carol").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+    let carol_id = home.account("carol").unwrap().account_id_hex;
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    remember_test_member_inbox(&app, &carol_id, "wss://relay.example");
+    let group_id_hex;
+    {
+        let mut bob = app.client("bob").await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let mut carol = app.client("carol").await.unwrap();
+        carol.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        let group_id = alice
+            .create_group("", &[bob_id.as_str(), carol_id.as_str()])
+            .await
+            .unwrap();
+        group_id_hex = hex::encode(group_id.as_slice());
+    }
+
+    let mut state = app.load_state("alice").unwrap();
+    let torn = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .expect("three-member group");
+    torn.member_count = Some(2);
+    torn.direct_member_ids_hex = Some(vec![alice_id.clone(), bob_id.clone()]);
+    app.save_state(&state).unwrap();
+
+    {
+        let _alice = app.client("alice").await.unwrap();
+    }
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let found = runtime
+        .existing_direct_conversation("alice", &bob_id)
+        .await
+        .expect("lookup after 2-to-3 repair");
+    assert!(
+        found.is_none(),
+        "a three-member conversation must not be reused as a direct"
+    );
+    runtime.shutdown().await;
+}
+
+#[test]
+fn failed_leave_local_reconciliation_error_keeps_compensation_closed_and_owned() {
+    run_composed_app_runtime_test("failed-leave-reconciliation-error", || async {
+        let (_dir, relay, app, mut client, group_id, registration) =
+            failed_leave_compensation_fixture(false).await;
+        let label = client.state.label.clone();
+        let connection = failed_leave_fixture_sql_connection(&app, &label);
+        // A genuine projection write fails; Session open/hydration still use normal code.
+        connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_failed_leave_reconciliation
+             BEFORE UPDATE ON account_groups
+             BEGIN SELECT RAISE(ABORT, 'synthetic local reconciliation refusal'); END;",
+            )
+            .unwrap();
+        let publications_before = relay.published_event_ids().len();
+        assert_admin_leave_refusal(client.leave_group(&group_id).await);
+        assert_eq!(relay.published_event_ids().len(), publications_before + 1);
+        assert_failed_leave_replacement_retains_owner_and_compensation(
+            &app,
+            &client,
+            &label,
+            &group_id,
+            &registration,
+        )
+        .await;
+        drop(client);
+        assert!(matches!(
+            app.client(&label).await,
+            Err(AppError::Session(cgka_session::SessionError::Storage(
+                cgka_traits::storage::StorageError::Backend(message)
+            ))) if message == "account schema shape differs from the current baseline"
+        ));
+        assert!(!app.account_session_owners.lock().unwrap().contains(&label));
+        assert_eq!(
+            app.pending_push_registration_shares(
+                &label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms,
+            )
+            .unwrap(),
+            vec![hex::encode(group_id.as_slice())]
+        );
+
+        connection
+            .execute_batch("DROP TRIGGER refuse_failed_leave_reconciliation")
+            .unwrap();
+        let mut reopened = app.client(&label).await.unwrap();
+        assert!(!reopened.runtime.session().is_closed());
+        reopened.share_push_registration().await.unwrap();
+        assert!(
+            app.pending_push_registration_shares(
+                &label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            app.group_push_tokens(&label, &hex::encode(group_id.as_slice()))
+                .unwrap()
+                .len(),
+            1
+        );
+    });
 }

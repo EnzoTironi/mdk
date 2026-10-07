@@ -9,6 +9,10 @@ use crate::types::{EpochId, GroupId, MemberId};
 /// Errors returned by every [`crate::engine::CgkaEngine`] method.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error("session is closed; reopen after local preparation rollback")]
+    SessionClosed,
+    #[error("local preparation suspended")]
+    LocalPreparationPending,
     #[error("queued intent artifact authority unavailable")]
     QueuedIntentRecoveryFailed,
     #[error("queued artifact regeneration is not permitted")]
@@ -255,6 +259,8 @@ impl EngineError {
     #[must_use]
     pub fn privacy_safe_kind(&self) -> &'static str {
         match self {
+            EngineError::SessionClosed => "session_closed",
+            EngineError::LocalPreparationPending => "local_preparation_pending",
             EngineError::QueuedIntentRecoveryFailed => "queued_intent_recovery_failed",
             EngineError::QueuedIntentReissueRefused => "queued_intent_reissue_refused",
             EngineError::UnknownGroup(_) => "unknown_group",

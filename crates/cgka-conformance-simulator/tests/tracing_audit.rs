@@ -168,6 +168,9 @@ fn production_library_sources_do_not_write_direct_output() {
             let Ok(contents) = fs::read_to_string(&file) else {
                 continue;
             };
+            if is_test_only_source(&contents) {
+                continue;
+            }
 
             for (index, line) in contents.lines().enumerate() {
                 for output_macro in DIRECT_OUTPUT_MACROS {
@@ -188,6 +191,16 @@ fn production_library_sources_do_not_write_direct_output() {
         "direct output audit failed:\n{}",
         failures.join("\n")
     );
+}
+
+// Only an explicit leading whole-file compiler gate establishes test-only scope.
+// Item gates, mixed feature gates and attribute-like strings remain audited.
+fn is_test_only_source(contents: &str) -> bool {
+    contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("//"))
+        == Some("#![cfg(test)]")
 }
 
 fn is_feature_gated_test_support(path: &Path) -> bool {
@@ -381,4 +394,24 @@ debug = 1
             "integrations/opencode/marmot".to_owned()
         ]
     );
+}
+
+#[test]
+fn test_only_source_gate_requires_a_leading_whole_file_compiler_attribute() {
+    assert!(is_test_only_source(
+        "//! Test witness.\n\n#![cfg(test)]\neprintln!(\"fixture\");\n"
+    ));
+    for source in [
+        "// #![cfg(test)]\neprintln!(\"production\");\n",
+        "const TEXT: &str = \"#![cfg(test)]\";\neprintln!(\"production\");\n",
+        "#[cfg(test)]\nmod tests {}\neprintln!(\"production\");\n",
+        "#![cfg(any(test, feature = \"diagnostics\"))]\neprintln!(\"production\");\n",
+        "/*\n#![cfg(test)]\n*/\neprintln!(\"production\");\n",
+        "fn production() {}\n#![cfg(test)]\n",
+    ] {
+        assert!(
+            !is_test_only_source(source),
+            "must remain audited: {source}"
+        );
+    }
 }

@@ -2422,6 +2422,8 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         // bound (ledger E9), the same class of observation as a storage failure.
         EngineError::Backend(_)
         | EngineError::Storage(_)
+        | EngineError::SessionClosed
+        | EngineError::LocalPreparationPending
         | EngineError::QueuedIntentRecoveryFailed
         | EngineError::QueuedIntentReissueRefused
         | EngineError::QueuedOutboundAtCapacity { .. } => SubjectFailureCategory::Resource,
@@ -2534,6 +2536,8 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::UnknownPending => "unknown_pending",
+        EngineError::SessionClosed => "session_closed",
+        EngineError::LocalPreparationPending => "local_preparation_pending",
         EngineError::QueuedIntentRecoveryFailed => "queued_intent_recovery_failed",
         EngineError::QueuedIntentReissueRefused => "queued_intent_reissue_refused",
         EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",

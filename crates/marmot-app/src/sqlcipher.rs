@@ -43,8 +43,8 @@ const SQLCIPHER_MIGRATION_MARKER_SUFFIX: &str = ".salt-migrating";
 const SQLCIPHER_SALT_LEN: usize = 32;
 const SQLCIPHER_KEY_LEN: usize = 32;
 
-/// Bound on the in-process v2-open verdict cache. Three databases per account
-/// (session, account projection, directory cache), so this covers ~85 accounts
+/// Bound on the in-process v2-open verdict cache. Two databases per account
+/// (session and directory cache), so this covers ~128 accounts
 /// per process; overflow evicts oldest-first and an evicted entry simply pays
 /// one recovery probe on its next open. Tracked per the long-lived-state
 /// discipline in `docs/marmot-architecture/runtime-state-bounds.md`.
@@ -59,15 +59,15 @@ static SQLCIPHER_MIGRATION_PROBE_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 /// Process-local cache of probe verdicts: database file -> salt whose derived
 /// v2 key was *observed* to open that database earlier in this process (a
-/// successful probe, or a legacy -> v2 rekey this process performed). A verdict
+/// successful probe, normal account-storage open, or legacy -> v2 rekey). A verdict
 /// lets the healthy steady-state path skip the recovery probe — a full second
 /// keyed open that pays the same 256k-iteration passphrase KDF as the real open
 /// (mdk#1439).
 ///
 /// Safety rules:
 /// - A verdict is recorded only after the database at that path was observed
-///   opening under the v2 key derived from that exact salt. Never on the
-///   fresh-database path, where no database file has been observed yet.
+///   opening under the v2 key derived from that exact salt. Never while only
+///   preparing a fresh key, before any database file has been observed.
 /// - A durable migration marker always forces the probe, verdict or not: the
 ///   marker means a migration may have been interrupted, and those crash
 ///   windows must keep the mdk#568 self-heal.
@@ -148,6 +148,13 @@ fn sqlcipher_v2_verdict_record(db_path: &Path, salt: &[u8; SQLCIPHER_SALT_LEN]) 
     lock_sqlcipher_v2_verdicts().record(sqlcipher_verdict_cache_key(db_path), *salt);
 }
 
+pub(super) fn record_account_storage_v2_open(
+    database: &DatabaseOpenGuard<'_>,
+    selected_salt: &[u8; SQLCIPHER_SALT_LEN],
+) {
+    sqlcipher_v2_verdict_record(database.path, selected_salt);
+}
+
 fn sqlcipher_v2_verdict_invalidate(db_path: &Path) {
     lock_sqlcipher_v2_verdicts().invalidate(&sqlcipher_verdict_cache_key(db_path));
 }
@@ -183,7 +190,6 @@ fn probe_attempts_for_test(db_path: &Path) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SqlcipherDatabaseKind {
     Session,
-    AccountProjection,
     DirectoryCache,
 }
 
@@ -191,14 +197,13 @@ impl SqlcipherDatabaseKind {
     fn hkdf_info_label(self) -> &'static [u8] {
         match self {
             Self::Session => b"marmot-app/session-sqlcipher-key/v2",
-            Self::AccountProjection => b"marmot-app/account-projection-sqlcipher-key/v2",
             Self::DirectoryCache => b"marmot-app/directory-cache-sqlcipher-key/v2",
         }
     }
 
     fn legacy_hash_label(self) -> &'static [u8] {
         match self {
-            Self::Session | Self::AccountProjection => b"marmot-app-sqlcipher-key-v1",
+            Self::Session => b"marmot-app-sqlcipher-key-v1",
             Self::DirectoryCache => b"marmot-app-directory-cache-sqlcipher-key-v1",
         }
     }
@@ -211,12 +216,11 @@ impl MarmotApp {
         keys: &nostr::prelude::Keys,
         database: &DatabaseOpenGuard<'_>,
         kind: SqlcipherDatabaseKind,
-    ) -> Result<SqlCipherKey, AppError> {
+    ) -> Result<(SqlCipherKey, [u8; SQLCIPHER_SALT_LEN]), AppError> {
         let db_path = database.path;
         let salt = self.sqlcipher_salt(label, keys, db_path, kind)?;
-        Ok(SqlCipherKey::new(derive_sqlcipher_key_material(
-            label, keys, &salt, kind,
-        )?)?)
+        let key = SqlCipherKey::new(derive_sqlcipher_key_material(label, keys, &salt, kind)?)?;
+        Ok((key, salt))
     }
 
     pub(crate) fn external_sqlcipher_key(
@@ -248,6 +252,7 @@ impl MarmotApp {
     ) -> Result<SqlCipherKey, AppError> {
         let lock = database_open_lock(path);
         self.sqlcipher_key_locked(label, keys, &lock.lock(), kind)
+            .map(|(key, _)| key)
     }
 
     fn external_sqlcipher_secret(
@@ -680,7 +685,7 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
         let session_path = app.account_dir("alice").join(SESSION_DB_FILE);
-        let projection_path = app.legacy_account_projection_path("alice");
+        let cache_path = app.account_dir("alice").join("app-cache.sqlite3");
 
         let session_key = app
             .sqlcipher_key(
@@ -698,12 +703,12 @@ mod tests {
                 SqlcipherDatabaseKind::Session,
             )
             .unwrap();
-        let projection_key = app
+        let cache_key = app
             .sqlcipher_key(
                 "alice",
                 &keys,
-                &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                &cache_path,
+                SqlcipherDatabaseKind::DirectoryCache,
             )
             .unwrap();
 
@@ -711,9 +716,9 @@ mod tests {
             session_key.as_secret_str(),
             repeated_session_key.as_secret_str()
         );
-        assert_ne!(session_key.as_secret_str(), projection_key.as_secret_str());
+        assert_ne!(session_key.as_secret_str(), cache_key.as_secret_str());
         assert!(sqlcipher_salt_path(&session_path).exists());
-        assert!(sqlcipher_salt_path(&projection_path).exists());
+        assert!(sqlcipher_salt_path(&cache_path).exists());
     }
 
     #[test]
@@ -768,12 +773,12 @@ mod tests {
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let projection_path = app.legacy_account_projection_path("alice");
+        let projection_path = app.account_storage_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
         let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
             "alice",
             &keys,
-            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::Session,
         ))
         .unwrap();
         {
@@ -792,7 +797,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
 
@@ -835,13 +840,13 @@ mod tests {
             configured
         };
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let projection_path = app.legacy_account_projection_path("alice");
+        let projection_path = app.account_storage_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
 
         let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
             "alice",
             &keys,
-            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::Session,
         ))
         .unwrap();
         {
@@ -869,7 +874,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
 
@@ -906,14 +911,14 @@ mod tests {
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let projection_path = app.legacy_account_projection_path("alice");
+        let projection_path = app.account_storage_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
 
         // Create a legacy DB and run a normal migration to a v2 key.
         let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
             "alice",
             &keys,
-            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::Session,
         ))
         .unwrap();
         {
@@ -931,7 +936,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
 
@@ -945,7 +950,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
 
@@ -974,13 +979,13 @@ mod tests {
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let projection_path = app.legacy_account_projection_path("alice");
+        let projection_path = app.account_storage_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
 
         let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
             "alice",
             &keys,
-            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::Session,
         ))
         .unwrap();
         {
@@ -1007,7 +1012,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
 
@@ -1104,13 +1109,13 @@ mod tests {
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let projection_path = app.legacy_account_projection_path("alice");
+        let projection_path = app.account_storage_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
         create_healthy_v2_database(
             "alice",
             &keys,
             &projection_path,
-            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::Session,
         );
 
         let first_key = app
@@ -1118,7 +1123,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
         assert_eq!(
@@ -1133,7 +1138,7 @@ mod tests {
                     "alice",
                     &keys,
                     &projection_path,
-                    SqlcipherDatabaseKind::AccountProjection,
+                    SqlcipherDatabaseKind::Session,
                 )
                 .unwrap();
             assert_eq!(key.as_secret_str(), first_key.as_secret_str());
@@ -1156,13 +1161,13 @@ mod tests {
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let projection_path = app.legacy_account_projection_path("alice");
+        let projection_path = app.account_storage_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
         create_healthy_v2_database(
             "alice",
             &keys,
             &projection_path,
-            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::Session,
         );
 
         let _ = app
@@ -1170,7 +1175,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
         assert_eq!(probe_attempts_for_test(&projection_path), 1);
@@ -1184,7 +1189,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
         assert_eq!(
@@ -1200,7 +1205,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
         assert_eq!(probe_attempts_for_test(&projection_path), 2);
@@ -1218,13 +1223,13 @@ mod tests {
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let projection_path = app.legacy_account_projection_path("alice");
+        let projection_path = app.account_storage_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
         create_healthy_v2_database(
             "alice",
             &keys,
             &projection_path,
-            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::Session,
         );
 
         let _ = app
@@ -1232,7 +1237,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
         assert_eq!(probe_attempts_for_test(&projection_path), 1);
@@ -1245,7 +1250,7 @@ mod tests {
         let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
             "alice",
             &keys,
-            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::Session,
         ))
         .unwrap();
         {
@@ -1264,7 +1269,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
         assert_eq!(
@@ -1292,7 +1297,7 @@ mod tests {
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let projection_path = app.legacy_account_projection_path("alice");
+        let projection_path = app.account_storage_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
         let mut salt = [0_u8; SQLCIPHER_SALT_LEN];
         OsRng.fill_bytes(&mut salt);
@@ -1303,7 +1308,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
         assert_eq!(
@@ -1315,7 +1320,7 @@ mod tests {
         let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
             "alice",
             &keys,
-            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::Session,
         ))
         .unwrap();
         {
@@ -1334,7 +1339,7 @@ mod tests {
                 "alice",
                 &keys,
                 &projection_path,
-                SqlcipherDatabaseKind::AccountProjection,
+                SqlcipherDatabaseKind::Session,
             )
             .unwrap();
         assert_eq!(
@@ -1349,6 +1354,34 @@ mod tests {
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "appeared");
+    }
+
+    #[tokio::test]
+    async fn fresh_account_storage_open_avoids_a_second_recovery_probe_in_the_normal_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(
+            std::sync::Arc::new(crate::tests::ScriptedPushRelayClient::default()),
+        );
+        let path = app.account_storage_path("alice");
+        assert!(!path.exists());
+        app.ensure_account_state("alice").unwrap();
+        assert!(path.is_file());
+        assert_eq!(app.load_state("alice").unwrap().label, "alice");
+        assert_eq!(probe_attempts_for_test(&path), 0);
+        let client = app.client("alice").await.unwrap();
+        assert!(
+            !client.runtime.session().is_closed(),
+            "the ordinary client must actually open its encrypted Session"
+        );
+        assert_eq!(
+            probe_attempts_for_test(&path),
+            0,
+            "the successful real storage open already verified the selected local v2 key"
+        );
+        drop(client);
+        app.close_storage().unwrap();
     }
 
     #[test]
