@@ -73,3 +73,9 @@ pub enum AccountError {
     #[error("transport delivery was addressed to a different account")]
     WrongAccountDelivery,
 }
+
+impl From<cgka_traits::storage::StorageError> for AccountError {
+    fn from(error: cgka_traits::storage::StorageError) -> Self {
+        Self::Session(SessionError::Storage(error))
+    }
+}

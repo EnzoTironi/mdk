@@ -86,12 +86,18 @@ async fn comparison_shutdown_reaps_task_and_releases_credit() {
     run_held_comparison(true, HeldCaller::None, false).await;
 }
 
+#[tokio::test]
+async fn failed_leave_compensation_preserves_held_sdk_comparison_authority() {
+    run_held_comparison(false, HeldCaller::FailedLeave, false).await;
+}
+
 /// The recovery caller queued while the comparison is held.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HeldCaller {
     None,
     CatchUp,
     Repair,
+    FailedLeave,
 }
 
 async fn run_held_comparison(
@@ -114,7 +120,19 @@ async fn run_held_comparison(
     let url = relay.url().await.to_string();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let alice = home.create_account("alice").unwrap();
+    let alice = if held_caller == HeldCaller::FailedLeave {
+        let account = home.create_nostr_account().unwrap();
+        assert_eq!(
+            home.account(&crate::ids::npub_for_account_id_lossy(
+                &account.account_id_hex,
+            ))
+            .unwrap(),
+            account
+        );
+        account
+    } else {
+        home.create_account("alice").unwrap()
+    };
     let bob = home.create_account("bob").unwrap();
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
@@ -156,6 +174,30 @@ async fn run_held_comparison(
     .await
     .expect("Bob joined before the target message");
 
+    let registration = if held_caller == HeldCaller::FailedLeave {
+        runtime
+            .set_native_push_enabled(&alice.label, true)
+            .await
+            .unwrap();
+        let registration = runtime
+            .upsert_push_registration(
+                &alice.label,
+                crate::PushPlatform::Fcm,
+                "opaque-token",
+                &Keys::generate().public_key().to_hex(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registration.share.status,
+            crate::PushRegistrationShareStatus::Complete
+        );
+        Some(registration.registration)
+    } else {
+        None
+    };
+
     let storage = app.account_storage(&alice.label).unwrap();
     let route: [u8; 32] = hex::decode(
         app.group(&alice.label, &hex::encode(&group))
@@ -180,6 +222,16 @@ async fn run_held_comparison(
         .await
         .unwrap();
     *gate.target.lock().unwrap() = Some(event.id.to_hex());
+    let activity = registration.as_ref().map(|_| {
+        let activity = crate::client::TestComparisonActivityWitness::default();
+        *activity.target_event_id.lock().unwrap() = Some(event.id.to_hex());
+        *runtime
+            .shared_services()
+            .comparison_activity_witness
+            .lock()
+            .unwrap() = Some((alice.label.clone(), activity.clone()));
+        activity
+    });
     assert!(
         !storage
             .retained_recovery_event(&recovery_route, &event_id, None, crate::unix_now_seconds())
@@ -244,6 +296,21 @@ async fn run_held_comparison(
                 .clone(),
         );
     }
+    let held_trace_start = runtime
+        .shared_services()
+        .comparison_test_trace
+        .lock()
+        .unwrap()
+        .len();
+    if let Some(activity) = &activity {
+        assert_eq!(
+            activity.attempt_serial.load(Ordering::SeqCst),
+            before_retry + 1
+        );
+        assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
+        assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(activity.matching_events.load(Ordering::SeqCst), 0);
+    }
     assert_eq!(
         recovery_credits::available_credits(&pool),
         recovery_credits::MAX_CONCURRENT_JOBS - 1
@@ -279,6 +346,99 @@ async fn run_held_comparison(
             .unwrap(),
         None
     );
+    if let Some(registration) = &registration {
+        let slot_before = storage.recovery_comparison().unwrap();
+        let epoch_before = runtime
+            .group_mls_state(&alice.label, &group)
+            .await
+            .unwrap()
+            .epoch;
+        let result = timeout(
+            Duration::from_secs(5),
+            runtime.leave_group(&alice.label, &group),
+        )
+        .await
+        .expect("refused leave compensates while the comparison stays held");
+        assert!(matches!(
+            result,
+            Err(AppError::Account(marmot_account::AccountError::Session(
+                cgka_session::SessionError::Engine(
+                    cgka_traits::EngineError::AdminCannotSelfRemove { .. }
+                )
+            )))
+        ));
+        assert!(
+            app.pending_push_registration_removals(&alice.label)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            app.pending_push_registration_shares(
+                &alice.label,
+                &registration.token_fingerprint,
+                registration.updated_at_ms
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            app.group_push_tokens(&alice.label, &hex::encode(&group))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            app.client(&alice.label).await,
+            Err(AppError::AccountSessionBusy)
+        ));
+        assert!(matches!(
+            app.client(&crate::ids::npub_for_account_id_lossy(
+                &alice.account_id_hex
+            ))
+            .await,
+            Err(AppError::AccountSessionBusy)
+        ));
+        assert_eq!(
+            runtime
+                .group_mls_state(&alice.label, &group)
+                .await
+                .unwrap()
+                .epoch,
+            epoch_before
+        );
+        let slot_after = storage.recovery_comparison().unwrap();
+        assert_eq!(slot_after.revision, slot_before.revision);
+        assert_eq!(slot_after.frozen_revision, slot_before.frozen_revision);
+        assert_eq!(slot_after.attempt_serial, slot_before.attempt_serial);
+        let activity = activity.as_ref().unwrap();
+        assert_eq!(
+            activity.attempt_serial.load(Ordering::SeqCst),
+            before_retry + 1
+        );
+        assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
+        assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(activity.matching_events.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            storage.recovery_retry_state().unwrap().attempt_serial,
+            before_retry + 1
+        );
+        assert_eq!(
+            recovery_credits::available_credits(&pool),
+            recovery_credits::MAX_CONCURRENT_JOBS - 1,
+            "replacement must not release the held job's actual permit"
+        );
+        assert!(storage.recovery_comparison().unwrap().pending());
+        assert!(
+            !storage
+                .retained_recovery_event(
+                    &recovery_route,
+                    &event_id,
+                    None,
+                    crate::unix_now_seconds()
+                )
+                .unwrap()
+        );
+    }
     let mut held_media = Vec::new();
     let prebarrier = if prebarrier_media {
         let accounts = runtime.accounts();
@@ -328,7 +488,7 @@ async fn run_held_comparison(
     } else {
         None
     };
-    let catch_up = if held_caller != HeldCaller::None {
+    let catch_up = if matches!(held_caller, HeldCaller::CatchUp | HeldCaller::Repair) {
         let revision = storage.recovery_comparison().unwrap().revision;
         let (respond, mut waiting) = oneshot::channel();
         let command = if held_caller == HeldCaller::CatchUp {
@@ -450,6 +610,28 @@ async fn run_held_comparison(
     } else {
         None
     };
+    // Capture after leave compensation, before the same held result is joined.
+    let refusal_before = if activity.is_some() {
+        Some((
+            cgka_traits::storage::GroupStorage::get_group(&storage, &group).unwrap(),
+            cgka_traits::storage::MessageStorage::list_messages(
+                &storage,
+                &group,
+                cgka_traits::types::EpochId(0),
+            )
+            .unwrap(),
+            storage
+                .app_messages(storage_sqlite::StoredAppMessageQuery {
+                    group_id_hex: Some(hex::encode(&group)),
+                    ..Default::default()
+                })
+                .unwrap(),
+            runtime.group_mls_state(&alice.label, &group).await.unwrap(),
+            runtime.subscribe(),
+        ))
+    } else {
+        None
+    };
     if shutdown_while_held {
         runtime.shutdown_and_close().await.unwrap();
     } else {
@@ -490,6 +672,98 @@ async fn run_held_comparison(
                 .await
                 .expect("drain follows repair")
                 .unwrap();
+        }
+        if let Some(activity) = &activity {
+            assert_eq!(
+                activity.attempt_serial.load(Ordering::SeqCst),
+                before_retry + 1
+            );
+            assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 0);
+            assert_eq!(activity.active_requests.load(Ordering::SeqCst), 0);
+            assert!(
+                activity.matching_events.load(Ordering::SeqCst) > 0,
+                "the selected attempt returned the exact held event"
+            );
+            let trace = runtime
+                .shared_services()
+                .comparison_test_trace
+                .lock()
+                .unwrap()
+                .clone();
+            let joined = &trace[held_trace_start..];
+            assert!(
+                joined.contains(&"route_events"),
+                "the worker joined the original returned network result before fencing admission"
+            );
+            assert!(
+                !joined.contains(&"task_started"),
+                "another job cannot supply the positive result witness"
+            );
+            assert!(!joined.contains(&"task_join_error"));
+            assert!(
+                storage
+                    .retained_recovery_event(
+                        &recovery_route,
+                        &event_id,
+                        None,
+                        crate::unix_now_seconds()
+                    )
+                    .unwrap(),
+                "the joined raw event is retained in transport inventory"
+            );
+            let (group_before, messages_before, app_before, mls_before, mut events) =
+                refusal_before.unwrap();
+            // The serialized read also follows runtime publication of the joined result.
+            assert_eq!(
+                runtime.group_mls_state(&alice.label, &group).await.unwrap(),
+                mls_before,
+                "the unreadable probe leaves the live MLS projection unchanged"
+            );
+            assert_eq!(
+                cgka_traits::storage::GroupStorage::get_group(&storage, &group).unwrap(),
+                group_before,
+                "the unreadable probe cannot change engine group state"
+            );
+            assert_eq!(
+                cgka_traits::storage::MessageStorage::list_messages(
+                    &storage,
+                    &group,
+                    cgka_traits::types::EpochId(0),
+                )
+                .unwrap(),
+                messages_before,
+                "the unreadable probe creates no engine message or retry row"
+            );
+            assert!(matches!(
+                cgka_traits::storage::MessageStorage::get_message(
+                    &storage,
+                    &cgka_traits::types::MessageId::new(event_id.to_vec()),
+                ),
+                Err(cgka_traits::storage::StorageError::NotFound)
+            ));
+            assert_eq!(
+                storage
+                    .app_messages(storage_sqlite::StoredAppMessageQuery {
+                        group_id_hex: Some(hex::encode(&group)),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                app_before,
+                "the unreadable probe produces no application record"
+            );
+            loop {
+                match events.try_recv() {
+                    Ok(MarmotAppEvent::MessageReceived(update)) => {
+                        assert_ne!(update.account_id_hex, alice.account_id_hex);
+                    }
+                    Ok(MarmotAppEvent::AgentStreamStarted(update)) => {
+                        assert_ne!(update.account_id_hex, alice.account_id_hex);
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(error) => panic!("unreadable-probe delivery witness lost: {error}"),
+                }
+            }
         }
         runtime.shutdown_and_close().await.unwrap();
     }

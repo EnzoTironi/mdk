@@ -1,4 +1,3 @@
-
 #[derive(Clone, Default)]
 struct CrashDuringFanoutPublishAdapter {
     publishes: Arc<Mutex<Vec<TransportPublishRequest>>>,
@@ -273,7 +272,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
     .unwrap();
     fanout
         .set_application_message(OutboundApplicationMessage {
- authority: None,
+            authority: None,
             group_id: group_id.clone(),
             app_event_id: "terminal-app-event".into(),
             source_epoch: EpochId(1),
@@ -446,20 +445,24 @@ async fn queued_app_message_with_missing_route_remains_retryable() {
         .await
         .unwrap();
 
-    let failed = runtime.advance_convergence(&group_id).await.unwrap();
-    assert_eq!(failed.failures.len(), 1);
-    assert!(failed.failed_app_messages.is_empty());
-    assert!(
-        runtime.has_queued_outbound_intents(&group_id).unwrap(),
-        "a routing failure has not proved terminal delivery failure"
-    );
+    assert!(runtime.advance_convergence(&group_id).await.is_err());
+    assert!(runtime.session().is_closed());
+    assert!(matches!(
+        runtime.session().has_queued_outbound_intents(&group_id),
+        Err(cgka_session::SessionError::Engine(cgka_traits::EngineError::SessionClosed))
+    ));
+
 }
 
 #[tokio::test]
 async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot ordered fanout key").unwrap();
-    let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-ordered-fanout");
+    let mut alice = session(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice-ordered-fanout",
+    );
     let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-ordered-fanout");
     let bob_key_package = bob.fresh_key_package().await.unwrap();
     let created = alice
@@ -777,12 +780,8 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
         group_id.as_slice().to_vec(),
         vec![endpoint],
     );
-    let mut runtime = AccountDeviceRuntime::new(
-        alice,
-        adapter,
-        policy,
-        RecordingKeyPackages::default(),
-    );
+    let mut runtime =
+        AccountDeviceRuntime::new(alice, adapter, policy, RecordingKeyPackages::default());
     let payload = app_payload_for(&alice_hex, b"only one semantic message");
     let app_event_id = MarmotAppEvent::decode(&payload).unwrap().id;
 
@@ -799,7 +798,10 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
     assert!(effects.published_app_messages.is_empty());
     assert_eq!(effects.unresolved_app_messages.len(), 1);
     assert_eq!(effects.unresolved_app_messages[0].group_id, group_id);
-    assert_eq!(effects.unresolved_app_messages[0].app_event_id, app_event_id);
+    assert_eq!(
+        effects.unresolved_app_messages[0].app_event_id,
+        app_event_id
+    );
     assert_eq!(
         effects.unresolved_app_messages[0].message_id,
         transport_event_id
@@ -892,7 +894,7 @@ async fn ambiguous_legacy_create_welcome_confirms_after_restart_with_exact_retry
         ),
         "recovered effects: {recovered:?}; fanouts: {:?}; quarantined: {:?}",
         restarted.session().outbound_fanouts().unwrap(),
-        restarted.session().quarantined_groups()
+        restarted.session().quarantined_groups().unwrap()
     );
     assert_eq!(restarted.session().epoch(&group_id).unwrap().0, 1);
     let attempts = adapter.publishes();
@@ -1004,7 +1006,11 @@ async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
         [PendingResolution::Confirmed { .. }]
     ));
     let attempts = adapter.publishes();
-    assert_eq!(attempts.len(), 3, "commit retry must release the frozen Welcome");
+    assert_eq!(
+        attempts.len(),
+        3,
+        "commit retry must release the frozen Welcome"
+    );
     assert_eq!(attempts[1].message, original_commit);
     let recovered_welcome = attempts
         .iter()
@@ -1240,7 +1246,7 @@ async fn assert_frozen_fanout_restart_edge(
         )
     };
     if resume_via_deferred_advance {
-        assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
+        assert_eq!(reopened.unhydrated_group_ids().unwrap(), vec![group_id.clone()]);
     }
     let replacement_policy = StaticTransportRouting::new(vec![TransportEndpoint(
         "wss://replacement-inbox.example".into(),
@@ -1264,7 +1270,7 @@ async fn assert_frozen_fanout_restart_edge(
 
     assert!(effects.fanout[0].mls_confirmed);
     assert!(effects.fanout[0].fanout_complete);
-    assert!(resumed.session().unhydrated_group_ids().is_empty());
+    assert!(resumed.session().unhydrated_group_ids().unwrap().is_empty());
     assert_eq!(resumed.session().epoch(&group_id).unwrap().0, 2);
     let attempts = adapter.publishes();
     let resumed_attempts = &attempts[pre_restart_publish_count..];
@@ -1735,4 +1741,634 @@ async fn invite_quorum_survives_restart() {
         assert_eq!(attempts[0].message, fanouts[0].request().message);
         assert!(resumed.session().outbound_fanouts().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn current_queued_artifact_ack_after_restart_retires_binding_without_regeneration() {
+    for acknowledged_before_restart in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued-current.sqlite");
+        let key = SqlCipherKey::new("synthetic current queued restart key").unwrap();
+        let mut alice = current_session(&path, &key, b"current-queued-restart");
+        let sender = hex::encode(alice.self_id().as_slice());
+        let created = alice
+            .create_group(CreateGroupRequest {
+                name: "current queued restart".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            created.effects.publish.as_slice(),
+            [PublishWork::FoundingGroupCreated { .. }]
+        ));
+        let group = created.group_id;
+        alice
+            .queue_app_message_with_audit_context(
+                group.clone(),
+                app_payload_for(&sender, b"one saved intent"),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let prepared = alice.advance_convergence(&group).await.unwrap();
+        let [
+            PublishWork::ApplicationMessage {
+                msg,
+                queued_intent,
+                app_event_id,
+                source_epoch,
+                retention,
+                authority,
+                ..
+            },
+        ] = prepared.publish.as_slice()
+        else {
+            panic!("one queued application");
+        };
+        assert!(queued_intent.is_some());
+        let exact = msg.clone();
+        let TransportEnvelope::GroupMessage { transport_group_id } = &exact.envelope else {
+            panic!("group message");
+        };
+        let mut fanout = OutboundFanout::stage(
+            TransportPublishRequest {
+                account_id: alice.self_id(),
+                message: exact.clone(),
+                target: TransportPublishTarget::Group {
+                    group_id: group.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![TransportEndpoint::from("wss://queued-original.example")],
+                },
+                required_acks: 1,
+            },
+            None,
+            Some(group.clone()),
+            0,
+        )
+        .unwrap();
+        fanout
+            .set_application_message(OutboundApplicationMessage {
+                group_id: group.clone(),
+                app_event_id: app_event_id.clone(),
+                source_epoch: *source_epoch,
+                retention: *retention,
+                authority: *authority,
+            })
+            .unwrap();
+        alice.put_outbound_fanout(&fanout).unwrap();
+        fanout.mark_attempt_started(0).unwrap();
+        alice.put_outbound_fanout(&fanout).unwrap();
+        if acknowledged_before_restart {
+            fanout.mark_target_accepted(0).unwrap();
+            alice.put_outbound_fanout(&fanout).unwrap();
+        }
+        drop(alice);
+        let reopened = current_session(&path, &key, b"current-queued-restart");
+        let adapter = RecordingAdapter::default();
+        let replacement = StaticTransportRouting::new(vec![]).with_group_route(
+            group.clone(),
+            vec![0xEE; 32],
+            vec![TransportEndpoint::from("wss://queued-replacement.example")],
+        );
+        let mut runtime = AccountDeviceRuntime::new(
+            reopened,
+            adapter.clone(),
+            replacement,
+            RecordingKeyPackages::default(),
+        );
+        let resumed = runtime.resume_outbound_fanouts().await.unwrap();
+        assert_eq!(resumed.published_app_messages.len(), 1);
+        assert!(!runtime.has_queued_outbound_intents(&group).unwrap());
+        let attempts = adapter.publishes();
+        assert_eq!(attempts.len(), usize::from(!acknowledged_before_restart));
+        assert!(attempts.iter().all(|attempt| attempt.message == exact
+            && attempt.target.endpoints() == fanout.request().target.endpoints()));
+        runtime.advance_convergence(&group).await.unwrap();
+        assert_eq!(adapter.publishes().len(), attempts.len());
+        runtime
+            .acknowledge_published_app_messages(&resumed.published_app_messages)
+            .unwrap();
+        assert!(runtime.session().outbound_fanouts().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn queued_local_staging_refusal_rolls_back_and_requires_reopen() {
+    use cgka_traits::storage::OutboundIntentStorage;
+    for missing_route in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atomic-queued.sqlite");
+        let key = SqlCipherKey::new("synthetic atomic queued key").unwrap();
+        let mut alice = current_session(&path, &key, b"atomic-queued-owner");
+        let sender = hex::encode(alice.self_id().as_slice());
+        let created = alice.create_group(CreateGroupRequest {
+            name: "atomic queued".into(), description: String::new(), members: vec![],
+            required_features: vec![], app_components: vec![], initial_admins: vec![],
+        }).await.unwrap();
+        let group = created.group_id;
+        alice.queue_app_message_with_audit_context(group.clone(),
+            app_payload_for(&sender, b"one atomic intent"), Default::default()).await.unwrap();
+        let store = storage_sqlite::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let before = store.list_queued_outbound_intents(&group).unwrap();
+        let baseline_epoch = alice.epoch(&group).unwrap();
+        let sql = rusqlite::Connection::open(&path).unwrap();
+        sql.pragma_update(None, "key", key.as_secret_str()).unwrap();
+        if !missing_route {
+            sql.execute_batch("CREATE TRIGGER refuse_fanout BEFORE INSERT ON cgka_outbound_fanout BEGIN SELECT RAISE(ABORT, 'synthetic fanout write refusal'); END;").unwrap();
+        }
+        let good_route = || StaticTransportRouting::new(vec![]).with_group_route(
+            group.clone(), group.as_slice().to_vec(),
+            vec![TransportEndpoint::from("wss://atomic-queued.example")]);
+        let route = if missing_route { StaticTransportRouting::new(vec![]) } else { good_route() };
+        let adapter = RecordingAdapter::default();
+        let mut runtime = AccountDeviceRuntime::new(alice, adapter.clone(), route, RecordingKeyPackages::default());
+        assert!(runtime.advance_convergence(&group).await.is_err());
+        assert!(runtime.session().is_closed());
+        assert!(adapter.publishes().is_empty());
+        assert_eq!(store.list_queued_outbound_intents(&group).unwrap(), before);
+        assert!(store.list_outbound_fanouts_for_group(&group).unwrap().is_empty());
+        drop(runtime);
+        if !missing_route { sql.execute_batch("DROP TRIGGER refuse_fanout;").unwrap(); }
+        let reopened = current_session(&path, &key, b"atomic-queued-owner");
+        assert_eq!(reopened.epoch(&group).unwrap(), baseline_epoch);
+        let mut recovered = AccountDeviceRuntime::new(reopened, adapter.clone(), good_route(), RecordingKeyPackages::default());
+        recovered.advance_convergence(&group).await.unwrap();
+        assert_eq!(adapter.publishes().len(), 1);
+        recovered.advance_convergence(&group).await.unwrap();
+        assert_eq!(adapter.publishes().len(), 1);
+    }
+}
+
+struct SuspendedLocalPeeler {
+    mode: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+struct LocalFutureDrop(Arc<AtomicUsize>);
+impl Drop for LocalFutureDrop {
+    fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+}
+#[async_trait]
+impl TransportPeeler for SuspendedLocalPeeler {
+    async fn peel_group_message(&self, message: &TransportMessage, context: &GroupContextSnapshot) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_group_message(message, context).await
+    }
+    async fn peel_welcome(&self, message: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(message).await
+    }
+    async fn wrap_group_message(&self, payload: &EncryptedPayload, context: &GroupContextSnapshot) -> Result<TransportMessage, PeelerError> {
+        let _drop = LocalFutureDrop(Arc::clone(&self.drops));
+        match self.mode.load(Ordering::SeqCst) {
+            1 => futures::future::pending().await,
+            2 => panic!("synthetic local preparation panic"),
+            _ => MockPeeler.wrap_group_message(payload, context).await,
+        }
+    }
+    async fn wrap_welcome(&self, payload: &EncryptedPayload, recipient: &MemberId) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+#[tokio::test]
+async fn suspended_or_panicking_local_preparation_is_dropped_and_reopen_restores_authority() {
+    use cgka_traits::storage::OutboundIntentStorage;
+    use futures::FutureExt;
+    for mode in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local-poll.sqlite");
+        let key = SqlCipherKey::new("synthetic local poll key").unwrap();
+        let identity = b"local-poll-owner";
+        let keys = deterministic_nostr_keys(identity);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut alice = AccountDeviceSession::open(SessionConfig::new(
+            &path, SqlCipherKey::new(key.as_secret_str()).unwrap(), pad32(identity),
+            Box::new(SuspendedLocalPeeler { mode: Arc::new(AtomicUsize::new(mode)), drops: Arc::clone(&drops) }),
+        ).account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+            .protocol_profile(ProtocolProfile::Current)).unwrap();
+        let sender = hex::encode(alice.self_id().as_slice());
+        let group = alice.create_group(CreateGroupRequest {
+            name: "local poll".into(), description: String::new(), members: vec![],
+            required_features: vec![], app_components: vec![], initial_admins: vec![],
+        }).await.unwrap().group_id;
+        alice.queue_app_message_with_audit_context(group.clone(), app_payload_for(&sender, b"one local poll"), Default::default()).await.unwrap();
+        let store = storage_sqlite::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let before = store.list_queued_outbound_intents(&group).unwrap();
+        let adapter = RecordingAdapter::default();
+        let route = StaticTransportRouting::new(vec![]).with_group_route(group.clone(), group.as_slice().to_vec(), vec![TransportEndpoint::from("wss://local-poll.example")]);
+        let mut runtime = AccountDeviceRuntime::new(alice, adapter.clone(), route.clone(), RecordingKeyPackages::default());
+        let result = std::panic::AssertUnwindSafe(runtime.advance_convergence(&group)).catch_unwind().await;
+        if mode == 1 {
+            assert!(matches!(result, Ok(Err(AccountError::Engine(cgka_traits::EngineError::LocalPreparationPending)))
+                | Ok(Err(AccountError::Session(cgka_session::SessionError::Engine(cgka_traits::EngineError::LocalPreparationPending))))));
+        } else { assert!(result.is_err()); }
+        assert!(runtime.session().is_closed());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(adapter.publishes().is_empty());
+        assert_eq!(store.list_queued_outbound_intents(&group).unwrap(), before);
+        assert!(store.list_outbound_fanouts_for_group(&group).unwrap().is_empty());
+        drop(runtime);
+        let mut reopened = AccountDeviceRuntime::new(current_session(&path, &key, identity), adapter.clone(), route, RecordingKeyPackages::default());
+        reopened.advance_convergence(&group).await.unwrap();
+        assert_eq!(adapter.publishes().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_after_commit_reopens_the_exact_frozen_artifact() {
+    use futures::FutureExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("committed-before-publish.sqlite");
+    let key = SqlCipherKey::new("synthetic pre-exposure key").unwrap();
+    let identity = b"pre-exposure-owner";
+    let mut alice = current_session(&path, &key, identity);
+    let sender = hex::encode(alice.self_id().as_slice());
+    let group = alice.create_group(CreateGroupRequest {
+        name: "pre exposure".into(), description: String::new(), members: vec![],
+        required_features: vec![], app_components: vec![], initial_admins: vec![],
+    }).await.unwrap().group_id;
+    alice.queue_app_message_with_audit_context(group.clone(), app_payload_for(&sender, b"exact after cancellation"), Default::default()).await.unwrap();
+    let endpoint = TransportEndpoint::from("wss://pre-exposure.example");
+    let adapter = RecordingAdapter::default();
+    *adapter.inner.endpoint_gate.lock().unwrap() = Some((endpoint.clone(), Arc::new(tokio::sync::Semaphore::new(0))));
+    let route = StaticTransportRouting::new(vec![]).with_group_route(group.clone(), group.as_slice().to_vec(), vec![endpoint]);
+    let mut runtime = AccountDeviceRuntime::new(alice, adapter, route.clone(), RecordingKeyPackages::default());
+    assert!(runtime.advance_convergence(&group).now_or_never().is_none());
+    assert!(!runtime.session().is_closed());
+    let fanouts = runtime.session().outbound_fanouts().unwrap();
+    assert_eq!(fanouts.len(), 1);
+    let exact = fanouts[0].request().message.clone();
+    drop(runtime);
+    let replacement = RecordingAdapter::default();
+    let mut reopened = AccountDeviceRuntime::new(current_session(&path, &key, identity), replacement.clone(), route, RecordingKeyPackages::default());
+    reopened.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(replacement.publishes().len(), 1);
+    assert_eq!(replacement.publishes()[0].message, exact);
+}
+
+#[tokio::test]
+async fn persisted_same_message_wrong_association_refuses_before_adapter() {
+    use futures::FutureExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("committed-before-publish.sqlite");
+    let key = SqlCipherKey::new("synthetic pre-exposure key").unwrap();
+    let identity = b"pre-exposure-owner";
+    let mut alice = current_session(&path, &key, identity);
+    let sender = hex::encode(alice.self_id().as_slice());
+    let group = alice
+        .create_group(CreateGroupRequest {
+            name: "pre exposure".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+        .group_id;
+    alice
+        .queue_app_message_with_audit_context(
+            group.clone(),
+            app_payload_for(&sender, b"exact after cancellation"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let endpoint = TransportEndpoint::from("wss://pre-exposure.example");
+    let adapter = RecordingAdapter::default();
+    *adapter.inner.endpoint_gate.lock().unwrap() =
+        Some((endpoint.clone(), Arc::new(tokio::sync::Semaphore::new(0))));
+    let route = StaticTransportRouting::new(vec![]).with_group_route(
+        group.clone(),
+        group.as_slice().to_vec(),
+        vec![endpoint],
+    );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        route.clone(),
+        RecordingKeyPackages::default(),
+    );
+    assert!(runtime.advance_convergence(&group).now_or_never().is_none());
+    assert!(!runtime.session().is_closed());
+    let fanouts = runtime.session().outbound_fanouts().unwrap();
+    assert_eq!(fanouts.len(), 1);
+    let exact = fanouts[0].request().message.clone();
+    let original = fanouts[0].clone();
+    let attempts_before_refusal = adapter.publishes();
+    let mut expected_attempt = original.request().clone();
+    expected_attempt.required_acks = 1;
+    assert_eq!(attempts_before_refusal, vec![expected_attempt]);
+    let app = original.application_message().unwrap().clone();
+    let effects = cgka_session::SessionEffects {
+        events: vec![],
+        queued: vec![],
+        pending_convergence: vec![],
+        publish: vec![cgka_session::PublishWork::ApplicationMessage {
+            msg: exact.clone(),
+            queued_intent: None,
+            group_id: app.group_id.clone(),
+            app_event_id: app.app_event_id.clone(),
+            source_epoch: app.source_epoch,
+            retention: app.retention,
+            authority: app.authority,
+        }],
+    };
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    sql.pragma_update(None, "key", key.as_secret_str()).unwrap();
+    let (original_group_column, original_record): (Option<Vec<u8>>, Vec<u8>) = sql
+        .query_row(
+            "SELECT group_id, record FROM cgka_outbound_fanout WHERE message_id = ?1",
+            [original.message_id().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(original_group_column.as_deref(), Some(group.as_slice()));
+    assert_eq!(
+        serde_json::from_slice::<OutboundFanout>(&original_record).unwrap(),
+        original
+    );
+    for wrong_account in [true, false] {
+        let mut value = serde_json::to_value(&original).unwrap();
+        if wrong_account {
+            value["request"]["account_id"] =
+                serde_json::to_value(cgka_traits::types::MemberId::new(vec![42; 32])).unwrap();
+        } else {
+            value["application_message"]["source_epoch"] =
+                serde_json::to_value(cgka_traits::types::EpochId(app.source_epoch.0 + 1)).unwrap();
+        }
+        let altered: OutboundFanout = serde_json::from_value(value).unwrap();
+        // Corrupt the synthetic row only after valid preparation. Normal
+        // storage updates correctly forbid changing frozen associations.
+        assert_eq!(
+            sql.execute(
+                "UPDATE cgka_outbound_fanout SET record = ?1 WHERE message_id = ?2",
+                rusqlite::params![
+                    serde_json::to_vec(&altered).unwrap(),
+                    original.message_id().as_slice()
+                ],
+            )
+            .unwrap(),
+            1
+        );
+        let group_column: Option<Vec<u8>> = sql
+            .query_row(
+                "SELECT group_id FROM cgka_outbound_fanout WHERE message_id = ?1",
+                [original.message_id().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(group_column, original_group_column);
+        assert!(
+            runtime
+                .publish_session_effects(effects.clone())
+                .now_or_never()
+                .expect("association refusal must finish before adapter wait")
+                .is_err()
+        );
+        assert_eq!(adapter.publishes(), attempts_before_refusal);
+        assert_eq!(runtime.session().outbound_fanouts().unwrap(), vec![altered]);
+    }
+    assert_eq!(
+        sql.execute(
+            "UPDATE cgka_outbound_fanout SET record = ?1 WHERE message_id = ?2",
+            rusqlite::params![original_record, original.message_id().as_slice()],
+        )
+        .unwrap(),
+        1
+    );
+    let restored_row: (Option<Vec<u8>>, Vec<u8>) = sql
+        .query_row(
+            "SELECT group_id, record FROM cgka_outbound_fanout WHERE message_id = ?1",
+            [original.message_id().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(restored_row, (original_group_column, original_record));
+    drop(runtime);
+    let replacement = RecordingAdapter::default();
+    let mut reopened = AccountDeviceRuntime::new(
+        current_session(&path, &key, identity),
+        replacement.clone(),
+        route,
+        RecordingKeyPackages::default(),
+    );
+    reopened.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(replacement.publishes().len(), 1);
+    assert_eq!(replacement.publishes()[0].message, exact);
+}
+
+#[tokio::test]
+async fn restored_queued_proposal_refuses_a_wrong_local_group_before_adapter() {
+    use cgka_traits::storage::{
+        OutboundIntentStorage, QueuedIntentPreparation, QueuedOutboundIntent, RegeneratedArtifact,
+        StorageError, StorageProvider,
+    };
+    use futures::FutureExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("restored proposal authority key").unwrap();
+    let bob_path = dir.path().join("bob-proposal.sqlite");
+    let mut alice = session_with_registry(
+        dir.path().join("alice-proposal.sqlite"),
+        &key,
+        b"alice-proposal",
+        selfremove_registry(),
+    );
+    let mut bob = session_with_registry(&bob_path, &key, b"bob-proposal", selfremove_registry());
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "restored proposal authority".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: vec![Feature("self-remove")],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected group creation publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    let other = bob
+        .create_group(CreateGroupRequest {
+            name: "another real local group".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![Feature("self-remove")],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let wrong_group_id = other.group_id;
+    let pending = match &other.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected group creation publish work, got {other:?}"),
+    };
+    bob.confirm_published(pending).await.unwrap();
+    assert_ne!(wrong_group_id, group_id);
+
+    let leave = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let proposal = match &leave.publish[0] {
+        PublishWork::Proposal { msg, .. } => msg.clone(),
+        other => panic!("expected real SelfRemove proposal, got {other:?}"),
+    };
+    let transport_group_id = match &proposal.envelope {
+        TransportEnvelope::GroupMessage { transport_group_id } => transport_group_id.clone(),
+        other => panic!("expected group-message envelope, got {other:?}"),
+    };
+    let created_at_ms = proposal.timestamp.0 * 1000;
+    let original = OutboundFanout::stage(
+        TransportPublishRequest {
+            account_id: bob.self_id(),
+            message: proposal.clone(),
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id,
+                endpoints: vec![TransportEndpoint::from("wss://restored-proposal.example")],
+            },
+            required_acks: 1,
+        },
+        None,
+        Some(group_id.clone()),
+        created_at_ms,
+    )
+    .unwrap();
+    let mut intent_identity = b"restored-proposal-intent-v1".to_vec();
+    intent_identity.extend_from_slice(proposal.id.as_slice());
+    // Seed canonical persisted ownership with actual MLS bytes, then exercise
+    // cold hydration. This fixture does not claim to exercise queue admission.
+    let queued = QueuedOutboundIntent {
+        id: hash_id(&intent_identity),
+        group_id: group_id.clone(),
+        intent: SendIntent::Leave {
+            group_id: group_id.clone(),
+        },
+        created_at_ms,
+        reissue_attempts: 0,
+        preparation: QueuedIntentPreparation::BoundArtifact {
+            artifact: RegeneratedArtifact::Message {
+                message_id: proposal.id.clone(),
+            },
+        },
+    };
+    let storage = SqliteAccountStorage::open_encrypted(&bob_path, &key).unwrap();
+    storage
+        .with_transaction(|storage| -> Result<(), StorageError> {
+            storage.put_outbound_fanout(&original)?;
+            storage.put_queued_outbound_intent(&queued)?;
+            Ok(())
+        })
+        .unwrap();
+    let sql = rusqlite::Connection::open(&bob_path).unwrap();
+    sql.pragma_update(None, "key", key.as_secret_str()).unwrap();
+    let (original_group_column, original_record): (Option<Vec<u8>>, Vec<u8>) = sql
+        .query_row(
+            "SELECT group_id, record FROM cgka_outbound_fanout WHERE message_id = ?1",
+            [original.message_id().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(original_group_column.as_deref(), Some(group_id.as_slice()));
+    assert_eq!(
+        serde_json::from_slice::<OutboundFanout>(&original_record).unwrap(),
+        original
+    );
+    drop(bob);
+    let reopened = session_with_registry(&bob_path, &key, b"bob-proposal", selfremove_registry());
+    let restored = reopened
+        .regenerated_queued_intent_for_message(&proposal.id)
+        .unwrap()
+        .expect("cold hydration must restore the proposal's queued owner");
+    assert_eq!(restored.group_id, group_id);
+    assert_eq!(restored.intent_id, queued.id);
+    let effects = cgka_session::SessionEffects {
+        events: vec![],
+        queued: vec![],
+        pending_convergence: vec![],
+        publish: vec![PublishWork::Proposal {
+            msg: proposal,
+            queued_intent: Some(restored),
+        }],
+    };
+    let adapter = RecordingAdapter::default();
+    let attempts_before_refusal = adapter.publishes();
+    // A valid frozen artifact must need no current route lookup.
+    let mut runtime = AccountDeviceRuntime::new(
+        reopened,
+        adapter.clone(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    );
+    let mut value = serde_json::to_value(&original).unwrap();
+    value["group_id"] = serde_json::to_value(&wrong_group_id).unwrap();
+    let altered: OutboundFanout = serde_json::from_value(value).unwrap();
+    // Simulate on-disk corruption after valid hydration. The storage update
+    // guard forbids changing a frozen fanout's group; corrupting it before
+    // reopen would instead fail the queued-binding hydration precondition.
+    assert_eq!(
+        sql.execute(
+            "UPDATE cgka_outbound_fanout SET group_id = ?1, record = ?2 WHERE message_id = ?3",
+            rusqlite::params![
+                wrong_group_id.as_slice(),
+                serde_json::to_vec(&altered).unwrap(),
+                original.message_id().as_slice()
+            ],
+        )
+        .unwrap(),
+        1
+    );
+    let error = runtime
+        .publish_session_effects(effects.clone())
+        .now_or_never()
+        .expect("association refusal must finish before adapter publication")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AccountError::Engine(cgka_traits::EngineError::QueuedIntentRecoveryFailed)
+    ));
+    assert_eq!(adapter.publishes(), attempts_before_refusal);
+    assert_eq!(runtime.session().outbound_fanouts().unwrap(), vec![altered]);
+    assert_eq!(
+        storage.list_queued_outbound_intents(&group_id).unwrap(),
+        vec![queued]
+    );
+
+    assert_eq!(
+        sql.execute(
+            "UPDATE cgka_outbound_fanout SET group_id = ?1, record = ?2 WHERE message_id = ?3",
+            rusqlite::params![
+                original_group_column,
+                original_record,
+                original.message_id().as_slice()
+            ],
+        )
+        .unwrap(),
+        1
+    );
+    runtime.publish_session_effects(effects).await.unwrap();
+    assert_eq!(adapter.publishes(), vec![original.request().clone()]);
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(runtime.session().outbound_fanouts().unwrap().is_empty());
 }

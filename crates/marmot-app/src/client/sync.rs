@@ -749,7 +749,7 @@ impl AppClient {
                     })
                 } else if self.runtime.has_queued_outbound_intents(group_id)?
                     || (matches!(
-                        self.runtime.epoch_state(group_id),
+                        self.runtime.epoch_state(group_id)?,
                         Some(cgka_traits::EpochState::Stable { .. })
                     ) && self
                         .runtime
@@ -2920,7 +2920,7 @@ impl AppClient {
                 && let Ok(group) = client.runtime.group_record(group_id)
             {
                 let initial_join = probe.joined(receive.clone(), &group);
-                if initial_join && client.runtime.session().audit_v5_enabled() {
+                if initial_join && matches!(client.runtime.session().audit_v5_enabled(), Ok(true)) {
                     let admins = client.runtime.admin_pubkeys(group_id).ok();
                     probe.baseline(
                         &group,
@@ -5462,7 +5462,7 @@ impl AppClient {
             );
             if previous_group != updated_group
                 && let Some(probe) = &mut self.audit_v5_probe
-                && (self.runtime.session().audit_v5_enabled() || cfg!(test))
+                && (matches!(self.runtime.session().audit_v5_enabled(), Ok(true)) || cfg!(test))
             {
                 probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
             }

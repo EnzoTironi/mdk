@@ -34,7 +34,6 @@ the default.
 - Provides compact `group_authority` reads and `with_group_authority_snapshot` for composing host-owned persisted
   reads with current engine facts on this session's store. The callback is synchronous and read-only; unhydrated groups
   return `GroupNotHydrated`. It does not serve a frozen startup snapshot or start relay work.
-- Offers `promote_legacy_message_rows` for host-scheduled, bounded promotion of legacy stored rows after readiness.
 
 It does **not** do account key derivation, recovery, or key rotation; relay sync, network publish, or transport
 adaptation; or UI projection and application databases. Those live above this crate (see
@@ -48,8 +47,8 @@ cargo test -p cgka-session
 
 - `tests/session_lifecycle.rs` — encrypted open/create/confirm/close/reopen, Welcome and app-message ingest,
   auto-publish and SelfRemove re-proposal work, convergence releasing queued outbound work, disband requests, compact authority
-  capture, KeyPackage cutover on open, and the legacy-row promotion facade (using
-  [`fixtures/session-promotion-v1.bin`](fixtures/README.md)).
+  capture, KeyPackage cutover on open, and complete current Welcome/sent-message persistence across cold reopen
+  with unchanged group membership, epoch, own leaf, and usable public Session sends.
 - `tests/nostr_stack.rs` — the production-shaped non-relay stack: SQLCipher storage, the real `NostrMlsPeeler`, and
   `NostrTransportAdapter` over an in-memory relay client. Covers inbox and group subscription routing, NIP-59 Welcome
   and kind `445` group delivery, routing-component-driven `h` tags and publish targets (the transport id is not the MLS

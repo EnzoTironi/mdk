@@ -9321,6 +9321,12 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
             .collect::<Vec<_>>()
     );
 
+    let bob_policy_before = app
+        .group("bob", &group_id_hex)
+        .unwrap()
+        .unwrap()
+        .encrypted_media;
+
     let bob_error = bob
         .replace_encrypted_media_blob_endpoints(
             &group_id,
@@ -9332,6 +9338,30 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
         .await
         .unwrap_err();
     assert!(bob_error.to_string().contains("admin"));
+    assert!(matches!(
+        &bob_error,
+        AppError::Account(marmot_account::AccountError::Session(
+            cgka_session::SessionError::Engine(cgka_traits::EngineError::NotGroupAdmin {
+                group_id: denied,
+            })
+        )) if denied == &group_id
+    ));
+    assert!(matches!(
+        bob.sync().await,
+        Err(AppError::Account(marmot_account::AccountError::Engine(
+            cgka_traits::EngineError::SessionClosed
+        )))
+    ));
+    // A refused local preparation consumes Engine authority; reopen the same account.
+    drop(bob);
+    let mut bob = app.client("bob").await.unwrap();
+    assert_eq!(
+        app.group("bob", &group_id_hex)
+            .unwrap()
+            .unwrap()
+            .encrypted_media,
+        bob_policy_before
+    );
 
     alice
         .replace_encrypted_media_blob_endpoints(

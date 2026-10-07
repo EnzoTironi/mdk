@@ -11,7 +11,7 @@ under `src/`; see [`../../AGENTS.md`](../../AGENTS.md).
 | `groups.rs` | `GroupStorage`: group CRUD, listing, cascade delete; delegates route rows to `transport_routes.rs`. |
 | `transport_routes.rs` | Durable transport-route index rows (routing id → group id + observing epoch) seeded at session open (mdk#1161). |
 | `account_device_signer.rs` | Marmot identity to MLS signing-key binding. |
-| `messages.rs` | `MessageStorage`: message rows (storage format 2 columns), deferred-message metadata, format promotion. |
+| `messages.rs` | `MessageStorage`: normalized message rows and deferred-message metadata. |
 | `snapshots.rs`, `snapshots/` | Snapshot capture, rollback, listing, release, checkpoints, replay fingerprints; see its local `AGENTS.md`. |
 | `outbound.rs` | `OutboundIntentStorage` / `OutboundFanoutStorage`: durable queued outbound intents and fanouts. |
 | `welcomes.rs` | Pending Welcome put/list/take. |
@@ -27,9 +27,7 @@ under `src/`; see [`../../AGENTS.md`](../../AGENTS.md).
 ## Rules
 
 - Keep tests beside the module they exercise.
-- Message rows follow storage format 2 (`docs/marmot-architecture/storage-format-v2.md`): scalar columns, `payload`,
-  and `deferred_peel` are authoritative and `record` is `NULL`; legacy format-1 rows stay readable and promote
-  atomically on mutation. Other Marmot records (for example groups) are serialized `record` blobs so trait shapes can
-  evolve through Rust migrations.
+- Message rows use scalar columns, `payload`, and optional `deferred_peel` as their only authorities.
+  Other Marmot records (for example groups) retain their independently encoded `record` blobs.
 - Preserve insertion order where replay depends on deterministic ordering.
 - Group delete must remove group-scoped OpenMLS rows too.

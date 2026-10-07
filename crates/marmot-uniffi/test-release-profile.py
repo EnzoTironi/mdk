@@ -646,14 +646,17 @@ class ReleaseProfileTests(unittest.TestCase):
                 },
             ),
         ):
-            with self.subTest(script=script):
-                self._assert_apple_builder_profile(script, extras)
+            for target_mode in ('default', 'absolute', 'relative'):
+                with self.subTest(script=script, target_mode=target_mode):
+                    self._assert_apple_builder_profile(script, extras, target_mode)
 
-    def _assert_apple_builder_profile(self, script: str, extras: dict):
-        log = self.root / f"{script}.jsonl"
+    def _assert_apple_builder_profile(self, script: str, extras: dict, target_mode: str):
+        work = self.root / f"{script}-{target_mode}"
+        work.mkdir()
+        log = work / f"{script}.jsonl"
         log.write_text("")
-        bin_dir = self.root / f"bin-{script}"
-        workspace = self.root / f"old-source-{script}"
+        bin_dir = work / f"bin-{script}"
+        workspace = work / f"old-source-{script}"
         crate = workspace / "crates/marmot-uniffi"
         privacy = crate / "apple-privacy"
         shutil.copytree(HERE / "apple-privacy", privacy)
@@ -678,14 +681,14 @@ class ReleaseProfileTests(unittest.TestCase):
             "printf 'xcframework' > \"$out/Info.plist\"\n",
         )
         native = macho64(True, b"__TEXT")
-        write_ar(self.root / f"{script}-native.a", [("obj.o", native)])
+        write_ar(work / f"{script}-native.a", [("obj.o", native)])
         write_executable(
             bin_dir / "cargo",
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
             "from pathlib import Path\n"
             f"log = Path({str(log)!r})\n"
-            f"native = Path({str(self.root / (script + '-native.a'))!r}).read_bytes()\n"
+            f"native = Path({str(work / (script + '-native.a'))!r}).read_bytes()\n"
             "entry = {'argv': sys.argv[1:], 'strip': os.environ.get('CARGO_PROFILE_RELEASE_STRIP'),"
             " 'lto': os.environ.get('CARGO_PROFILE_RELEASE_LTO'),"
             " 'codegen': os.environ.get('CARGO_PROFILE_RELEASE_CODEGEN_UNITS'),"
@@ -696,7 +699,8 @@ class ReleaseProfileTests(unittest.TestCase):
             "    handle.write(json.dumps(entry) + '\\n')\n"
             "args = sys.argv[1:]\n"
             f"workspace = Path({str(workspace)!r})\n"
-            "target_dir = workspace / 'target'\n"
+            "target_dir = Path(os.environ.get('CARGO_TARGET_DIR') or workspace / 'target')\n"
+            "if not target_dir.is_absolute(): target_dir = workspace / target_dir\n"
             "if args and args[0] == 'build':\n"
             "    triple = args[args.index('--target') + 1] if '--target' in args else None\n"
             "    if triple:\n"
@@ -715,13 +719,35 @@ class ReleaseProfileTests(unittest.TestCase):
             "    raise SystemExit('unexpected cargo invocation')\n",
         )
         env = os.environ.copy()
-        env["HOME"] = str(self.root / f"home-{script}")
+        env["HOME"] = str(work / f"home-{script}")
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
         env["MARMOTKIT_WORKSPACE_DIR"] = str(workspace)
         env["MARMOTKIT_CRATE_DIR"] = str(crate)
+        outer_target = work / "outer-target"
+        outer_target.mkdir()
+        sentinel = outer_target / "unchanged"
+        sentinel.write_bytes(b"outer target remains untouched")
+        env["CARGO_TARGET_DIR"] = str(outer_target)
+        if target_mode == "default":
+            env.pop("CARGO_TARGET_DIR")
+            expected_target = workspace / "target"
+        elif target_mode == "absolute":
+            expected_target = work / "absolute-target"
+            env["CARGO_TARGET_DIR"] = str(expected_target)
+        else:
+            self.assertEqual(target_mode, "relative")
+            env["CARGO_TARGET_DIR"] = "relative-target"
+            expected_target = workspace / "relative-target"
         env["OTLP_EXPORT"] = "1"
         env["PRODUCT_ANALYTICS_EXPORT"] = "1"
         subprocess.run([str(HERE / script)], check=True, env=env, cwd=ROOT)
+        self.assertEqual(list(outer_target.iterdir()), [sentinel])
+        self.assertEqual(sentinel.read_bytes(), b"outer target remains untouched")
+        self.assertTrue((expected_target / "release/libmarmot_uniffi.dylib").is_file())
+        for triple in extras["targets"]:
+            self.assertTrue((expected_target / triple / "release/libmarmot_uniffi.a").is_file())
+        if target_mode != "default":
+            self.assertFalse((workspace / "target").exists())
         records = [json.loads(line) for line in log.read_text().splitlines() if line]
         builds = [row for row in records if row["argv"][:1] == ["build"]]
         generate = [row for row in records if row["argv"][:1] == ["run"]]

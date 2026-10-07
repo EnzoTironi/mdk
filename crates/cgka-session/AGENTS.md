@@ -16,8 +16,6 @@ key derivation, relay sync, or UI projection.
 - Surface engine effects as app events plus publishable transport work.
 - `open` validates profile and convergence policy before opening storage or hydrating; keep new open-time checks
   ahead of any durable mutation.
-- Keep storage-only legacy-format promotion explicit and host-scheduled after readiness; do not add it to the
-  session-open critical path or widen the generic engine storage API for it.
 - Prefer behavior tests over internal state assertions.
 
 ## Verification

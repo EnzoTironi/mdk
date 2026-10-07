@@ -73,10 +73,8 @@ impl Marmot {
     ///
     /// Well-formed unknown peers, self lookups, and non-reusable historical
     /// groups return `None`. Malformed peer ids and unknown accounts keep the
-    /// same typed errors as the other identity commands. After an account
-    /// upgrade that introduces the peer index, this read returns
-    /// [`MarmotKitError::DirectConversationIndexNotReady`] until the one-time
-    /// backfill finishes; that is retryable and must not be treated as a miss.
+    /// same typed errors as the other identity commands.
+    /// Current writes maintain the peer index; group hydration uses the ordinary read lifecycle.
     pub async fn existing_direct_conversation(
         &self,
         account_ref: String,

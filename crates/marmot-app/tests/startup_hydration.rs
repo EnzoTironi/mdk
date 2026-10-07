@@ -345,7 +345,7 @@ async fn held_hydration_body() {
 }
 
 #[test]
-fn existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held() {
+fn existing_direct_conversation_waits_for_current_group_hydration() {
     let thread = std::thread::Builder::new()
         .name("startup-hydration-direct-index".to_owned())
         .stack_size(8 * 1024 * 1024)
@@ -360,10 +360,7 @@ fn existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held() {
     thread.join().unwrap();
 }
 
-/// First open after migration 50: Direct groups exist, the peer index is
-/// empty, and readiness is signaled before the hydration-lane backfill.
-/// Lookup must return a retryable error, never `Ok(None)`, until the worker
-/// finishes reconciliation and the existing group becomes visible.
+/// Persisted current peer candidates hydrate on demand while background hydration stays held.
 async fn held_direct_conversation_index_body() {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -390,13 +387,11 @@ async fn held_direct_conversation_index_body() {
     let group_id_hex = hex::encode(group_id.as_slice());
 
     let app = open_store(&dir, &url, Some(BATCH_HOLD_MS));
-    app.reset_direct_conversation_members_backfill_for_test(BENCH_ACCOUNT)
-        .unwrap();
     assert!(
-        app.direct_conversation_candidates(BENCH_ACCOUNT, &donor_id)
+        !app.direct_conversation_candidates(BENCH_ACCOUNT, &donor_id)
             .unwrap()
             .is_empty(),
-        "upgrade fixture must start from an empty peer index"
+        "current writes must have persisted the peer index"
     );
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -407,41 +402,40 @@ async fn held_direct_conversation_index_body() {
         "readiness must not wait on the held hydration pipeline"
     );
 
-    let held = tokio::time::timeout(
-        Duration::from_millis(BATCH_HOLD_MS / 2),
+    let found = tokio::time::timeout(
+        Duration::from_millis(250),
         runtime.existing_direct_conversation(BENCH_ACCOUNT, &donor_id),
     )
     .await
-    .expect("lookup during the hold must not wait out hydration");
-    assert!(
-        matches!(held, Err(AppError::DirectConversationIndexNotReady)),
-        "held lookup must be retryable, not a miss: {held:?}"
+    .expect("named-group lookup must complete while background hydration is held")
+    .expect("current group lookup during the hold")
+    .expect("persisted current direct conversation during the hold");
+    assert_eq!(found.group_id_hex, group_id_hex);
+    assert!(found.reusable);
+
+    let hydration_attempts = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot()
+        .account_group_hydration
+        .attempts;
+    assert_eq!(
+        hydration_attempts, 1,
+        "hydration pipeline must still be held while assertions run"
     );
     runtime.shutdown().await;
 
     let app = open_store(&dir, &url, None);
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.start().await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let found = loop {
-        let result = runtime
-            .existing_direct_conversation(BENCH_ACCOUNT, &donor_id)
-            .await;
-        match result {
-            Ok(Some(found)) => break found,
-            Ok(None) => panic!(
-                "upgrade lookup must never return None before or after the peer-index backfill"
-            ),
-            Err(AppError::DirectConversationIndexNotReady) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "peer-index backfill did not complete after hydration was released"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(other) => panic!("unexpected lookup error after hydration release: {other:?}"),
-        }
-    };
+    let found = tokio::time::timeout(
+        Duration::from_secs(15),
+        runtime.existing_direct_conversation(BENCH_ACCOUNT, &donor_id),
+    )
+    .await
+    .expect("current hydration must finish")
+    .expect("current group lookup")
+    .expect("persisted current direct conversation");
     assert_eq!(found.group_id_hex, group_id_hex);
     assert!(found.reusable);
     runtime.shutdown().await;

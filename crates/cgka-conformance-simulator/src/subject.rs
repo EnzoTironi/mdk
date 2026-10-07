@@ -1758,6 +1758,9 @@ impl ConvergenceSubject for EngineHarnessSubject {
 
         match outcome {
             SubjectOutboundOutcome::Accepted => {
+                self.client(client)?
+                    .mark_regenerated_artifact_accepted(&record.artifact.message.id)
+                    .map_err(subject_engine_error)?;
                 if record.artifact.state_confirmation_required
                     && pending_belongs_to_current_incarnation
                     && !pending_already_confirmed
@@ -1875,8 +1878,12 @@ impl ConvergenceSubject for EngineHarnessSubject {
                 }
 
                 if let Some((group_id, intent_id)) = &record.queued_intent {
+                    self.client(client)?
+                        .mark_regenerated_artifact_unexposed(&record.artifact.message.id)
+                        .map_err(subject_engine_error)?;
                     self.client_mut(client)?
-                        .retry_regenerated_queued_intent(group_id, intent_id);
+                        .retry_regenerated_queued_intent(group_id, intent_id)
+                        .map_err(subject_engine_error)?;
                     self.client_mut(client)?
                         .forget_regenerated_queued_intent(&record.artifact.message.id);
                 }
@@ -2415,6 +2422,10 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         // bound (ledger E9), the same class of observation as a storage failure.
         EngineError::Backend(_)
         | EngineError::Storage(_)
+        | EngineError::SessionClosed
+        | EngineError::LocalPreparationPending
+        | EngineError::QueuedIntentRecoveryFailed
+        | EngineError::QueuedIntentReissueRefused
         | EngineError::QueuedOutboundAtCapacity { .. } => SubjectFailureCategory::Resource,
         EngineError::InvalidTransition(_)
         | EngineError::Other(_)
@@ -2525,6 +2536,10 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::UnknownPending => "unknown_pending",
+        EngineError::SessionClosed => "session_closed",
+        EngineError::LocalPreparationPending => "local_preparation_pending",
+        EngineError::QueuedIntentRecoveryFailed => "queued_intent_recovery_failed",
+        EngineError::QueuedIntentReissueRefused => "queued_intent_reissue_refused",
         EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
     }
     .into()

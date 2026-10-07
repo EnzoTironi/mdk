@@ -50,6 +50,8 @@ use tls_codec::Serialize as _;
 mod encrypted_media_source_secret;
 #[path = "distributed_convergence/historical_application_sender.rs"]
 mod historical_application_sender;
+#[path = "support/queued_artifact.rs"]
+mod queued_artifact;
 mod support;
 use support::proof_signer;
 
@@ -3047,6 +3049,7 @@ async fn engine_defers_child_commit_until_parent_arrives() {
             },
             created_at_ms: 1_001,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .expect("persist already-queued admin group-state intent");
 
@@ -3321,6 +3324,7 @@ fn queue_intent(
             intent,
             created_at_ms,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .expect("persist queued outbound intent");
 }
@@ -3528,6 +3532,8 @@ async fn admin_group_state_intent_gets_one_attempt_before_next_inbound_generatio
 
     // The attempt failed to publish: roll it back. The reservation stays
     // consumed and retained inbound proceeds into generation 1.
+    queued_artifact::stage_queued_results(&carol, &carol_storage, &group_id, &drained);
+    queued_artifact::mark_queued_results_unexposed(&carol_storage, &drained);
     carol.publish_failed(pending).await.unwrap();
     let syncing = carol
         .converge_stored_openmls_messages_at(&group_id, 1_100_000)
@@ -4615,6 +4621,7 @@ async fn durable_unrecoverable_halt_blocks_queued_drain_without_rehydration() {
             },
             created_at_ms: 1,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
     let mut stored_group = storage.get_group(&group_id).unwrap();
@@ -5573,6 +5580,8 @@ async fn a_completed_pass_rearms_the_drain_for_intents_queued_inside_the_window(
         1,
         "expected the retained message: {drained:?}"
     );
+
+    queued_artifact::stage_queued_results(&carol, &carol_storage, &group_id, &drained);
 
     // A second drain before the host's confirm must not regenerate the
     // in-flight intent: re-preparing would publish the same logical message
@@ -9750,6 +9759,7 @@ async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
             },
             created_at_ms: 0,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
 
@@ -9796,6 +9806,7 @@ async fn restart_schedules_groups_with_durable_queued_intents() {
             },
             created_at_ms: 1,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
     drop(alice);
@@ -9848,6 +9859,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             },
             created_at_ms: 0,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
     let app_intent_id = MessageId::new(b"later-app".to_vec());
@@ -9862,6 +9874,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             },
             created_at_ms: 1,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .unwrap();
 
@@ -9892,6 +9905,8 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
         2
     );
 
+    queued_artifact::stage_queued_results(&alice, &alice_storage, &group_id, &drained);
+    queued_artifact::mark_queued_results_unexposed(&alice_storage, &drained);
     alice.publish_failed(pending_invite).await.unwrap();
     let drained_after_failure = alice.advance_convergence(&group_id).await.unwrap();
     assert_eq!(drained_after_failure.len(), 1);

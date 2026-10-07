@@ -1448,6 +1448,7 @@ async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
         },
         created_at_ms: 1,
         reissue_attempts: 0,
+        preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
     };
     // Production draft send installs this observer on the accepting engine session.
     f.store

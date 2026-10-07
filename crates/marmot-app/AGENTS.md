@@ -239,10 +239,6 @@ components, full-history repair, notices, blocking, moderation) see [`README.md`
   release file locks. Closing is terminal — do not add a path that transparently reopens a database afterwards, and
   put shutdown checks at engine-step boundaries (never inside a step, where a snapshot guard may be live). See
   `docs/marmot-architecture/overview/local-artifact-safety.md`.
-- Keep legacy message-format promotion after account readiness and bounded to
-  one small transaction per steady-state maintenance tick. Log aggregate
-  progress only, retry transient contention, and halt durable decode failures
-  without disabling legacy reads.
 - Keep local test relay code in tests; production app runtime should talk to Nostr relay URLs through the adapter.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
@@ -272,8 +268,7 @@ components, full-history repair, notices, blocking, moderation) see [`README.md`
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
   stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
   `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
-  (opt-in bounded product observations; export behind `product-analytics-export`), `projection.rs` (legacy account
-  projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
+  (opt-in bounded product observations; export behind `product-analytics-export`), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
   `test_support.rs` (test-only gates/helpers).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
   `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `conversation_window.rs`, `chat_list_window.rs`,

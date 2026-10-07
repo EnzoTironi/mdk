@@ -39,7 +39,7 @@ mod encrypted_media_secrets;
 mod local_submissions;
 mod message_drafts;
 pub use local_submissions::LocalSubmission;
-mod migrations;
+mod account_schema;
 mod openmls_storage;
 mod pending_welcome_delivery;
 mod prepared_group_image_upload;
@@ -101,6 +101,10 @@ pub use connection::{
     SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,
     SqliteTimingOperation, open_hardened_sqlcipher,
 };
+#[cfg(feature = "diagnostic-account-open-witness")]
+pub use connection::{
+    DiagnosticMigrationStep, DiagnosticOpenEvent, DiagnosticOpenObserver, DiagnosticOpenPhase,
+};
 pub use message_drafts::{
     MessageDraftCommitObserver, MessageDraftRevision, MessageDraftRevisionError,
     SelectedMessageDraft, SelectedMessageDraftAttachment, SelectedMessageDraftContent,
@@ -120,7 +124,6 @@ pub use shared::{
     PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
     StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
 };
-pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]
 pub use storage::messages::StorageFormatBenchSizes;
 pub use timeline::{

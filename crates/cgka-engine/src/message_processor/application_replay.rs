@@ -76,12 +76,15 @@ impl<S: StorageProvider> Engine<S> {
                     .with(|count| count.set(count.get() + 1));
                 let parked_row = record.state == MessageState::ConvergenceDeferred;
                 match Self::retained_convergence_row(&record, tip) {
-                    Some(RetainedConvergenceRow::Application(message)) if parked_row => {
-                        if parked.len() < limit {
-                            parked.push(message);
-                        }
+                    Some(RetainedConvergenceRow::Application(message))
+                        if parked_row && parked.len() < limit =>
+                    {
+                        parked.push(message);
                     }
-                    Some(RetainedConvergenceRow::Application(message)) => fresh.push(message),
+                    Some(RetainedConvergenceRow::Application(message)) if !parked_row => {
+                        fresh.push(message);
+                    }
+                    Some(RetainedConvergenceRow::Application(_)) => {}
                     Some(RetainedConvergenceRow::Commit) => {
                         rival_branch_parked |= parked_row;
                     }

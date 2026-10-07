@@ -1040,18 +1040,7 @@ fn account_projection_state_heals_poisoned_stored_cursor_on_save() {
 
 #[test]
 fn account_projection_state_clamps_poisoned_snapshot_into_fresh_store() {
-    // Legacy-import shape (mdk#182): the marmot-app migration
-    // (`migrate_legacy_account_projection_if_needed`) writes a legacy-loaded
-    // state into a brand-new account store through this same
-    // `save_account_projection_state`. A pre-clamp-era legacy projection can
-    // carry a transport cursor poisoned above `now + skew`; adopting it into the
-    // fresh store (the `stored = None` arm) must clamp it to save-time
-    // `now + skew`, never persist the poison. Because the migration routes
-    // through this exact save, a fresh-store save with a poisoned snapshot is
-    // the faithful reproduction of that path — no separate migration fixture is
-    // needed for the storage layer. A true end-to-end counterpart that drives
-    // the migration itself lives in marmot-app
-    // (`legacy_account_projection_clamps_poisoned_transport_cursor_on_import`).
+    // A current snapshot saved into a fresh account store must clamp a future transport cursor.
     let store = SqliteAccountStorage::in_memory().unwrap();
     let now_before = unix_now_seconds();
     let poisoned = now_before + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
@@ -3185,7 +3174,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, payload)
              VALUES (?1, ?2, 0, 4, ?3)",
             rusqlite::params![fresh_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
         )
@@ -3256,7 +3245,7 @@ fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, payload)
              VALUES (?1, ?2, 0, 0, ?3)",
             rusqlite::params![first_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
         )
@@ -3269,7 +3258,7 @@ fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, payload)
              VALUES (?1, ?2, 0, 0, ?3)",
             rusqlite::params![buffered_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
         )
@@ -3294,7 +3283,7 @@ fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, payload)
              VALUES (?1, ?2, 0, 0, ?3)",
             rusqlite::params![fresh_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
         )
@@ -3368,7 +3357,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, payload)
              VALUES (?1, ?2, 0, 0, ?3)",
             rusqlite::params![historical_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
         )
@@ -3430,7 +3419,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, payload)
              VALUES (?1, ?2, 0, 0, ?3)",
             rusqlite::params![newer_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
         )

@@ -26,7 +26,10 @@ use cgka_traits::maintenance::{
     WallClock,
 };
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::StorageError;
+use cgka_traits::storage::{
+    OutboundIntentStorage, QueuedIntentPreparation, RegeneratedArtifact, StorageError,
+    StorageProvider,
+};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{
@@ -35,9 +38,7 @@ use cgka_traits::{
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditTransportContext, AuditTransportWire, ForensicRecorder,
 };
-use storage_sqlite::{
-    MessageFormatPromotionProgress, SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions,
-};
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
 
 const TRACE_TARGET: &str = "cgka_session::session";
 
@@ -191,7 +192,9 @@ impl SessionConfig {
 }
 
 pub struct AccountDeviceSession {
-    engine: Engine<SqliteAccountStorage>,
+    engine: Option<Engine<SqliteAccountStorage>>,
+    identity: MemberId,
+    protocol_profile: ProtocolProfile,
     storage: SqliteAccountStorage,
     open_timings: SessionOpenTimings,
 }
@@ -310,6 +313,50 @@ pub struct IngestEffects {
 }
 
 impl AccountDeviceSession {
+    fn live_engine(&self) -> Result<&Engine<SqliteAccountStorage>, EngineError> {
+        self.engine.as_ref().ok_or(EngineError::SessionClosed)
+    }
+
+    fn live_engine_mut(&mut self) -> Result<&mut Engine<SqliteAccountStorage>, EngineError> {
+        self.engine.as_mut().ok_or(EngineError::SessionClosed)
+    }
+
+    /// A failed local transaction consumes all Engine authority. Reopen from
+    /// the same database before any subsequent engine operation.
+    pub fn is_closed(&self) -> bool {
+        self.engine.is_none()
+    }
+
+    /// Run local preparation and exact fanout staging on the same connection
+    /// and thread. The callback must poll preparation once, reject Pending,
+    /// and perform no transport I/O. No future may escape this boundary.
+    /// Signer/peeler callbacks must be local and side-effect-free: one-poll
+    /// readiness alone cannot prove that an injected callback is pure.
+    pub fn with_local_preparation<T, E>(
+        &mut self,
+        prepare: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<cgka_traits::storage::StorageError> + From<EngineError>,
+    {
+        self.live_engine().map_err(E::from)?;
+        let storage = self.storage.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            storage.with_transaction(|_| prepare(self))
+        }));
+        match outcome {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                drop(self.engine.take());
+                Err(error)
+            }
+            Err(payload) => {
+                drop(self.engine.take());
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
     pub fn open(config: SessionConfig) -> SessionResult<Self> {
         if config.protocol_profile == ProtocolProfile::Legacy
             && !config.allow_legacy_compatibility_profile
@@ -420,8 +467,12 @@ impl AccountDeviceSession {
             groups_quarantined = open_timings.groups_quarantined,
             "account device session opened"
         );
+        let identity = engine.self_id();
+        let protocol_profile = engine.new_protocol_profile();
         Ok(Self {
-            engine,
+            engine: Some(engine),
+            identity,
+            protocol_profile,
             storage: maintenance_storage,
             open_timings,
         })
@@ -443,27 +494,13 @@ impl AccountDeviceSession {
         &self.open_timings
     }
 
-    /// Promote one bounded batch of legacy message rows after session
-    /// readiness.
-    ///
-    /// This is deliberately an explicit host-scheduled step rather than part
-    /// of [`Self::open`]: migration 47 preserves legacy rows so a large
-    /// account's payload decoding does not extend the account-open critical
-    /// path. The result contains aggregate counts only.
-    pub fn promote_legacy_message_rows(
-        &self,
-        limit: usize,
-    ) -> SessionResult<MessageFormatPromotionProgress> {
-        Ok(self.storage.promote_legacy_message_rows(limit)?)
-    }
-
     pub async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         tracing::debug!(
             target: TRACE_TARGET,
             method = "fresh_key_package",
             "creating fresh key package"
         );
-        let key_package = self.engine.fresh_key_package().await?;
+        let key_package = self.live_engine_mut()?.fresh_key_package().await?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "fresh_key_package",
@@ -473,7 +510,7 @@ impl AccountDeviceSession {
     }
 
     pub fn durably_owned_key_packages(&self) -> SessionResult<Vec<KeyPackage>> {
-        Ok(self.engine.durably_owned_key_packages()?)
+        Ok(self.live_engine()?.durably_owned_key_packages()?)
     }
 
     pub fn key_package_metadata(
@@ -497,7 +534,9 @@ impl AccountDeviceSession {
             method = "delete_key_package",
             "deleting key package bundle"
         );
-        self.engine.delete_key_package(key_package).await?;
+        self.live_engine_mut()?
+            .delete_key_package(key_package)
+            .await?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "delete_key_package",
@@ -507,11 +546,11 @@ impl AccountDeviceSession {
     }
 
     pub fn key_package_lifecycle(&self) -> SessionResult<Option<KeyPackageLifecycleState>> {
-        Ok(self.engine.key_package_lifecycle()?)
+        Ok(self.live_engine()?.key_package_lifecycle()?)
     }
 
     pub fn put_key_package_lifecycle(&self, state: &KeyPackageLifecycleState) -> SessionResult<()> {
-        Ok(self.engine.put_key_package_lifecycle(state)?)
+        Ok(self.live_engine()?.put_key_package_lifecycle(state)?)
     }
 
     pub fn stage_key_package_replacement(
@@ -521,7 +560,7 @@ impl AccountDeviceSession {
         refresh_lead_secs: u64,
         targets: Vec<TransportFanoutTarget>,
     ) -> SessionResult<KeyPackage> {
-        Ok(self.engine.stage_key_package_replacement(
+        Ok(self.live_engine_mut()?.stage_key_package_replacement(
             state,
             authored_created_at,
             refresh_lead_secs,
@@ -534,33 +573,35 @@ impl AccountDeviceSession {
         retired: &[KeyPackage],
         state: &KeyPackageLifecycleState,
     ) -> SessionResult<()> {
-        Ok(self.engine.promote_key_package_lifecycle(retired, state)?)
+        Ok(self
+            .live_engine_mut()?
+            .promote_key_package_lifecycle(retired, state)?)
     }
 
     pub fn group_maintenance(
         &self,
         group_id: &GroupId,
     ) -> SessionResult<Option<GroupMaintenanceState>> {
-        Ok(self.engine.group_maintenance(group_id)?)
+        Ok(self.live_engine()?.group_maintenance(group_id)?)
     }
 
     pub fn put_group_maintenance(&self, state: &GroupMaintenanceState) -> SessionResult<()> {
-        Ok(self.engine.put_group_maintenance(state)?)
+        Ok(self.live_engine()?.put_group_maintenance(state)?)
     }
 
     pub fn put_maintenance_obligation(&self, record: &MaintenanceObligation) -> SessionResult<()> {
-        Ok(self.engine.put_maintenance_obligation(record)?)
+        Ok(self.live_engine()?.put_maintenance_obligation(record)?)
     }
 
     pub fn maintenance_obligation(
         &self,
         id: &MessageId,
     ) -> SessionResult<Option<MaintenanceObligation>> {
-        Ok(self.engine.maintenance_obligation(id)?)
+        Ok(self.live_engine()?.maintenance_obligation(id)?)
     }
 
     pub fn maintenance_obligations(&self) -> SessionResult<Vec<MaintenanceObligation>> {
-        Ok(self.engine.list_maintenance_obligations()?)
+        Ok(self.live_engine()?.list_maintenance_obligations()?)
     }
 
     pub fn maintenance_obligations_for_group(
@@ -568,12 +609,12 @@ impl AccountDeviceSession {
         group_id: &GroupId,
     ) -> SessionResult<Vec<MaintenanceObligation>> {
         Ok(self
-            .engine
+            .live_engine()?
             .list_maintenance_obligations_for_group(group_id)?)
     }
 
     pub fn delete_maintenance_obligation(&self, id: &MessageId) -> SessionResult<()> {
-        Ok(self.engine.delete_maintenance_obligation(id)?)
+        Ok(self.live_engine()?.delete_maintenance_obligation(id)?)
     }
 
     /// Durable disposition of one stored message, for state-derived repair of
@@ -582,73 +623,77 @@ impl AccountDeviceSession {
         &self,
         id: &MessageId,
     ) -> SessionResult<Option<cgka_traits::MessageState>> {
-        Ok(self.engine.stored_message_state(id)?)
+        Ok(self.live_engine()?.stored_message_state(id)?)
     }
 
     pub fn group_evolutions(&self) -> SessionResult<Vec<DurableGroupEvolution>> {
-        Ok(self.engine.list_group_evolutions()?)
+        Ok(self.live_engine()?.list_group_evolutions()?)
     }
 
     pub fn group_evolutions_for_group(
         &self,
         group_id: &GroupId,
     ) -> SessionResult<Vec<DurableGroupEvolution>> {
-        Ok(self.engine.list_group_evolutions_for_group(group_id)?)
+        Ok(self
+            .live_engine()?
+            .list_group_evolutions_for_group(group_id)?)
     }
 
     pub fn put_group_evolution(&self, record: &DurableGroupEvolution) -> SessionResult<()> {
-        Ok(self.engine.put_group_evolution(record)?)
+        Ok(self.live_engine()?.put_group_evolution(record)?)
     }
 
     pub fn own_leaf_hash(&self, group_id: &GroupId) -> SessionResult<Vec<u8>> {
-        Ok(self.engine.own_leaf_hash(group_id)?)
+        Ok(self.live_engine()?.own_leaf_hash(group_id)?)
     }
 
     pub fn put_transport_fanout(&self, record: &DurableTransportFanout) -> SessionResult<()> {
-        Ok(self.engine.put_transport_fanout(record)?)
+        Ok(self.live_engine()?.put_transport_fanout(record)?)
     }
 
     pub fn transport_fanout(
         &self,
         id: &MessageId,
     ) -> SessionResult<Option<DurableTransportFanout>> {
-        Ok(self.engine.transport_fanout(id)?)
+        Ok(self.live_engine()?.transport_fanout(id)?)
     }
 
     pub fn transport_fanouts(&self) -> SessionResult<Vec<DurableTransportFanout>> {
-        Ok(self.engine.list_transport_fanouts()?)
+        Ok(self.live_engine()?.list_transport_fanouts()?)
     }
 
     pub fn delete_transport_fanout(&self, id: &MessageId) -> SessionResult<()> {
-        Ok(self.engine.delete_transport_fanout(id)?)
+        Ok(self.live_engine()?.delete_transport_fanout(id)?)
     }
 
     pub fn periodic_maintenance_policy(&self) -> SessionResult<PeriodicMaintenancePolicy> {
-        Ok(self.engine.periodic_maintenance_policy()?)
+        Ok(self.live_engine()?.periodic_maintenance_policy()?)
     }
 
     pub fn put_periodic_maintenance_policy(
         &self,
         policy: PeriodicMaintenancePolicy,
     ) -> SessionResult<()> {
-        Ok(self.engine.put_periodic_maintenance_policy(policy)?)
+        Ok(self
+            .live_engine()?
+            .put_periodic_maintenance_policy(policy)?)
     }
 
     /// Abandon a group locally without sending a leave or disband.
     pub fn forget_group_local(&mut self, group_id: &GroupId) -> SessionResult<bool> {
-        Ok(self.engine.forget_group_local(group_id)?)
+        Ok(self.live_engine_mut()?.forget_group_local(group_id)?)
     }
 
     pub fn group_record(&self, group_id: &GroupId) -> SessionResult<Group> {
-        Ok(self.engine.group_record(group_id)?)
+        Ok(self.live_engine()?.group_record(group_id)?)
     }
 
     pub fn new_protocol_profile(&self) -> ProtocolProfile {
-        self.engine.new_protocol_profile()
+        self.protocol_profile
     }
 
     pub fn live_group_ids(&self) -> SessionResult<Vec<GroupId>> {
-        Ok(self.engine.live_group_ids()?)
+        Ok(self.live_engine()?.live_group_ids()?)
     }
 
     /// The stored outbound welcome for `id` along with its group, for
@@ -658,37 +703,39 @@ impl AccountDeviceSession {
         &self,
         id: &MessageId,
     ) -> SessionResult<(GroupId, TransportMessage)> {
-        Ok(self.engine.stored_sent_welcome(id)?)
+        Ok(self.live_engine()?.stored_sent_welcome(id)?)
     }
 
     /// Retained outbound Welcomes that have not yet met their independent
     /// delivery policy. This is derived from the engine's transactional
     /// message store, so it survives a crash before app projection writes.
     pub fn outstanding_sent_welcomes(&self) -> SessionResult<Vec<(GroupId, TransportMessage)>> {
-        Ok(self.engine.outstanding_sent_welcomes()?)
+        Ok(self.live_engine()?.outstanding_sent_welcomes()?)
     }
 
     /// IDs of delivery-aware outbound Welcomes, including completed ones.
     pub fn tracked_outbound_welcome_ids(&self) -> SessionResult<Vec<MessageId>> {
-        Ok(self.engine.tracked_outbound_welcome_ids()?)
+        Ok(self.live_engine()?.tracked_outbound_welcome_ids()?)
     }
 
     /// Complete one retained outbound Welcome delivery obligation after the
     /// transport reports the required acknowledgements.
     pub fn mark_sent_welcome_delivered(&self, id: &MessageId) -> SessionResult<()> {
-        Ok(self.engine.mark_sent_welcome_delivered(id)?)
+        Ok(self.live_engine()?.mark_sent_welcome_delivered(id)?)
     }
 
     /// Stored groups that failed session-open hydration and were skipped
     /// (mdk#151 / #417), paired with their coarse quarantine reason.
     /// Backs the application's per-group recovery surface (mdk#426).
-    pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
-        self.engine.quarantined_groups()
+    pub fn quarantined_groups(
+        &self,
+    ) -> SessionResult<Vec<(GroupId, GroupHydrationQuarantineReason)>> {
+        Ok(self.live_engine()?.quarantined_groups())
     }
 
     /// Number of currently quarantined groups without cloning their identities.
-    pub fn quarantined_group_count(&self) -> usize {
-        self.engine.quarantined_group_count()
+    pub fn quarantined_group_count(&self) -> SessionResult<usize> {
+        Ok(self.live_engine()?.quarantined_group_count())
     }
 
     /// Re-attempt hydration of a single quarantined group. Returns `Ok(true)`
@@ -698,23 +745,29 @@ impl AccountDeviceSession {
     /// beyond the crash-recovery already performed at open, never re-joins, and
     /// never discards local history.
     pub fn retry_hydrate_quarantined_group(&mut self, group_id: &GroupId) -> SessionResult<bool> {
-        Ok(self.engine.retry_hydrate_quarantined_group(group_id)?)
+        Ok(self
+            .live_engine_mut()?
+            .retry_hydrate_quarantined_group(group_id)?)
     }
 
     /// Group ids the session-open cheap pass seeded whose full hydration has
     /// not run yet (mdk#1161), route-backfill-pending groups first. Empty
     /// once the background hydration pipeline (or eager open) has drained.
-    pub fn unhydrated_group_ids(&self) -> Vec<GroupId> {
-        self.engine.unhydrated_group_ids()
+    pub fn unhydrated_group_ids(&self) -> SessionResult<Vec<GroupId>> {
+        Ok(self.live_engine()?.unhydrated_group_ids())
     }
 
     /// Fully hydrate one seeded group now. Returns `Ok(true)` when the group
     /// is live after the call (hydrated now, or it already was), `Ok(false)`
-    /// when hydration failed and the group moved to the quarantine surface —
-    /// the same terminal state an open-time hydration failure produces.
+    /// for an unknown, quarantined, removed, or disbanded group. A failed
+    /// hydration has the same quarantine outcome as an open-time failure.
     pub fn ensure_group_hydrated(&mut self, group_id: &GroupId) -> SessionResult<bool> {
-        match self.engine.ensure_hydrated(group_id) {
-            Ok(()) => Ok(true),
+        let engine = self.live_engine_mut()?;
+        match engine.ensure_hydrated(group_id) {
+            Ok(()) => match engine.epoch_state(group_id) {
+                None | Some(cgka_traits::EpochState::Disbanded(_)) => Ok(false),
+                Some(_) => Ok(!engine.group_record(group_id)?.is_terminal()),
+            },
             Err(EngineError::UnknownGroup(_)) => Ok(false),
             Err(other) => Err(other.into()),
         }
@@ -730,8 +783,11 @@ impl AccountDeviceSession {
         order: &[GroupId],
         budget: usize,
     ) -> SessionResult<HydrationProgress> {
-        let unhydrated: std::collections::HashSet<GroupId> =
-            self.engine.unhydrated_group_ids().into_iter().collect();
+        let unhydrated: std::collections::HashSet<GroupId> = self
+            .live_engine_mut()?
+            .unhydrated_group_ids()
+            .into_iter()
+            .collect();
         let mut batch: Vec<GroupId> = order
             .iter()
             .filter(|group_id| unhydrated.contains(*group_id))
@@ -742,7 +798,7 @@ impl AccountDeviceSession {
             let named: std::collections::HashSet<GroupId> = batch.iter().cloned().collect();
             let fill = budget - batch.len();
             batch.extend(
-                self.engine
+                self.live_engine_mut()?
                     .unhydrated_group_ids()
                     .into_iter()
                     .filter(|group_id| !named.contains(group_id))
@@ -751,18 +807,18 @@ impl AccountDeviceSession {
         }
         let mut progress = HydrationProgress::default();
         for group_id in batch {
-            match self.engine.ensure_hydrated(&group_id) {
+            match self.live_engine_mut()?.ensure_hydrated(&group_id) {
                 Ok(()) => progress.hydrated += 1,
                 Err(EngineError::UnknownGroup(_)) => progress.quarantined += 1,
                 Err(other) => return Err(other.into()),
             }
         }
-        progress.remaining = self.engine.unhydrated_group_ids().len();
+        progress.remaining = self.live_engine_mut()?.unhydrated_group_ids().len();
         Ok(progress)
     }
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> SessionResult<Vec<[u8; 32]>> {
-        Ok(self.engine.admin_pubkeys(group_id)?)
+        Ok(self.live_engine()?.admin_pubkeys(group_id)?)
     }
 
     pub fn app_component(
@@ -770,7 +826,7 @@ impl AccountDeviceSession {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> SessionResult<Option<Vec<u8>>> {
-        Ok(self.engine.app_component(group_id, component_id)?)
+        Ok(self.live_engine()?.app_component(group_id, component_id)?)
     }
 
     /// Batched [`Self::app_component`]: one engine state load answers every id.
@@ -779,7 +835,9 @@ impl AccountDeviceSession {
         group_id: &GroupId,
         component_ids: &[AppComponentId],
     ) -> SessionResult<Vec<Option<Vec<u8>>>> {
-        Ok(self.engine.app_components(group_id, component_ids)?)
+        Ok(self
+            .live_engine()?
+            .app_components(group_id, component_ids)?)
     }
 
     pub fn safe_export_secret(
@@ -787,7 +845,8 @@ impl AccountDeviceSession {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<SecretBytes, EngineError> {
-        self.engine.safe_export_secret(group_id, component_id)
+        self.live_engine_mut()?
+            .safe_export_secret(group_id, component_id)
     }
 
     pub fn exporter_secret(
@@ -796,7 +855,7 @@ impl AccountDeviceSession {
         label: &str,
         length: usize,
     ) -> Result<SecretBytes, EngineError> {
-        let context = self.engine.group_context(group_id)?;
+        let context = self.live_engine()?.group_context(group_id)?;
         context
             .exporter_secret(label, length)
             .ok_or_else(|| EngineError::Other(format!("missing exporter secret for label {label}")))
@@ -808,7 +867,7 @@ impl AccountDeviceSession {
         label: &str,
         length: usize,
     ) -> Result<(EpochId, SecretBytes), EngineError> {
-        let context = self.engine.group_context(group_id)?;
+        let context = self.live_engine()?.group_context(group_id)?;
         let epoch = context.epoch();
         let secret = context.exporter_secret(label, length).ok_or_else(|| {
             EngineError::Other(format!("missing exporter secret for label {label}"))
@@ -823,7 +882,7 @@ impl AccountDeviceSession {
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<Option<SecretBytes>, EngineError> {
-        self.engine
+        self.live_engine()?
             .retained_encrypted_media_exporter_secret(group_id, epoch)
     }
 
@@ -832,7 +891,7 @@ impl AccountDeviceSession {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<(EpochId, SecretBytes), EngineError> {
-        self.engine
+        self.live_engine_mut()?
             .safe_export_secret_with_epoch(group_id, component_id)
     }
 
@@ -841,7 +900,7 @@ impl AccountDeviceSession {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<EpochId, EngineError> {
-        self.engine
+        self.live_engine()?
             .current_safe_export_epoch(group_id, component_id)
     }
 
@@ -849,21 +908,22 @@ impl AccountDeviceSession {
         &self,
         group_id: &GroupId,
     ) -> Result<cgka_engine::key_package::KeyPackageRequirements, EngineError> {
-        self.engine.invite_key_package_requirements(group_id)
+        self.live_engine()?
+            .invite_key_package_requirements(group_id)
     }
 
     pub fn create_key_package_requirements(
         &self,
         request: &CreateGroupRequest,
     ) -> Result<cgka_engine::key_package::KeyPackageRequirements, EngineError> {
-        self.engine.create_key_package_requirements(request)
+        self.live_engine()?.create_key_package_requirements(request)
     }
 
     pub fn constructable_capabilities(
         &self,
         key_packages: &[KeyPackage],
     ) -> Result<cgka_traits::capabilities::GroupCapabilities, EngineError> {
-        self.engine.constructable_capabilities(key_packages)
+        self.live_engine()?.constructable_capabilities(key_packages)
     }
 
     pub async fn create_group(
@@ -878,8 +938,8 @@ impl AccountDeviceSession {
             initial_admin_count = req.initial_admins.len(),
             "creating group"
         );
-        let (group_id, result) = self.engine.create_group(req).await?;
-        let effects = self.collect_effects(vec![result]);
+        let (group_id, result) = self.live_engine_mut()?.create_group(req).await?;
+        let effects = self.collect_effects(vec![result])?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "create_group",
@@ -912,7 +972,7 @@ impl AccountDeviceSession {
             "creating group"
         );
         let (group_id, result) = self
-            .engine
+            .live_engine_mut()?
             .create_group_with_optional_app_components_and_audit_context(
                 req,
                 optional_app_components,
@@ -924,7 +984,7 @@ impl AccountDeviceSession {
             method = "create_group_with_audit_context",
             "group created"
         );
-        let effects = self.collect_effects(vec![result]);
+        let effects = self.collect_effects(vec![result])?;
         Ok(CreateGroupEffects { group_id, effects })
     }
 
@@ -935,14 +995,14 @@ impl AccountDeviceSession {
             intent_kind = send_intent_kind(&intent),
             "sending local intent"
         );
-        let result = self.engine.send(intent).await?;
+        let result = self.live_engine_mut()?.send(intent).await?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "send",
             result_kind = send_result_kind(&result),
             "local intent accepted"
         );
-        Ok(self.collect_effects(vec![result]))
+        self.collect_effects(vec![result])
     }
 
     pub async fn send_with_audit_context(
@@ -957,7 +1017,7 @@ impl AccountDeviceSession {
             "sending local intent"
         );
         let result = self
-            .engine
+            .live_engine_mut()?
             .send_with_audit_context(intent, Some(context))
             .await?;
         tracing::debug!(
@@ -966,7 +1026,7 @@ impl AccountDeviceSession {
             result_kind = send_result_kind(&result),
             "local intent accepted"
         );
-        Ok(self.collect_effects(vec![result]))
+        self.collect_effects(vec![result])
     }
 
     pub async fn queue_app_message_with_audit_context(
@@ -981,10 +1041,10 @@ impl AccountDeviceSession {
             "durably queueing local application-message intent"
         );
         let result = self
-            .engine
+            .live_engine_mut()?
             .queue_app_message_with_audit_context(group_id, payload, Some(context))
             .await?;
-        Ok(self.collect_effects(vec![result]))
+        self.collect_effects(vec![result])
     }
 
     pub async fn ingest(&mut self, msg: TransportMessage) -> SessionResult<IngestEffects> {
@@ -993,16 +1053,18 @@ impl AccountDeviceSession {
             method = "ingest",
             "ingesting transport message"
         );
-        let outcome = self.engine.ingest(msg).await?;
-        let left_object_unpersisted = self.engine.last_ingest_left_object_unpersisted();
+        let outcome = self.live_engine_mut()?.ingest(msg).await?;
+        let left_object_unpersisted = self
+            .live_engine_mut()?
+            .last_ingest_left_object_unpersisted();
         tracing::debug!(
             target: TRACE_TARGET,
             method = "ingest",
             outcome_kind = ingest_outcome_kind(&outcome),
             "transport message ingested"
         );
-        let valid_proposal_groups = self.engine.drain_valid_proposal_groups();
-        let effects = self.collect_effects(vec![]);
+        let valid_proposal_groups = self.live_engine_mut()?.drain_valid_proposal_groups();
+        let effects = self.collect_effects(vec![])?;
         Ok(IngestEffects {
             outcome,
             left_object_unpersisted,
@@ -1022,18 +1084,20 @@ impl AccountDeviceSession {
         );
         let transport_context = audit_transport_context(delivery.source);
         let outcome = self
-            .engine
+            .live_engine_mut()?
             .ingest_with_audit_context(delivery.message, Some(transport_context))
             .await?;
-        let left_object_unpersisted = self.engine.last_ingest_left_object_unpersisted();
+        let left_object_unpersisted = self
+            .live_engine_mut()?
+            .last_ingest_left_object_unpersisted();
         tracing::debug!(
             target: TRACE_TARGET,
             method = "ingest_delivery",
             outcome_kind = ingest_outcome_kind(&outcome),
             "transport delivery ingested"
         );
-        let valid_proposal_groups = self.engine.drain_valid_proposal_groups();
-        let effects = self.collect_effects(vec![]);
+        let valid_proposal_groups = self.live_engine_mut()?.drain_valid_proposal_groups();
+        let effects = self.collect_effects(vec![])?;
         Ok(IngestEffects {
             outcome,
             left_object_unpersisted,
@@ -1051,14 +1115,17 @@ impl AccountDeviceSession {
             method = "advance_convergence",
             "advancing convergence"
         );
-        let results = self.engine.advance_convergence(group_id).await?;
+        let results = self
+            .live_engine_mut()?
+            .advance_convergence(group_id)
+            .await?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "advance_convergence",
             result_count = results.len(),
             "convergence advanced"
         );
-        Ok(self.collect_effects(results))
+        self.collect_effects(results)
     }
 
     /// Settle retained convergence inputs without draining queued outbound
@@ -1080,22 +1147,27 @@ impl AccountDeviceSession {
             method = "advance_convergence_inputs",
             "advancing convergence inputs without draining queued outbound intents"
         );
-        let settled = self.engine.advance_convergence_inputs(group_id).await?;
+        let settled = self
+            .live_engine_mut()?
+            .advance_convergence_inputs(group_id)
+            .await?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "advance_convergence_inputs",
             settled,
             "convergence inputs advanced"
         );
-        Ok(self.collect_effects(Vec::new()))
+        self.collect_effects(Vec::new())
     }
 
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> SessionResult<bool> {
-        Ok(self.engine.has_pending_convergence_inputs(group_id)?)
+        Ok(self
+            .live_engine()?
+            .has_pending_convergence_inputs(group_id)?)
     }
 
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> SessionResult<bool> {
-        Ok(self.engine.has_queued_outbound_intents(group_id)?)
+        Ok(self.live_engine()?.has_queued_outbound_intents(group_id)?)
     }
 
     pub fn prepare_convergence_cutoff_delay_ms(
@@ -1103,7 +1175,7 @@ impl AccountDeviceSession {
         group_id: &GroupId,
     ) -> SessionResult<Option<u64>> {
         Ok(CgkaEngine::prepare_convergence_cutoff_delay_ms(
-            &mut self.engine,
+            self.live_engine_mut()?,
             group_id,
         )?)
     }
@@ -1112,7 +1184,9 @@ impl AccountDeviceSession {
         &mut self,
         group_id: &GroupId,
     ) -> SessionResult<Option<u64>> {
-        Ok(self.engine.deferred_peel_cutoff_delay_ms(group_id)?)
+        Ok(self
+            .live_engine_mut()?
+            .deferred_peel_cutoff_delay_ms(group_id)?)
     }
 
     /// See `Engine::reissue_superseded_own_commit` (mdk#1734).
@@ -1120,25 +1194,34 @@ impl AccountDeviceSession {
         &mut self,
         commit_id: &MessageId,
     ) -> SessionResult<Option<SupersededIntentReport>> {
-        Ok(self.engine.reissue_superseded_own_commit(commit_id)?)
+        Ok(self
+            .live_engine_mut()?
+            .reissue_superseded_own_commit(commit_id)?)
     }
 
     /// See `Engine::reissue_superseded_own_commits_from_state` (mdk#1734).
     pub fn reissue_superseded_own_commits_from_state(
         &mut self,
     ) -> SessionResult<Vec<SupersededIntentReport>> {
-        Ok(self.engine.reissue_superseded_own_commits_from_state()?)
+        Ok(self
+            .live_engine_mut()?
+            .reissue_superseded_own_commits_from_state()?)
     }
 
     pub async fn retry_rejoins_after_trusted_removal(&mut self) -> SessionResult<bool> {
-        Ok(self.engine.retry_rejoins_after_trusted_removal().await?)
+        Ok(self
+            .live_engine_mut()?
+            .retry_rejoins_after_trusted_removal()
+            .await?)
     }
 
     pub fn pending_group_rejoins_for(
         &self,
         group_id: &GroupId,
     ) -> SessionResult<Vec<cgka_traits::welcome::PendingWelcome>> {
-        Ok(self.engine.pending_group_rejoins_for(Some(group_id))?)
+        Ok(self
+            .live_engine()?
+            .pending_group_rejoins_for(Some(group_id))?)
     }
 
     pub async fn confirm_group_rejoin(
@@ -1146,21 +1229,24 @@ impl AccountDeviceSession {
         welcome_id: &MessageId,
         token: &[u8],
     ) -> SessionResult<GroupId> {
-        Ok(self.engine.confirm_group_rejoin(welcome_id, token).await?)
+        Ok(self
+            .live_engine_mut()?
+            .confirm_group_rejoin(welcome_id, token)
+            .await?)
     }
 
     pub fn decline_group_rejoin(&mut self, welcome_id: &MessageId) -> SessionResult<()> {
-        Ok(self.engine.decline_group_rejoin(welcome_id)?)
+        Ok(self.live_engine_mut()?.decline_group_rejoin(welcome_id)?)
     }
 
     pub fn reinvite_recovery_records(
         &self,
     ) -> SessionResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
-        Ok(self.engine.reinvite_recovery_records()?)
+        Ok(self.live_engine()?.reinvite_recovery_records()?)
     }
 
     pub fn pending_reinvites(&self) -> SessionResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
-        Ok(self.engine.pending_reinvites()?)
+        Ok(self.live_engine()?.pending_reinvites()?)
     }
 
     pub fn reserve_reinvite_lookup(
@@ -1168,7 +1254,9 @@ impl AccountDeviceSession {
         commit_id: &MessageId,
         now_ms: u64,
     ) -> SessionResult<bool> {
-        Ok(self.engine.reserve_reinvite_lookup(commit_id, now_ms)?)
+        Ok(self
+            .live_engine_mut()?
+            .reserve_reinvite_lookup(commit_id, now_ms)?)
     }
 
     pub fn reissue_invite_with_key_packages(
@@ -1177,7 +1265,7 @@ impl AccountDeviceSession {
         packages: Vec<KeyPackage>,
     ) -> SessionResult<Option<SupersededIntentReport>> {
         Ok(self
-            .engine
+            .live_engine_mut()?
             .reissue_invite_with_key_packages(commit_id, packages)?)
     }
 
@@ -1187,7 +1275,7 @@ impl AccountDeviceSession {
         group_id: &GroupId,
     ) -> SessionResult<Option<u64>> {
         Ok(self
-            .engine
+            .live_engine_mut()?
             .scheduled_self_remove_auto_commit_delay_ms(group_id)?)
     }
 
@@ -1196,13 +1284,58 @@ impl AccountDeviceSession {
         intent: &QueuedIntentRef,
     ) -> SessionResult<()> {
         Ok(self
-            .engine
+            .live_engine_mut()?
             .confirm_regenerated_queued_intent(&intent.intent_id)?)
     }
 
-    pub fn retry_regenerated_queued_intent(&mut self, intent: &QueuedIntentRef) {
-        self.engine
-            .retry_regenerated_queued_intent(&intent.group_id, &intent.intent_id);
+    pub fn regenerated_queued_intent_for_message(
+        &self,
+        message_id: &MessageId,
+    ) -> SessionResult<Option<QueuedIntentRef>> {
+        Ok({
+            self.live_engine()?
+                .regenerated_queued_intent_for_message(message_id)
+                .map(|(group_id, intent_id)| QueuedIntentRef {
+                    group_id,
+                    intent_id,
+                })
+        })
+    }
+
+    /// Durable ownership lookup for local fanout staging. Unlike the memory
+    /// lookup, this includes queued pending commits by their exact origin ID.
+    pub fn queued_intent_for_artifact(
+        &self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+    ) -> SessionResult<Option<QueuedIntentRef>> {
+        self.live_engine()?;
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .into_iter()
+            .find(|record| match &record.preparation {
+                QueuedIntentPreparation::BoundArtifact {
+                    artifact: RegeneratedArtifact::Message { message_id: bound },
+                } => bound == message_id,
+                QueuedIntentPreparation::BoundArtifact {
+                    artifact: RegeneratedArtifact::PendingCommit { origin_message_id },
+                } => origin_message_id == message_id,
+                QueuedIntentPreparation::Unprepared {} => false,
+            })
+            .map(|record| QueuedIntentRef {
+                group_id: record.group_id,
+                intent_id: record.id,
+            }))
+    }
+
+    pub fn retry_regenerated_queued_intent(
+        &mut self,
+        intent: &QueuedIntentRef,
+    ) -> SessionResult<()> {
+        Ok(self
+            .live_engine_mut()?
+            .retry_regenerated_queued_intent(&intent.group_id, &intent.intent_id)?)
     }
 
     pub async fn confirm_published(
@@ -1214,8 +1347,8 @@ impl AccountDeviceSession {
             method = "confirm_published",
             "confirming published state"
         );
-        let event = self.engine.confirm_published(pending).await?;
-        let mut effects = self.collect_effects(vec![]);
+        let event = self.live_engine_mut()?.confirm_published(pending).await?;
+        let mut effects = self.collect_effects(vec![])?;
         if !effects.events.contains(&event) {
             effects.events.insert(0, event);
         }
@@ -1233,10 +1366,10 @@ impl AccountDeviceSession {
         fanout: &mut OutboundFanout,
     ) -> SessionResult<SessionEffects> {
         let event = self
-            .engine
+            .live_engine_mut()?
             .confirm_published_fanout(pending, fanout)
             .await?;
-        let mut effects = self.collect_effects(vec![]);
+        let mut effects = self.collect_effects(vec![])?;
         if !effects.events.contains(&event) {
             effects.events.insert(0, event);
         }
@@ -1252,13 +1385,13 @@ impl AccountDeviceSession {
             method = "publish_failed",
             "recording publish failure"
         );
-        self.engine.publish_failed(pending).await?;
+        self.live_engine_mut()?.publish_failed(pending).await?;
         tracing::debug!(
             target: TRACE_TARGET,
             method = "publish_failed",
             "publish failure recorded"
         );
-        Ok(self.collect_effects(vec![]))
+        self.collect_effects(vec![])
     }
 
     pub async fn publish_failed_fanout(
@@ -1266,17 +1399,20 @@ impl AccountDeviceSession {
         pending: PendingStateRef,
         fanout: &mut OutboundFanout,
     ) -> SessionResult<SessionEffects> {
-        self.engine.publish_failed_fanout(pending, fanout).await?;
-        Ok(self.collect_effects(vec![]))
+        self.live_engine_mut()?
+            .publish_failed_fanout(pending, fanout)
+            .await?;
+        self.collect_effects(vec![])
     }
 
     /// Bounded local policy recovery, driven by account maintenance.
     pub fn recover_pending_application_authority(&mut self) -> SessionResult<()> {
-        self.engine.recover_pending_application_authority()?;
+        self.live_engine_mut()?
+            .recover_pending_application_authority()?;
         Ok(())
     }
 
-    pub fn drain(&mut self) -> SessionEffects {
+    pub fn drain(&mut self) -> SessionResult<SessionEffects> {
         tracing::trace!(
             target: TRACE_TARGET,
             method = "drain",
@@ -1286,11 +1422,14 @@ impl AccountDeviceSession {
     }
 
     pub fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError> {
-        self.engine.epoch(group_id)
+        self.live_engine()?.epoch(group_id)
     }
 
-    pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
-        self.engine.epoch_state(group_id)
+    pub fn epoch_state(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<cgka_traits::EpochState>> {
+        Ok(self.live_engine()?.epoch_state(group_id))
     }
 
     /// Compact, current engine facts for a worker-owned conversation capture.
@@ -1298,7 +1437,7 @@ impl AccountDeviceSession {
         &self,
         group_id: &GroupId,
     ) -> SessionResult<cgka_engine::group_authority::GroupAuthoritySnapshot> {
-        Ok(self.engine.group_authority(group_id)?)
+        Ok(self.live_engine()?.group_authority(group_id)?)
     }
 
     /// Compose host-owned persisted reads with compact live authority using
@@ -1327,74 +1466,74 @@ impl AccountDeviceSession {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<cgka_traits::DisbandRequest>, EngineError> {
-        self.engine.disband_request(group_id)
+        self.live_engine()?.disband_request(group_id)
     }
 
     pub fn disbanding_in_progress(&self, group_id: &GroupId) -> Result<bool, EngineError> {
-        self.engine.disbanding_in_progress(group_id)
+        self.live_engine()?.disbanding_in_progress(group_id)
     }
 
     pub fn leave_in_progress(&self, group_id: &GroupId) -> Result<bool, EngineError> {
-        self.engine.leave_in_progress(group_id)
+        self.live_engine()?.leave_in_progress(group_id)
     }
 
     pub fn disbanding_support_blockers(
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<MemberId>, EngineError> {
-        self.engine.disbanding_support_blockers(group_id)
+        self.live_engine()?.disbanding_support_blockers(group_id)
     }
 
     pub fn acknowledge_disband_failure(&self, group_id: &GroupId) -> Result<bool, EngineError> {
-        self.engine.acknowledge_disband_failure(group_id)
+        self.live_engine()?.acknowledge_disband_failure(group_id)
     }
 
     pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> SessionResult<()> {
-        self.engine.put_outbound_fanout(fanout)?;
+        self.live_engine()?.put_outbound_fanout(fanout)?;
         Ok(())
     }
 
     pub fn pending_origin_message_id(&self, pending: PendingStateRef) -> SessionResult<MessageId> {
-        Ok(self.engine.pending_origin_message_id(pending)?)
+        Ok(self.live_engine()?.pending_origin_message_id(pending)?)
     }
 
     pub fn pending_fanout_kind(
         &self,
         pending: PendingStateRef,
     ) -> SessionResult<cgka_traits::FanoutPendingKind> {
-        Ok(self.engine.pending_fanout_kind(pending)?)
+        Ok(self.live_engine()?.pending_fanout_kind(pending)?)
     }
 
     pub fn outbound_fanouts(&self) -> SessionResult<Vec<OutboundFanout>> {
-        Ok(self.engine.outbound_fanouts()?)
+        Ok(self.live_engine()?.outbound_fanouts()?)
     }
 
     pub fn outbound_fanouts_for_group(
         &self,
         group_id: &GroupId,
     ) -> SessionResult<Vec<OutboundFanout>> {
-        Ok(self.engine.outbound_fanouts_for_group(group_id)?)
+        Ok(self.live_engine()?.outbound_fanouts_for_group(group_id)?)
     }
 
     pub fn delete_outbound_fanout(&self, message_id: &MessageId) -> SessionResult<()> {
-        self.engine.delete_outbound_fanout(message_id)?;
+        self.live_engine()?.delete_outbound_fanout(message_id)?;
         Ok(())
     }
 
     pub fn pending_group_id(&self, pending: PendingStateRef) -> SessionResult<GroupId> {
-        Ok(self.engine.pending_group_id(pending)?)
+        Ok(self.live_engine()?.pending_group_id(pending)?)
     }
 
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {
-        self.engine.members(group_id)
+        self.live_engine()?.members(group_id)
     }
 
     pub fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError> {
-        self.engine.own_leaf_index(group_id)
+        self.live_engine()?.own_leaf_index(group_id)
     }
 
     pub fn self_id(&self) -> MemberId {
-        self.engine.self_id()
+        self.identity.clone()
     }
 
     pub fn set_convergence_policy(
@@ -1406,7 +1545,7 @@ impl AccountDeviceSession {
             method = "set_convergence_policy",
             "updating convergence policy"
         );
-        self.engine
+        self.live_engine_mut()?
             .set_convergence_policy(policy)
             .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))
     }
@@ -1416,148 +1555,162 @@ impl AccountDeviceSession {
         group_id: Option<&GroupId>,
         context: Option<AuditEventContext>,
         kind: AuditEventKind,
-    ) {
-        self.engine.audit_external(group_id, context, kind);
+    ) -> SessionResult<()> {
+        self.live_engine()?.audit_external(group_id, context, kind);
+        Ok(())
     }
 
     pub fn record_v5_event(
         &self,
         group_ref: Option<marmot_forensics::v5::GroupRef>,
         event: marmot_forensics::v5::Event,
-    ) {
-        self.engine.audit_v5_event(group_ref, event);
+    ) -> SessionResult<()> {
+        self.live_engine()?.audit_v5_event(group_ref, event);
+        Ok(())
     }
 
-    pub fn audit_v5_enabled(&self) -> bool {
-        self.engine.audit_v5_enabled()
+    pub fn audit_v5_enabled(&self) -> SessionResult<bool> {
+        Ok(self.live_engine()?.audit_v5_enabled())
     }
 
-    pub fn finish_audit_v5_recording(&self, reason: marmot_forensics::v5::RecordingStopReason) {
-        self.engine.finish_audit_v5_recording(reason);
+    pub fn finish_audit_v5_recording(
+        &self,
+        reason: marmot_forensics::v5::RecordingStopReason,
+    ) -> SessionResult<()> {
+        self.live_engine()?.finish_audit_v5_recording(reason);
+        Ok(())
     }
 
-    pub fn record_audit_health(&self) {
-        self.engine.audit_recorder_health();
+    pub fn record_audit_health(&self) -> SessionResult<()> {
+        self.live_engine()?.audit_recorder_health();
+        Ok(())
     }
 
     /// Path of the active forensic audit log, if a file-backed recorder is
     /// installed on this session. `None` when audit logging is off (the
     /// engine uses the no-op recorder).
-    pub fn audit_log_path(&self) -> Option<std::path::PathBuf> {
-        self.engine.audit_recorder_path()
+    pub fn audit_log_path(&self) -> SessionResult<Option<std::path::PathBuf>> {
+        Ok(self.live_engine()?.audit_recorder_path())
     }
 
     /// Rotate the forensic audit log: discard the current file and begin a
     /// fresh one, continuing to record from that point. No-op when no
     /// file-backed recorder is installed.
     pub fn rotate_audit_log(&self) -> std::io::Result<()> {
-        self.engine.rotate_audit_recorder()
+        self.live_engine()
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .rotate_audit_recorder()
     }
 
     /// Install or replace the forensic recorder on the live engine, e.g. when
     /// the audit-logging switch is toggled. Pass a `NoopRecorder` to stop
     /// recording; dropping the prior recorder flushes and closes any file it
     /// held, so no session reopen is required.
-    pub fn set_audit_recorder(&mut self, recorder: Box<dyn ForensicRecorder>) {
-        self.engine.set_recorder(recorder);
+    pub fn set_audit_recorder(&mut self, recorder: Box<dyn ForensicRecorder>) -> SessionResult<()> {
+        self.live_engine_mut()?.set_recorder(recorder);
+        Ok(())
     }
 
-    fn collect_effects(&mut self, results: Vec<SendResult>) -> SessionEffects {
-        let mut effects = SessionEffects {
-            events: self.engine.drain_events(),
-            publish: Vec::new(),
-            queued: Vec::new(),
-            pending_convergence: self.engine.drain_pending_convergence_groups(),
-        };
-        for result in results {
-            match result {
-                SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => {}
-                SendResult::ApplicationMessage {
-                    msg,
-                    group_id,
-                    app_event_id,
-                    source_epoch,
-                    retention,
-                    authority,
-                } => {
-                    let queued_intent = self
-                        .engine
-                        .regenerated_queued_intent_for_message(&msg.id)
-                        .map(|(group_id, intent_id)| QueuedIntentRef {
-                            group_id,
-                            intent_id,
-                        });
-                    effects.publish.push(PublishWork::ApplicationMessage {
+    fn collect_effects(&mut self, results: Vec<SendResult>) -> SessionResult<SessionEffects> {
+        Ok({
+            let mut effects = SessionEffects {
+                events: self.live_engine_mut()?.drain_events(),
+                publish: Vec::new(),
+                queued: Vec::new(),
+                pending_convergence: self.live_engine_mut()?.drain_pending_convergence_groups(),
+            };
+            for result in results {
+                match result {
+                    SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => {}
+                    SendResult::ApplicationMessage {
                         msg,
-                        queued_intent,
                         group_id,
                         app_event_id,
                         source_epoch,
                         retention,
                         authority,
-                    });
-                }
-                SendResult::Proposal { msg } => {
-                    let queued_intent = self
-                        .engine
-                        .regenerated_queued_intent_for_message(&msg.id)
-                        .map(|(group_id, intent_id)| QueuedIntentRef {
+                    } => {
+                        let queued_intent = self
+                            .live_engine_mut()?
+                            .regenerated_queued_intent_for_message(&msg.id)
+                            .map(|(group_id, intent_id)| QueuedIntentRef {
+                                group_id,
+                                intent_id,
+                            });
+                        effects.publish.push(PublishWork::ApplicationMessage {
+                            msg,
+                            queued_intent,
                             group_id,
-                            intent_id,
+                            app_event_id,
+                            source_epoch,
+                            retention,
+                            authority,
                         });
-                    effects
+                    }
+                    SendResult::Proposal { msg } => {
+                        let queued_intent = self
+                            .live_engine_mut()?
+                            .regenerated_queued_intent_for_message(&msg.id)
+                            .map(|(group_id, intent_id)| QueuedIntentRef {
+                                group_id,
+                                intent_id,
+                            });
+                        effects
+                            .publish
+                            .push(PublishWork::Proposal { msg, queued_intent });
+                    }
+                    SendResult::GroupEvolution {
+                        msg,
+                        welcomes,
+                        pending,
+                    } => effects.publish.push(PublishWork::GroupEvolution {
+                        msg,
+                        welcomes,
+                        pending,
+                    }),
+                    SendResult::GroupCreated { welcomes, pending } => effects
                         .publish
-                        .push(PublishWork::Proposal { msg, queued_intent });
+                        .push(PublishWork::GroupCreated { welcomes, pending }),
+                    SendResult::FoundingGroupCreated { welcomes } => effects
+                        .publish
+                        .push(PublishWork::FoundingGroupCreated { welcomes }),
+                    SendResult::Queued {
+                        group_id,
+                        intent_id,
+                    } => effects.queued.push(QueuedIntentRef {
+                        group_id,
+                        intent_id,
+                    }),
                 }
-                SendResult::GroupEvolution {
-                    msg,
-                    welcomes,
-                    pending,
-                } => effects.publish.push(PublishWork::GroupEvolution {
-                    msg,
-                    welcomes,
-                    pending,
-                }),
-                SendResult::GroupCreated { welcomes, pending } => effects
-                    .publish
-                    .push(PublishWork::GroupCreated { welcomes, pending }),
-                SendResult::FoundingGroupCreated { welcomes } => effects
-                    .publish
-                    .push(PublishWork::FoundingGroupCreated { welcomes }),
-                SendResult::Queued {
-                    group_id,
-                    intent_id,
-                } => effects.queued.push(QueuedIntentRef {
-                    group_id,
-                    intent_id,
-                }),
             }
-        }
-        for auto in self.engine.drain_auto_publish() {
-            effects.publish.push(PublishWork::AutoPublish {
-                msg: auto.msg,
-                pending: auto.pending,
-            });
-        }
-        for msg in self.engine.drain_auto_proposals() {
-            effects.publish.push(PublishWork::Proposal {
-                msg,
-                queued_intent: None,
-            });
-        }
-        effects
-            .pending_convergence
-            .extend(self.engine.drain_pending_convergence_groups());
-        effects.events.extend(self.engine.drain_events());
-        tracing::trace!(
-            target: TRACE_TARGET,
-            method = "collect_effects",
-            event_count = effects.events.len(),
-            publish_count = effects.publish.len(),
-            queued_count = effects.queued.len(),
-            "session effects collected"
-        );
-        effects
+            for auto in self.live_engine_mut()?.drain_auto_publish() {
+                effects.publish.push(PublishWork::AutoPublish {
+                    msg: auto.msg,
+                    pending: auto.pending,
+                });
+            }
+            for msg in self.live_engine_mut()?.drain_auto_proposals() {
+                effects.publish.push(PublishWork::Proposal {
+                    msg,
+                    queued_intent: None,
+                });
+            }
+            effects
+                .pending_convergence
+                .extend(self.live_engine_mut()?.drain_pending_convergence_groups());
+            effects
+                .events
+                .extend(self.live_engine_mut()?.drain_events());
+            tracing::trace!(
+                target: TRACE_TARGET,
+                method = "collect_effects",
+                event_count = effects.events.len(),
+                publish_count = effects.publish.len(),
+                queued_count = effects.queued.len(),
+                "session effects collected"
+            );
+            effects
+        })
     }
 }
 

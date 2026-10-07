@@ -87,7 +87,7 @@ fn epoch_backfill_terminal_event_kind(
 
 impl AppClient {
     pub(crate) fn audit_v5_enabled(&self) -> bool {
-        self.runtime.session().audit_v5_enabled()
+        matches!(self.runtime.session().audit_v5_enabled(), Ok(true))
     }
 
     /// Drain only current-operation events into the installed recorder. The
@@ -97,7 +97,7 @@ impl AppClient {
             return;
         };
         for (group_ref, event) in probe.take_live_events() {
-            self.runtime.session().record_v5_event(group_ref, event);
+            let _ = self.runtime.session().record_v5_event(group_ref, event);
         }
     }
 
@@ -248,7 +248,7 @@ impl AppClient {
         let Some(action) = context.human_action.as_ref() else {
             return;
         };
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             Some(group_id),
             Some(context.clone()),
             AuditEventKind::HumanAction {
@@ -313,7 +313,7 @@ impl AppClient {
                 accepted: outcome.accepted,
             })
             .collect();
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             None,
             None,
             AuditEventKind::SubscriptionRebuild {
@@ -343,7 +343,7 @@ impl AppClient {
         cursor_before_secs: Option<u64>,
         cursor_after_secs: Option<u64>,
     ) {
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             None,
             None,
             AuditEventKind::SyncDrain {
@@ -370,7 +370,7 @@ impl AppClient {
         trigger: EpochStallBackfillTrigger,
         context: &AuditEventContext,
     ) {
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             Some(group_id),
             Some(context.clone()),
             AuditEventKind::EpochStallBackfillArmed {
@@ -387,7 +387,7 @@ impl AppClient {
         retry_ordinal: u64,
         context: &AuditEventContext,
     ) {
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             None,
             Some(context.clone()),
             AuditEventKind::EpochStallBackfillStarted {
@@ -406,9 +406,10 @@ impl AppClient {
         context: &AuditEventContext,
     ) {
         let kind = epoch_backfill_terminal_event_kind(succeeded, terminal);
-        self.runtime
-            .session()
-            .record_audit_event(Some(group_id), Some(context.clone()), kind);
+        let _ =
+            self.runtime
+                .session()
+                .record_audit_event(Some(group_id), Some(context.clone()), kind);
     }
 
     pub(crate) fn record_epoch_stall_backfill_deferred(
@@ -417,7 +418,7 @@ impl AppClient {
         retry_ordinal: u64,
         context: &AuditEventContext,
     ) {
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             None,
             Some(context.clone()),
             AuditEventKind::EpochStallBackfillDeferred {
@@ -443,7 +444,7 @@ impl AppClient {
         stalled_epoch: u64,
         arms: u32,
     ) {
-        self.runtime.session().record_audit_event(
+        let _ = self.runtime.session().record_audit_event(
             Some(group_id),
             None,
             AuditEventKind::EpochStallBackfillEscalated {
@@ -460,7 +461,7 @@ impl AppClient {
     /// file it held, so no session reopen is required.
     pub(crate) fn set_audit_recording(&mut self, enabled: bool) {
         let recorder = self.app.build_audit_recorder(&self.state.label, enabled);
-        self.runtime.session_mut().set_audit_recorder(recorder);
+        let _ = self.runtime.session_mut().set_audit_recorder(recorder);
         if enabled {
             if self.audit_v5_enabled() && self.audit_v5_probe.is_none() {
                 self.audit_v5_probe = Some(super::audit_v5_probe::WelcomeProbe::live());
@@ -474,7 +475,7 @@ impl AppClient {
     /// Used only after the account worker observes an explicit graceful
     /// shutdown signal. Dropping a client on another path never emits stop.
     pub(crate) fn finish_audit_recording(&self) {
-        self.runtime.session().finish_audit_v5_recording(
+        let _ = self.runtime.session().finish_audit_v5_recording(
             marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown,
         );
     }
@@ -492,7 +493,15 @@ impl AppClient {
         &self,
         path: &std::path::Path,
     ) -> Result<bool, AppError> {
-        if self.runtime.session().audit_log_path().as_deref() == Some(path) {
+        if self
+            .runtime
+            .session()
+            .audit_log_path()
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(path)
+        {
             // The requester may have been cancelled after queueing this worker
             // command. Fence the destructive rotation where it actually runs,
             // independent of the requester's mutation guard.

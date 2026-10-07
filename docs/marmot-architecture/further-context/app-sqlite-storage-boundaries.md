@@ -17,7 +17,7 @@ For `N` active signing accounts whose stores have been opened, the layout has up
 
 | Path | Encryption and scope | Authority and recovery contract |
 | --- | --- | --- |
-| `accounts/<label>/session.sqlite` | Per-account SQLCipher | Contains authoritative protocol and recovery state plus durable app projections. It is not disposable and uses the numbered `cgka_schema_migrations` history described by [Storage Format V2](../storage-format-v2.md). |
+| `accounts/<label>/session.sqlite` | Per-account SQLCipher | Contains authoritative protocol and recovery state plus durable app projections. Its authoritative current state must be preserved during normal operation. Coordinated prelaunch resets require an explicitly bound disposable resource; it uses the single `current_account_schema_v1` marker described by [Storage Format V2](../storage-format-v2.md). |
 | `accounts/<label>/app-cache.sqlite3` | Per-account SQLCipher | Contains derived account-private Nostr directory and bounded search state. It can be reconstructed from `AccountHome` plus the Nostr network, but ordinary upgrades should preserve and migrate it so offline directory behavior and discovery provenance are not discarded. |
 | `shared.sqlite3` | Installation-wide plaintext SQLite, created owner-only | Contains a sanitized public-directory mirror plus durable installation-wide telemetry/audit preferences and the telemetry installation id. The directory rows are reconstructible; the settings and installation id must not be silently discarded with the cache. |
 
@@ -36,15 +36,13 @@ assuming the two SQLite commits are atomic.
 
 ## Legacy Imports
 
-The root-level `app-cache.sqlite3` is a legacy plaintext directory location that is imported and removed. Likewise,
-`accounts/<label>/app.sqlite3` is a legacy projection database imported once into `session.sqlite`. Neither is a fourth
-current store.
+The root-level `app-cache.sqlite3` is a legacy plaintext directory location that is imported and removed. The obsolete account-projection importer is removed; no account projection import is performed.
 
 ## Migration Domains
 
-All three current database categories have independent numbered migration histories and future-schema refusal:
-`session.sqlite` uses `cgka_schema_migrations`, per-account `app-cache.sqlite3` uses `app_cache_schema_migrations`, and
-installation-wide `shared.sqlite3` uses `shared_schema_migrations`. Each runner reads and updates only its own ledger.
+The account/session store installs its direct current schema and single version-1/name marker; it refuses historical,
+future, foreign and malformed layouts. Per-account `app-cache.sqlite3` independently uses `app_cache_schema_migrations`,
+and installation-wide `shared.sqlite3` uses `shared_schema_migrations`. Those independent migration contracts are unchanged.
 
 Cache version 1 creates the six directory/search tables and indexes. Existing unversioned tables are adopted only
 after their columns, types, nullability, defaults, primary keys and index columns match the version-1 shape. Missing
@@ -84,7 +82,7 @@ rows remain untouched; new databases do not create them.
 
 The shared store retains the unencrypted, owner-only operational posture documented in
 [storage-sqlite migrations](../../../crates/storage-sqlite/README.md#migrations). Directory mirroring/reconciliation,
-session storage, app-cache migrations, and the retired app-projection import are unchanged.
+app-cache migrations and shared-store contracts are unchanged; account/session initialization uses its direct baseline.
 
 Each store needs an independent schema identity because its release cadence, rollback behavior, and durability
 contract can diverge. A session migration version must never be treated as the version of either cache.

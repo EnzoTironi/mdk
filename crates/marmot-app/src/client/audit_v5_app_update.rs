@@ -75,7 +75,7 @@ impl AppClient {
             known_not_committed,
             failure_stage,
         } = observed;
-        self.runtime.session().record_v5_event(
+        let _ = self.runtime.session().record_v5_event(
             None,
             Event::AppUpdateOutcome(AppUpdateOutcome {
                 operation_ref: None,
@@ -122,7 +122,7 @@ impl AppClient {
         if !self.audit_v5_enabled() {
             return;
         }
-        self.runtime.session().record_v5_event(
+        let _ = self.runtime.session().record_v5_event(
             None,
             Event::AppUpdateOutcome(AppUpdateOutcome {
                 operation_ref: None,
@@ -149,7 +149,7 @@ impl AppClient {
         if !self.audit_v5_enabled() {
             return;
         }
-        self.runtime.session().record_v5_event(
+        let _ = self.runtime.session().record_v5_event(
             None,
             Event::AppUpdateOutcome(AppUpdateOutcome {
                 operation_ref: None,

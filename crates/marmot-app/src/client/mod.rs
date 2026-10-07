@@ -2030,7 +2030,7 @@ impl AppClient {
         if let (Some(probe), Some(pending)) = (&mut self.audit_v5_probe, founding_probe) {
             probe.founding_prepared(pending, &group_id, &prepared.effects);
             audit_context.v5_welcome_refs = probe.take_validated_refs();
-            if self.runtime.session().audit_v5_enabled()
+            if matches!(self.runtime.session().audit_v5_enabled(), Ok(true))
                 && let Ok(group) = self.runtime.group_record(&group_id)
             {
                 let admins = self.runtime.admin_pubkeys(&group_id).ok();
@@ -2183,7 +2183,7 @@ impl AppClient {
     /// separately stored self-membership projection.
     ///
     /// This read path does not classify departures from roster contents.
-    /// Legacy defaults are reconciled by the account-open backfill, while
+    /// Current projection writes preserve membership, while
     /// authenticated membership events own steady-state changes.
     pub(crate) fn group_roster_session(
         &self,
@@ -2217,7 +2217,7 @@ impl AppClient {
         let group = self.runtime.group_record(group_id)?;
         let lifecycle_state = self
             .runtime
-            .epoch_state(group_id)
+            .epoch_state(group_id)?
             .as_ref()
             .map(cgka_traits::GroupLifecycleState::from)
             .map(Into::into)
@@ -2270,15 +2270,17 @@ impl AppClient {
     /// reads this to surface a per-group recovery flow (mdk#426) — these
     /// groups are not in the live roster and otherwise vanish with no
     /// explanation. Each entry carries a coarse, privacy-safe recovery reason.
-    pub fn quarantined_groups(&self) -> Vec<AppQuarantinedGroup> {
-        self.runtime
-            .quarantined_groups()
-            .into_iter()
-            .map(|(group_id, reason)| AppQuarantinedGroup {
-                group_id_hex: hex::encode(group_id.as_slice()),
-                reason: reason.into(),
-            })
-            .collect()
+    pub fn quarantined_groups(&self) -> Result<Vec<AppQuarantinedGroup>, AppError> {
+        Ok({
+            self.runtime
+                .quarantined_groups()?
+                .into_iter()
+                .map(|(group_id, reason)| AppQuarantinedGroup {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    reason: reason.into(),
+                })
+                .collect()
+        })
     }
 
     /// Capture a [`GroupReadSnapshot`] of every known group's read-only
@@ -2368,7 +2370,7 @@ impl AppClient {
             groups,
             members,
             mls_state,
-            quarantined: self.quarantined_groups(),
+            quarantined: self.quarantined_groups()?,
         })
     }
 
@@ -3174,6 +3176,19 @@ impl AppClient {
                     group_id,
                     removed_registration.as_ref(),
                 );
+                if removed_registration.is_some()
+                    && self.runtime.session().is_closed()
+                    && let Err(recovery_error) =
+                        self.reopen_closed_session_for_push_compensation(group_id)
+                {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "leave_group",
+                        error_kind = recovery_error.privacy_safe_kind(),
+                        "failed-leave push compensation awaits session recovery",
+                    );
+                    return Err(err);
+                }
                 let _ = self
                     .retry_pending_push_registration_shares_best_effort()
                     .await;
@@ -3203,162 +3218,70 @@ impl AppClient {
         Ok(send_summary_from_effects(&effects))
     }
 
-    /// One-time open/upgrade backfill of `account_groups.self_membership`.
-    ///
-    /// Migration 0018 defaults every existing `account_groups` row to
-    /// `'member'`, which means accounts that already left / were removed from a
-    /// group *before* upgrading keep an inflated `account_unread_total()`: the
-    /// frozen unread row has no future removal event to flip the flag to
-    /// `'removed'`. This backfill closes that gap by deriving membership from
-    /// current engine state once, right after the account is opened. The pass
-    /// first reads every candidate roster and performs no membership writes if
-    /// any roster is unavailable or reflects a pending local publication, so a
-    /// deferred-hydration or publication retry cannot partly classify healthy
-    /// groups and then classify them again on a later pass.
-    ///
-    /// For each row carrying `'member'`, it asks the engine for the group's
-    /// roster (`runtime.members`, sourced from the hydrated Marmot record's
-    /// post-merge member set) and plans `Removed` only when the local account id
-    /// is absent. A pending publication, engine error, or malformed id aborts
-    /// before any plan is written, so uncertainty never suppresses. The work is
-    /// gated behind a once-only account-import marker, so subsequent opens are
-    /// a single marker read and the hot path stays projection-only.
-    ///
-    /// A backfilled departure is recorded as `Removed`, not `Left`: roster
-    /// absence cannot tell us *why* the account is gone, and `Removed`
-    /// ("removed by someone") is the safer unknown bucket — claiming the user
-    /// voluntarily left a group an admin actually evicted them from is the more
-    /// misleading error. Both states suppress the unread aggregate identically,
-    /// so the choice only affects how the chat list labels the departure.
-    pub(crate) fn backfill_self_membership_once(&self) -> Result<(), AppError> {
-        if self
-            .app
-            .account_import_marker(&self.state.label, crate::SELF_MEMBERSHIP_BACKFILL_MARKER)?
+    fn reopen_closed_session_for_push_compensation(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        if !self.runtime.session().is_closed()
+            || self._session_guard.label != self.state.label
+            || !Arc::ptr_eq(
+                &self._session_guard.owners,
+                &self.app.account_session_owners,
+            )
+            || !self
+                ._session_guard
+                .owners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&self._session_guard.label)
         {
-            return Ok(());
+            return Err(AppError::AccountSessionBusy);
         }
-        let local_account_id_hex = self
+        let account = self
             .app
             .account_home()
-            .account(&self.state.label)?
-            .account_id_hex;
-        let mut reconciliation = Vec::new();
-        for group_id_hex in self
-            .app
-            .account_group_ids_defaulting_to_member(&self.state.label)?
-        {
-            let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
-                tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "backfill_self_membership_once",
-                    abort_reason = "malformed_candidate",
-                    "aborting self-membership backfill"
-                );
-                return Ok(());
-            };
-            let group_id = GroupId::new(group_id_bytes);
-            // `members()` deliberately exposes the projected post-merge roster
-            // while a local commit awaits publication. That projection can be
-            // rolled back, so it cannot durably classify an account departure.
-            if matches!(
-                self.runtime.epoch_state(&group_id),
-                Some(cgka_traits::EpochState::PendingPublish(_))
-            ) {
-                return Ok(());
-            }
-            // Authoritative roster from engine state. On any engine error
-            // (unknown/quarantined group, partially-missing live state), abort
-            // the whole pass before writing anything. The preserving defaults
-            // remain and the unset marker makes the next open retry.
-            let members = match self.runtime.members(&group_id) {
-                Ok(members) => members,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "marmot_app::client",
-                        method = "backfill_self_membership_once",
-                        abort_reason = "roster_unavailable",
-                        error_kind = AppError::from(error).privacy_safe_kind(),
-                        "aborting self-membership backfill"
-                    );
-                    return Ok(());
-                }
-            };
-            reconciliation.push((
-                group_id_hex,
-                local_account_removed_from_roster(&members, &local_account_id_hex),
-            ));
+            .account(&self._session_guard.label)?;
+        let account_id = cgka_traits::MemberId::new(hex::decode(&account.account_id_hex)?);
+        if account_id != self.runtime.session().self_id() {
+            return Err(AppError::AccountSessionBusy);
         }
-        for (group_id_hex, removed) in reconciliation {
-            if removed {
-                self.app.set_group_self_membership(
-                    &self.state.label,
-                    &group_id_hex,
-                    SelfMembership::Removed,
-                )?;
-            }
-        }
-        self.app.mark_account_import_complete(
-            &self.state.label,
-            crate::SELF_MEMBERSHIP_BACKFILL_MARKER,
+        let peel_slot = self
+            .audit_v5_peel_slot
+            .as_ref()
+            .ok_or(AppError::AccountSessionBusy)?
+            .clone();
+        let signer = self.app.account_signer_for_summary(&account)?;
+        let config = self.app.account_session_config(
+            &account,
+            &signer,
+            self.transport_signer.clone(),
+            peel_slot,
         )?;
-        Ok(())
-    }
-
-    /// One-time open/upgrade backfill of `direct_conversation_members`.
-    ///
-    /// Migration 0050 creates the peer index empty. Groups saved after that
-    /// write their Direct roster on the projection path. Accounts that already
-    /// had unnamed two-member chats need one serialized pass on this worker
-    /// lane after hydration can read those rosters. The import marker is set
-    /// only when every eligible group is indexed; a failed or not-yet-hydrated
-    /// group leaves the marker unset so the next open retries. Steady-state
-    /// lookup never scans for unindexed rows.
-    pub(crate) fn backfill_direct_conversation_members_once(&self) -> Result<(), AppError> {
-        if self.app.account_import_marker(
-            &self.state.label,
-            crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
-        )? {
-            return Ok(());
+        self.app
+            .ensure_strict_cutover_replacement_intent_before_session_open(&account.label)?;
+        // The guard stays borrowed through normal eager open and installation.
+        // Keep the runtime's detached publishes and comparison owner intact.
+        let mut reopened = cgka_session::AccountDeviceSession::open(config)
+            .map_err(crate::external_signer_session_error)?;
+        if !reopened.ensure_group_hydrated(group_id)? {
+            return Err(AppError::UnknownGroup(hex::encode(group_id.as_slice())));
         }
-        let storage = self.app.account_storage(&self.state.label)?;
-        let unindexed = storage.unindexed_direct_conversation_group_ids()?;
-        let mut hydration_pending = false;
-        for group_id_hex in unindexed {
-            let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
-                continue;
-            };
-            if group_id_bytes.is_empty() {
-                continue;
+        let previous = std::mem::replace(self.runtime.session_mut(), reopened);
+        if let Err(error) = self.reconcile_hydrated_account_state() {
+            // A failed local reconciliation leaves the worker's ordinary
+            // closed-session reopen responsible for the durable compensation.
+            drop(std::mem::replace(self.runtime.session_mut(), previous));
+            return Err(error);
+        }
+        drop(previous);
+        if self.audit_v5_enabled() {
+            if self.audit_v5_probe.is_none() {
+                self.audit_v5_probe = Some(audit_v5_probe::WelcomeProbe::live());
             }
-            let group_id = GroupId::new(group_id_bytes);
-            let members = match self.runtime.members(&group_id) {
-                Ok(members) => members,
-                Err(err) => {
-                    if matches!(
-                        AppError::from(err).as_engine_error(),
-                        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
-                    ) {
-                        hydration_pending = true;
-                    }
-                    continue;
-                }
-            };
-            let member_ids_hex = members
-                .iter()
-                .map(|member| hex::encode(member.id.as_slice()).to_ascii_lowercase())
-                .collect::<Vec<_>>();
-            storage.fill_unindexed_direct_conversation_members(&group_id_hex, &member_ids_hex)?;
+        } else {
+            self.audit_v5_probe = None;
         }
-        if !hydration_pending
-            && storage
-                .unindexed_direct_conversation_group_ids()?
-                .is_empty()
-        {
-            self.app.mark_account_import_complete(
-                &self.state.label,
-                crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
-            )?;
-        }
+        self.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
         Ok(())
     }
 
@@ -6918,22 +6841,6 @@ fn require_initial_group_component_support(
     )))
 }
 
-/// Whether the local account (`local_account_id_hex`) is absent from a group's
-/// engine roster — the backfill's suppression decision. MLS member ids in this
-/// design are the Nostr account pubkey hex, so an account is "still a member"
-/// iff some roster entry's hex id matches the local id (case-insensitively).
-/// An empty roster is treated as absent. Kept pure and named so
-/// [`AppClient::backfill_self_membership_once`] is unit-testable without an
-/// engine harness.
-fn local_account_removed_from_roster(
-    members: &[cgka_traits::group::Member],
-    local_account_id_hex: &str,
-) -> bool {
-    !members
-        .iter()
-        .any(|member| hex::encode(member.id.as_slice()).eq_ignore_ascii_case(local_account_id_hex))
-}
-
 fn validate_stamped_poll_response(
     poll_event: &MarmotInnerEvent,
     response_created_at: u64,
@@ -7161,97 +7068,12 @@ mod app_component_gate_tests {
 }
 
 #[cfg(test)]
-mod self_membership_backfill_tests {
-    use super::{SelfMembership, local_account_removed_from_roster};
+mod current_membership_tests {
+    use super::SelfMembership;
     use crate::tests::ScriptedPushRelayClient;
     use crate::{AccountHome, MarmotApp};
-    use cgka_traits::MemberId;
-    use cgka_traits::group::Member;
     use cgka_traits::storage::GroupStorage;
     use std::sync::Arc;
-
-    fn member(id_hex: &str) -> Member {
-        Member {
-            id: MemberId::new(hex::decode(id_hex).unwrap()),
-            credential: Vec::new(),
-        }
-    }
-
-    /// A roster containing the local account preserves the member classification.
-    #[test]
-    fn local_account_in_roster_is_not_removed() {
-        let roster = vec![member("aa"), member("bb")];
-        // Local account ("aa") is still a member: must not be flagged removed.
-        assert!(!local_account_removed_from_roster(&roster, "aa"));
-        // Case-insensitive id match (uppercase local id).
-        assert!(!local_account_removed_from_roster(&roster, "AA"));
-    }
-
-    /// A non-empty roster without the local account classifies a legacy row as removed.
-    #[test]
-    fn local_account_absent_from_roster_is_removed() {
-        // Roster has only peers; the local account ("aa") was removed/left.
-        let roster = vec![member("bb"), member("cc")];
-        assert!(local_account_removed_from_roster(&roster, "aa"));
-    }
-
-    /// An empty authoritative roster classifies a legacy row as removed.
-    #[test]
-    fn empty_roster_is_treated_as_removed() {
-        assert!(local_account_removed_from_roster(&[], "aa"));
-    }
-
-    /// A projected roster from `PendingPublish` cannot complete or mutate the backfill.
-    #[tokio::test]
-    async fn pending_publish_defers_self_membership_backfill() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("pending group", &[]).await.unwrap();
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let storage = app.account_storage("alice").unwrap();
-        storage
-            .reset_direct_conversation_members_backfill(crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
-            .unwrap();
-
-        client
-            .runtime
-            .session_mut()
-            .send(cgka_traits::engine::SendIntent::SelfUpdate {
-                group_id: group_id.clone(),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            client.runtime.epoch_state(&group_id),
-            Some(cgka_traits::EpochState::PendingPublish(_))
-        ));
-
-        // Model a projected post-merge roster that temporarily omits the local
-        // account. Publication failure would restore this engine record, but it
-        // cannot repair an app-local membership row or a completed marker.
-        let mut projected = storage.get_group(&group_id).unwrap();
-        projected.members.clear();
-        storage.put_group(&projected).unwrap();
-
-        client.backfill_self_membership_once().unwrap();
-
-        assert_eq!(
-            app.stored_group_self_membership("alice", &group_id_hex)
-                .unwrap(),
-            Some(SelfMembership::Member),
-            "pending projection must not persist a departure",
-        );
-        assert!(
-            !app.account_import_marker("alice", crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
-                .unwrap(),
-            "pending projection must leave the marker unset for retry",
-        );
-    }
 
     /// Ordinary roster reads must preserve membership even when live members are incomplete.
     #[tokio::test]

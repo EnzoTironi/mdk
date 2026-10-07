@@ -1742,6 +1742,7 @@ impl MarmotApp {
                 &database,
                 SqlcipherDatabaseKind::DirectoryCache,
             )?
+            .0
         } else {
             self.external_sqlcipher_key(
                 &account.label,

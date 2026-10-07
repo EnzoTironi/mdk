@@ -30,7 +30,7 @@ site, and absence of a row does not establish that an operation never occurred.
 - Storage failures use typed busy/corruption/capacity classifications. Command
   completion owns a failure; sync completion owns forwarded partial-progress
   errors. SQLCipher recovery records performed/no-work/failure without key or
-  path information. Numbered migrations count only newly applied ledger entries.
+  path information. The account baseline counts one newly committed installation and zero current reopens.
 - KeyPackage lookup actions are canonical member-resolution commands; lookup
   attempts are package validations with usable/invalid/expired/unavailable
   outcomes. Directory source counts describe cache reuse versus network
@@ -104,9 +104,8 @@ than deployment or full catalogue acceptance:
   clock/session boundaries, consent migration/identity/persistence, stale work,
   HTTP batch limits/prefixes, retry/rejection behavior, background draining and
   close-before-drain ordering.
-- Shared-store tests: 40 passed. Account migration suite: 58 passed, three
-  pre-existing ignored tests. An additional open/reopen migration-summary test
-  verifies that existing ledger rows are not counted as new migrations.
+- Shared-store tests: 40 passed. The historical account-chain suite results are archival; current baseline qualification must be run separately.
+  The current open/reopen summary contract is one committed baseline and zero reapplications.
 - OTLP HTTP integration: seven passed. Baseline arithmetic tests cover counters,
   histogram buckets/sums, ratios, collection start times and source reset cases.
 - Directory tests: 68 passed. Mixed-publication and related selection tests: nine

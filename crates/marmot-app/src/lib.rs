@@ -99,6 +99,8 @@ mod external_signer;
 mod groups;
 mod history_notices;
 pub use history_notices::{HistoryNotice, HistoryNoticeCause};
+#[cfg(test)]
+mod account_state_witness;
 mod ids;
 mod key_package_records;
 #[cfg(test)]
@@ -113,7 +115,6 @@ mod messages;
 mod nostr_secret;
 mod nostr_verification;
 mod notifications;
-mod projection;
 mod publisher_sequences;
 mod relay_plane;
 mod relay_telemetry_export;
@@ -328,9 +329,8 @@ use conversions::{
     chat_notification_settings_from_account, group_push_token_from_account,
     normalize_relay_telemetry_settings, notification_settings_from_account,
     pending_push_registration_removal_from_account, relay_telemetry_settings_from_storage,
-    relay_telemetry_settings_to_storage, stored_app_event_from_message_record,
-    stored_app_event_from_projection, stored_push_registration_from_account,
-    stored_state_from_account_state,
+    relay_telemetry_settings_to_storage, stored_app_event_from_projection,
+    stored_push_registration_from_account, stored_state_from_account_state,
 };
 use directory::records::display_name_for_profile;
 use directory::{DirectoryCache, DirectorySyncHandle};
@@ -345,19 +345,8 @@ use key_package_records::{
     fresh_or_cached_key_package, latest_fresh_key_package_from_records,
     validated_cached_key_package,
 };
-use projection::LegacyAccountProjectionDb;
 use relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
 
-const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
-const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection-v1";
-/// Once-only marker for the open/upgrade backfill that derives
-/// `account_groups.self_membership` from current engine state for rows that
-/// predate migration 0018 (where every row defaulted to `'member'`).
-const SELF_MEMBERSHIP_BACKFILL_MARKER: &str = "self-membership-backfill-v1";
-/// Once-only marker for the open/upgrade backfill that writes
-/// `direct_conversation_members` from live rosters for Direct groups that
-/// predate migration 0050.
-const DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER: &str = "direct-conversation-members-backfill-v1";
 /// Invalidation reason for a sent app event that will never reach anyone,
 /// whether it was refused at send time or its group turned terminal while the
 /// engine still held it. The derived-state SQL keys the app-facing `Failed`
@@ -452,7 +441,7 @@ type AppRuntime = AccountDeviceRuntime<
 >;
 
 #[cfg(test)]
-type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
+type InventorySnapshotHook = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
 pub struct MarmotApp {
@@ -500,9 +489,9 @@ pub struct MarmotApp {
     #[cfg(test)]
     local_open_gates: local_open_test_gate::LocalOpenGates,
     #[cfg(test)]
-    legacy_projection_open_hook: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
+    account_state_witness: Option<Arc<account_state_witness::Witness>>,
     #[cfg(test)]
-    inventory_snapshot_between_reads: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
+    inventory_snapshot_between_reads: Arc<Mutex<Option<InventorySnapshotHook>>>,
     #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     #[cfg(test)]
@@ -1520,7 +1509,7 @@ impl MarmotApp {
             #[cfg(test)]
             local_open_gates: local_open_test_gate::LocalOpenGates::default(),
             #[cfg(test)]
-            legacy_projection_open_hook: Arc::new(Mutex::new(None)),
+            account_state_witness: None,
             #[cfg(test)]
             inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -1609,7 +1598,7 @@ impl MarmotApp {
             #[cfg(test)]
             local_open_gates: local_open_test_gate::LocalOpenGates::default(),
             #[cfg(test)]
-            legacy_projection_open_hook: Arc::new(Mutex::new(None)),
+            account_state_witness: None,
             #[cfg(test)]
             inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -1783,7 +1772,16 @@ impl MarmotApp {
                 blocking_progress.as_ref(),
                 AccountStartupStage::AccountState,
             );
+            #[cfg(test)]
+            let witness_operation = blocking_progress
+                .as_ref()
+                .and(app.account_state_witness.as_ref())
+                .and_then(|witness| witness.begin());
             app.ensure_account_state(&label)?;
+            #[cfg(test)]
+            if let Some(operation) = witness_operation {
+                operation.returned();
+            }
             enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
             let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
             #[cfg(test)]
@@ -1845,7 +1843,7 @@ impl MarmotApp {
         };
         let cursor_audit_placements = open.adapter.delivery_placement_counts();
         let recovery_loss_imports = open.recovery_loss_imports;
-        let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
+        let audit_v5_enabled = matches!(open.runtime.session().audit_v5_enabled(), Ok(true));
         let mut client = AppClient {
             #[cfg(test)]
             test_recovery_selection_witness: None,
@@ -3847,62 +3845,6 @@ impl MarmotApp {
         Ok(self.account_storage(label)?.epoch_stall_evidence()?)
     }
 
-    /// `group_id_hex` of every `account_groups` row carrying
-    /// `self_membership = 'member'`. The one-time open/upgrade backfill reads
-    /// this complete candidate set only while its account marker is absent.
-    pub(crate) fn account_group_ids_defaulting_to_member(
-        &self,
-        account_ref: &str,
-    ) -> Result<Vec<String>, AppError> {
-        let account = self.account_home().account(account_ref)?;
-        self.ensure_account_state(&account.label)?;
-        Ok(self
-            .account_storage(&account.label)?
-            .account_group_ids_defaulting_to_member()?)
-    }
-
-    /// Whether the named once-only account-import marker has been recorded.
-    pub(crate) fn account_import_marker(
-        &self,
-        account_ref: &str,
-        name: &str,
-    ) -> Result<bool, AppError> {
-        let account = self.account_home().account(account_ref)?;
-        self.ensure_account_state(&account.label)?;
-        Ok(self
-            .account_storage(&account.label)?
-            .account_import_marker(name)?)
-    }
-
-    /// Record the named once-only account-import marker as complete.
-    pub(crate) fn mark_account_import_complete(
-        &self,
-        account_ref: &str,
-        name: &str,
-    ) -> Result<(), AppError> {
-        let account = self.account_home().account(account_ref)?;
-        self.ensure_account_state(&account.label)?;
-        self.account_storage(&account.label)?
-            .mark_account_import_complete(name)?;
-        Ok(())
-    }
-
-    /// Test seam: empty the peer index and clear its completion marker so the
-    /// next account-worker open looks like the first open after migration 50.
-    #[cfg(any(test, feature = "test-policy-overrides"))]
-    pub fn reset_direct_conversation_members_backfill_for_test(
-        &self,
-        account_ref: &str,
-    ) -> Result<(), AppError> {
-        let account = self.account_home().account(account_ref)?;
-        self.ensure_account_state(&account.label)?;
-        self.account_storage(&account.label)?
-            .reset_direct_conversation_members_backfill(
-                DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
-            )?;
-        Ok(())
-    }
-
     pub(crate) fn remove_stale_group_push_tokens(
         &self,
         account_ref: &str,
@@ -4165,7 +4107,6 @@ impl MarmotApp {
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
-        let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer.clone());
         #[cfg(test)]
         let audit_v5_peel_slot = self
             .audit_v5_peel_slot
@@ -4175,76 +4116,14 @@ impl MarmotApp {
             .unwrap_or_else(|| Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default())));
         #[cfg(not(test))]
         let audit_v5_peel_slot = Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default()));
-        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> =
-            Box::new(client::audit_v5_probe::ProbePeeler {
-                inner: peeler,
-                slot: audit_v5_peel_slot.clone(),
-            });
-        let session_path = self.account_dir(label).join(SESSION_DB_FILE);
-        // load_state/account_storage above completed the first database open.
-        // Serialize any remaining key-migration probe with other openers.
-        let session_key = {
-            let lock = sqlcipher::database_open_lock(&session_path);
-            let database = lock.lock();
-            if let AccountSigner::Local(keys) = &signer {
-                self.sqlcipher_key_locked(label, keys, &database, SqlcipherDatabaseKind::Session)?
-            } else {
-                self.external_sqlcipher_key(
-                    label,
-                    &account.account_id_hex,
-                    &database,
-                    SqlcipherDatabaseKind::Session,
-                )?
-            }
-        };
-        // Optional forensic audit log. Enable `AuditLogSettings` before opening
-        // an account session to record per-account/device JSONL at
-        // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
-        // privacy-safe derived values only: obfuscated identifiers, digests,
-        // lengths, counts, reduced convergence data, and typed outcomes.
-        let mut session_config = SessionConfig::new(
-            session_path,
-            session_key,
-            account_id.as_slice().to_vec(),
-            peeler,
-        )
-        .account_identity_proof_signer(signer.as_proof_signer())
-        .feature_registry(app_feature_registry())
-        .supported_app_components(self.supported_app_component_ids());
+        let mut session_config = self.account_session_config(
+            &account,
+            &signer,
+            nostr_signer.clone(),
+            audit_v5_peel_slot.clone(),
+        )?;
         if defer_group_hydration {
             session_config = session_config.defer_group_hydration();
-        }
-        // Production uses the protocol-pinned convergence policy (SessionConfig's
-        // default). Only an explicit test-policy build may change it; normal
-        // debug and release builds ignore the knob (mdk#970).
-        if let Some(ms) = self.config.dev_settlement_quiescence_ms {
-            if cfg!(feature = "test-policy-overrides") {
-                session_config = session_config.convergence_policy(CanonicalizationPolicy {
-                    settlement_quiescence_ms: ms,
-                    ..CanonicalizationPolicy::default()
-                });
-            } else {
-                tracing::warn!(
-                    target: "marmot_app",
-                    method = "open_account",
-                    "ignoring dev_settlement_quiescence_ms without test-policy-overrides; pinned v1 policy required"
-                );
-            }
-        }
-        let audit_log_enabled = match self.audit_log_settings() {
-            Ok(settings) => settings.enabled,
-            Err(e) => {
-                tracing::warn!(
-                    target: "marmot_app",
-                    method = "open_account",
-                    error_kind = e.privacy_safe_kind(),
-                    "failed to read forensic audit log settings; continuing without audit logging"
-                );
-                false
-            }
-        };
-        if audit_log_enabled && let Some(recorder) = self.open_audit_recorder(label, &account_id) {
-            session_config = session_config.recorder(recorder);
         }
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
         let session =
@@ -4321,6 +4200,88 @@ impl MarmotApp {
             recovery_loss_imports,
             signer: nostr_signer,
         })
+    }
+
+    fn account_session_config(
+        &self,
+        account: &AccountSummary,
+        signer: &AccountSigner,
+        nostr_signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+        audit_v5_peel_slot: Arc<Mutex<client::audit_v5_probe::PeelSlot>>,
+    ) -> Result<SessionConfig, AppError> {
+        let label = account.label.as_str();
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer);
+        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> =
+            Box::new(client::audit_v5_probe::ProbePeeler {
+                inner: peeler,
+                slot: audit_v5_peel_slot.clone(),
+            });
+        let session_path = self.account_dir(label).join(SESSION_DB_FILE);
+        // load_state/account_storage above completed the first database open.
+        // Serialize any remaining key-migration probe with other openers.
+        let session_key = {
+            let lock = sqlcipher::database_open_lock(&session_path);
+            let database = lock.lock();
+            if let AccountSigner::Local(keys) = &signer {
+                self.sqlcipher_key_locked(label, keys, &database, SqlcipherDatabaseKind::Session)?
+                    .0
+            } else {
+                self.external_sqlcipher_key(
+                    label,
+                    &account.account_id_hex,
+                    &database,
+                    SqlcipherDatabaseKind::Session,
+                )?
+            }
+        };
+        // Optional forensic audit log. Enable `AuditLogSettings` before opening
+        // an account session to record per-account/device JSONL at
+        // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
+        // privacy-safe derived values only: obfuscated identifiers, digests,
+        // lengths, counts, reduced convergence data, and typed outcomes.
+        let mut session_config = SessionConfig::new(
+            session_path,
+            session_key,
+            account_id.as_slice().to_vec(),
+            peeler,
+        )
+        .account_identity_proof_signer(signer.as_proof_signer())
+        .feature_registry(app_feature_registry())
+        .supported_app_components(self.supported_app_component_ids());
+        // Production uses the protocol-pinned convergence policy (SessionConfig's
+        // default). Only an explicit test-policy build may change it; normal
+        // debug and release builds ignore the knob (mdk#970).
+        if let Some(ms) = self.config.dev_settlement_quiescence_ms {
+            if cfg!(feature = "test-policy-overrides") {
+                session_config = session_config.convergence_policy(CanonicalizationPolicy {
+                    settlement_quiescence_ms: ms,
+                    ..CanonicalizationPolicy::default()
+                });
+            } else {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "open_account",
+                    "ignoring dev_settlement_quiescence_ms without test-policy-overrides; pinned v1 policy required"
+                );
+            }
+        }
+        let audit_log_enabled = match self.audit_log_settings() {
+            Ok(settings) => settings.enabled,
+            Err(e) => {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "open_account",
+                    error_kind = e.privacy_safe_kind(),
+                    "failed to read forensic audit log settings; continuing without audit logging"
+                );
+                false
+            }
+        };
+        if audit_log_enabled && let Some(recorder) = self.open_audit_recorder(label, &account_id) {
+            session_config = session_config.recorder(recorder);
+        }
+        Ok(session_config)
     }
 
     fn acquire_account_session(&self, label: &str) -> Result<AppAccountSessionGuard, AppError> {
@@ -5693,25 +5654,68 @@ impl MarmotApp {
             method = "ensure_account_state"
         )
         .entered();
+        #[cfg(test)]
+        let boundary = account_state_witness::Boundary::enter(
+            self.account_state_witness.as_ref(),
+            account_state_witness::Phase::AccountLookup,
+        );
         let account = self.account_home().account(label)?;
+        #[cfg(test)]
+        boundary.returned();
+        #[cfg(test)]
+        let boundary = account_state_witness::Boundary::enter(
+            self.account_state_witness.as_ref(),
+            account_state_witness::Phase::ReadyLock,
+        );
         let mut ready = self
             .account_state_ready
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(test)]
+        boundary.returned();
         if ready.contains(label) {
             return Ok(());
         }
         #[cfg(test)]
+        let boundary = account_state_witness::Boundary::enter(
+            self.account_state_witness.as_ref(),
+            account_state_witness::Phase::TestGate,
+        );
+        #[cfg(test)]
         self.local_open_gates
             .wait(label, AccountStartupStage::AccountState);
+        #[cfg(test)]
+        boundary.returned();
         // Run KeyPackage cutover before any other account-storage access. The
         // cutover uses pre-existence of the encrypted account database as the
         // durable distinction between a fresh local account and an upgraded
         // device whose missing JSON slot must fail closed.
+        #[cfg(test)]
+        let boundary = account_state_witness::Boundary::enter(
+            self.account_state_witness.as_ref(),
+            account_state_witness::Phase::StrictCutover,
+        );
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
-        self.migrate_legacy_account_projection_if_needed(label)?;
-        self.account_storage(label)?
-            .ensure_account_projection_with_identity(label, &account.account_id_hex)?;
+        #[cfg(test)]
+        boundary.returned();
+        {
+            #[cfg(test)]
+            let boundary = account_state_witness::Boundary::enter(
+                self.account_state_witness.as_ref(),
+                account_state_witness::Phase::AccountStorage,
+            );
+            let storage = self.account_storage(label)?;
+            #[cfg(test)]
+            boundary.returned();
+            #[cfg(test)]
+            let boundary = account_state_witness::Boundary::enter(
+                self.account_state_witness.as_ref(),
+                account_state_witness::Phase::ProjectionIdentity,
+            );
+            storage.ensure_account_projection_with_identity(label, &account.account_id_hex)?;
+            #[cfg(test)]
+            boundary.returned();
+        }
         ready.insert(label.to_owned());
         Ok(())
     }
@@ -5857,10 +5861,6 @@ impl MarmotApp {
 
     fn account_dir(&self, label: &str) -> PathBuf {
         self.account_home().account_dir(label)
-    }
-
-    fn legacy_account_projection_path(&self, label: &str) -> PathBuf {
-        self.account_dir(label).join(LEGACY_ACCOUNT_APP_DB_FILE)
     }
 
     fn account_storage_path(&self, label: &str) -> PathBuf {
@@ -6075,8 +6075,15 @@ impl MarmotApp {
         )
         .entered();
         let path = self.account_storage_path(label);
+        #[cfg(test)]
+        let boundary = account_state_witness::Boundary::enter(
+            self.account_state_witness.as_ref(),
+            account_state_witness::Phase::DatabaseLock,
+        );
         let lock = sqlcipher::database_open_lock(&path);
         let database = lock.lock();
+        #[cfg(test)]
+        boundary.returned();
         // Another opener may have filled the cache while we waited. Hold the
         // database guard through key selection, migrations and publication.
         if let Some(storage) = self
@@ -6089,21 +6096,48 @@ impl MarmotApp {
             return Ok(storage);
         }
         let account = self.account_home().account(label)?;
-        let key = if account.local_signing {
+        #[cfg(test)]
+        let boundary = account_state_witness::Boundary::enter(
+            self.account_state_witness.as_ref(),
+            account_state_witness::Phase::KeySelection,
+        );
+        let (key, local_salt) = if account.local_signing {
             let keys = self.account_home().load_signing_keys(label)?;
-            self.sqlcipher_key_locked(label, &keys, &database, SqlcipherDatabaseKind::Session)?
+            let (key, salt) =
+                self.sqlcipher_key_locked(label, &keys, &database, SqlcipherDatabaseKind::Session)?;
+            (key, Some(salt))
         } else {
-            self.external_sqlcipher_key(
-                label,
-                &account.account_id_hex,
-                &database,
-                SqlcipherDatabaseKind::Session,
-            )?
+            (
+                self.external_sqlcipher_key(
+                    label,
+                    &account.account_id_hex,
+                    &database,
+                    SqlcipherDatabaseKind::Session,
+                )?,
+                None,
+            )
         };
+        #[cfg(test)]
+        boundary.returned();
         let migration_observation =
             self.product_analytics
                 .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
+        #[cfg(test)]
+        let boundary = account_state_witness::Boundary::enter(
+            self.account_state_witness.as_ref(),
+            account_state_witness::Phase::EncryptedOpen,
+        );
+        #[cfg(all(test, feature = "test-policy-overrides"))]
+        let opened =
+            account_state_witness::open_encrypted(self.account_state_witness.as_ref(), &path, &key);
+        #[cfg(not(all(test, feature = "test-policy-overrides")))]
         let opened = SqliteAccountStorage::open_encrypted(&path, &key);
+        #[cfg(test)]
+        if opened.is_ok() {
+            boundary.returned();
+        } else {
+            drop(boundary);
+        }
         if let Some(observation) = migration_observation {
             match &opened {
                 Ok(storage) if storage.migration_summary().0 > 0 => {
@@ -6118,6 +6152,11 @@ impl MarmotApp {
             }
         }
         let storage = opened?;
+        if let Some(salt) = local_salt {
+            // The held file guard and exact selected salt bind this real keyed
+            // open; preparing a key alone cannot establish a verdict.
+            sqlcipher::record_account_storage_v2_open(&database, &salt);
+        }
         // Publishing under `_lifecycle` is what keeps this connection reachable
         // by a later `close_storage`; see `begin_storage_open`.
         let mut storages = self
@@ -6482,87 +6521,10 @@ impl MarmotApp {
             .into())
     }
 
-    fn migrate_legacy_account_projection_if_needed(&self, label: &str) -> Result<(), AppError> {
-        let path = self.legacy_account_projection_path(label);
-        if !path.exists() {
-            return Ok(());
-        }
-        let storage = self.account_storage(label)?;
-        if storage.account_import_marker(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)? {
-            return Ok(());
-        }
-
-        // The cached account-storage lookup above releases its open guard before
-        // returning. Take a new lifecycle admission across the raw legacy
-        // connection and the complete import so `close_storage` cannot latch,
-        // release the root lease, and then have this path reopen a database in
-        // the supposedly lock-free root.
-        let _lifecycle = self.begin_storage_open("legacy account projection")?;
-        #[cfg(test)]
-        self.run_legacy_projection_open_hook_for_test();
-        let legacy = self.legacy_account_projection(label)?;
-        let state = legacy.load_state(label)?;
-        storage.save_account_projection_state(
-            &stored_state_from_account_state(&state),
-            MAX_SEEN_EVENT_IDS,
-            TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
-        )?;
-        for message in legacy.messages(AppMessageQuery::default())? {
-            if message.message_id_hex.is_empty() {
-                continue;
-            }
-            storage.record_app_event(&stored_app_event_from_message_record(&message))?;
-        }
-        if let Some(settings) = legacy.existing_notification_settings(label)? {
-            storage.notification_settings(label, &settings.account_id_hex)?;
-            storage.set_local_notifications_enabled(
-                label,
-                &settings.account_id_hex,
-                settings.local_notifications_enabled,
-            )?;
-            storage.set_native_push_enabled(
-                label,
-                &settings.account_id_hex,
-                settings.native_push_enabled,
-            )?;
-        }
-        if let Some(registration) = legacy.push_registration(label)? {
-            storage.upsert_push_registration(
-                account_push_registration_from_app(registration.registration),
-                registration.token_bytes,
-            )?;
-        }
-        for token in legacy.all_group_push_tokens()? {
-            storage.upsert_group_push_token(&account_group_push_token_from_app(&token))?;
-        }
-        storage.mark_account_import_complete(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn set_legacy_projection_open_hook_for_test(&self, hook: LegacyProjectionOpenHook) {
-        *self
-            .legacy_projection_open_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
-    }
-
-    #[cfg(test)]
-    fn run_legacy_projection_open_hook_for_test(&self) {
-        let hook = self
-            .legacy_projection_open_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn set_inventory_snapshot_between_reads_for_test(
         &self,
-        hook: Option<LegacyProjectionOpenHook>,
+        hook: Option<InventorySnapshotHook>,
     ) {
         *self
             .inventory_snapshot_between_reads
@@ -6610,33 +6572,6 @@ impl MarmotApp {
         lifecycle: Option<cgka_traits::KeyPackageLifecycleState>,
     ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
         self.project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)
-    }
-
-    fn legacy_account_projection(
-        &self,
-        label: &str,
-    ) -> Result<LegacyAccountProjectionDb, AppError> {
-        let path = self.legacy_account_projection_path(label);
-        let lock = sqlcipher::database_open_lock(&path);
-        let database = lock.lock();
-        let account = self.account_home().account(label)?;
-        let key = if account.local_signing {
-            let keys = self.account_home().load_signing_keys(label)?;
-            self.sqlcipher_key_locked(
-                label,
-                &keys,
-                &database,
-                SqlcipherDatabaseKind::AccountProjection,
-            )?
-        } else {
-            self.external_sqlcipher_key(
-                label,
-                &account.account_id_hex,
-                &database,
-                SqlcipherDatabaseKind::AccountProjection,
-            )?
-        };
-        LegacyAccountProjectionDb::open(path, &key)
     }
 
     fn projection_status(&self, label: &str) -> Result<AppProjectionStatus, AppError> {

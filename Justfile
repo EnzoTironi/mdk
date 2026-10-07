@@ -80,14 +80,6 @@ bench-create-direct-message:
 bench-group-image-create:
     cargo test --release -p marmot-app --test group_image_create -- --ignored --nocapture --test-threads=1
 
-# Storage-format v1 -> v2 operational benchmark (mdk#1414). Builds a
-# file-backed schema-v46 database with legacy Welcome-heavy rows, samples the
-# database/WAL/SHM high-water mark across migration, bounded promotion, reopen,
-# and explicit VACUUM, then prints one stable `MDK_BENCH ...` line. Override
-# the default 512 rows with `MDK_STORAGE_OPS_ROWS=<count>`.
-bench-storage-upgrade:
-    cargo test --release -p storage-sqlite migrations::tests::storage_format_upgrade_benchmark -- --ignored --exact --nocapture --test-threads=1
-
 # Idle reconciliation regression benchmark (mdk#1380). Builds one agent
 # account with several joined groups, idles a long-lived inbound subscription
 # over many compressed former-intervals, asserts the adaptive safety nets stay

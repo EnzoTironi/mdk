@@ -56,8 +56,8 @@ For `N` active signing accounts whose stores have been opened, the current layou
 authoritative SQLCipher `session.sqlite` and a derived SQLCipher `app-cache.sqlite3` per account, plus the
 installation-wide `shared.sqlite3` public-directory and settings store.
 
-Only the session database currently has a numbered migration ledger. The auxiliary stores need independent migration
-histories before non-additive schema changes. Their authority, reconciliation, durability, and legacy-import contracts
+The session database uses one direct current-schema marker. Directory and shared stores retain independent numbered
+migration ledgers. Their authority, reconciliation, durability and resource boundaries
 are detailed in [App SQLite Storage Boundaries](../further-context/app-sqlite-storage-boundaries.md).
 
 ## CLI Contract

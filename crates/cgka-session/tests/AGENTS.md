@@ -19,8 +19,8 @@ Never connect to real relays from these tests.
 
 ## Fixtures
 
-`../fixtures/session-promotion-v1.bin` backs the promotion-facade regression; see
-[`../fixtures/README.md`](../fixtures/README.md) before regenerating or replacing it.
+The current-message regression creates and confirms a group through the public Session API, then verifies complete
+Welcome and sent-message records through public storage reads across cold reopen. It does not seed historical rows.
 
 ## Verification
 

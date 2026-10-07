@@ -16,8 +16,8 @@ not "fix" it into the per-account database.
 | --- | --- |
 | `src/connection.rs` | SQLCipher key application, operational PRAGMAs, options, aggregate handle. |
 | `src/codec.rs` | JSON serialization helpers and SQLite error mapping. |
-| `src/migrations.rs` | Rust migration runner and migration tests. |
-| `src/migrations/` | Numbered Rust migration bodies plus upgrade/query-work tests; see its local `AGENTS.md`. |
+| `src/account_schema.rs` | One-transaction current account/session installer and refusal validation. |
+| `src/account_schema/` | Direct final DDL/seeds, exact shape, native reference and current/query-work tests; see its local `AGENTS.md`. |
 | `src/storage/` | Marmot engine storage tables by concern; see its local `AGENTS.md`. |
 | `src/storage/snapshots/` | Snapshot/checkpoint capture, restoration and the consistent replay-state fingerprint; see its local `AGENTS.md`. |
 | `src/openmls_storage/` | Custom OpenMLS storage adapter; see its local `AGENTS.md`. |
@@ -48,7 +48,7 @@ not "fix" it into the per-account database.
 | `src/shared/presentation.rs` | Accepted directory profile bytes and local revision under one shared-store transaction. |
 | `src/shared/migration_tests.rs`, `src/shared/assurance_tests.rs`, `src/shared/fixtures/` | Shared migration contract, populated historical upgrades and bounded interrupted-transaction recovery. |
 | `src/shared.rs` | `SqliteSharedStorage`: a separate non-account-scoped database for cross-identity state (public-directory cache and presentation, relay-telemetry/usage-diagnostics/audit-log settings, telemetry install id). |
-| `fixtures/` | Immutable account-database compatibility fixtures; see `fixtures/README.md`. |
+| `fixtures/README.md` | Current baseline evidence and retirement of numbered account-upgrade fixtures. |
 
 ## Invariants
 
@@ -60,15 +60,13 @@ not "fix" it into the per-account database.
   `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Retained-anchor policy is engine/group policy. SQLite stores snapshots and policy bytes; the engine decides when to
   prune.
-- Follow `docs/marmot-architecture/storage-format-v2.md`: numbered schema migrations gate database compatibility;
-  independently decoded blobs carry artifact-local versions; new `cgka_messages` writes use normalized format 2;
-  legacy format-1 rows remain readable and promote atomically on mutation.
-- Keep history-wide format promotion out of account open. The app runtime owns bounded post-readiness scheduling;
-  storage owns only the atomic, idempotent batch and aggregate progress result.
-- Never make `record` and normalized message columns competing authorities. In format 2, scalar columns, `payload`,
-  and `deferred_peel` are authoritative and `record` is `NULL`.
-- Migration file names use padded numeric prefixes, for example `0001_initial_schema.rs`. Never regenerate a
-  version-named fixture with a later writer.
+- Follow `docs/marmot-architecture/storage-format-v2.md`: the distinct current account marker and exact schema shape
+  gate database admission; independently decoded blobs retain their artifact-local versions.
+- `cgka_messages` has one normalized representation: scalar columns, required BLOB `payload`, and optional
+  `deferred_peel` are authoritative. There is no message `record` column, row-format discriminator, historical
+  decoder, promotion API, or host promotion schedule.
+- Install the direct current account schema atomically; refuse historical/foreign/partial schemas. External resets
+  belong to the account-device owner and require an exact affected-resource manifest.
 - Recovery-ledger, conversation-read, and replay-fingerprint contracts are stated in README.md; keep code and that text
   in sync. Never log or persist replay fingerprints.
 
@@ -77,6 +75,4 @@ not "fix" it into the per-account database.
 ```sh
 cargo test -p storage-sqlite
 cargo clippy -p storage-sqlite --all-targets -- -D warnings
-# Ignored file-backed v1 -> v2 operational benchmark:
-just bench-storage-upgrade
 ```

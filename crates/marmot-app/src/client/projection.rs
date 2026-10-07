@@ -479,7 +479,7 @@ impl AppClient {
         let live_group_ids = self.runtime.live_group_ids()?;
         let quarantined: std::collections::HashSet<_> = self
             .runtime
-            .quarantined_groups()
+            .quarantined_groups()?
             .into_iter()
             .map(|(id, _)| hex::encode(id.as_slice()))
             .collect();
@@ -563,8 +563,7 @@ impl AppClient {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
         self.reconcile_disband_drafts();
-        self.backfill_self_membership_once()?;
-        self.backfill_direct_conversation_members_once()
+        Ok(())
     }
 
     /// Finish the app-local half of durable disband acceptance after a crash
@@ -1194,9 +1193,6 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
             "read_marker_failed:invalid_group_membership_page"
         }
         AppError::ChatPresentationNotReady => "read_marker_failed:chat_presentation_not_ready",
-        AppError::DirectConversationIndexNotReady => {
-            "read_marker_failed:direct_conversation_index_not_ready"
-        }
         AppError::InvalidCachedIdentityPage(_) => "read_marker_failed:invalid_cached_identity_page",
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",

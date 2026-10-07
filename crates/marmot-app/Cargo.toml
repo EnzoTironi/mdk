@@ -12,6 +12,7 @@ product-analytics-export = []
 test-policy-overrides = [
     "cgka-engine/test-policy-overrides",
     "cgka-session/test-policy-overrides",
+    "storage-sqlite/diagnostic-account-open-witness",
 ]
 # Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
 # privacy-critical mapping and opt-in gate stay in the default build; this

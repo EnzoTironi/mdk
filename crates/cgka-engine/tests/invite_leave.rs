@@ -1568,6 +1568,7 @@ fn queue_app_message_intent(
             },
             created_at_ms: 1,
             reissue_attempts: 0,
+            preparation: cgka_traits::storage::QueuedIntentPreparation::Unprepared {},
         })
         .expect("queue outbound intent");
     id

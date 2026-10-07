@@ -13,18 +13,14 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::KeyPackageBundleStorage;
+use cgka_traits::storage::{KeyPackageBundleStorage, MessageStorage};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use nostr::prelude::FinalizeEvent;
-use std::io::Write;
 use std::sync::Arc;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
-
-const SESSION_PROMOTION_FIXTURE: &[u8] = include_bytes!("../fixtures/session-promotion-v1.bin");
-const SESSION_PROMOTION_GROUP_ID_HEX: &str = "1d3ce58153822ac936ba83eba9cb87db";
 
 fn deterministic_nostr_keys(name: &[u8]) -> nostr::prelude::Keys {
     use sha2::{Digest, Sha256};
@@ -316,33 +312,94 @@ async fn session_reopens_encrypted_sqlite_group_state() {
 }
 
 #[tokio::test]
-async fn session_facade_promotes_one_bounded_legacy_row_without_semantic_change() {
+async fn session_current_message_persists_across_cold_reopen_without_semantic_change() {
     let dir = tempfile::tempdir().unwrap();
-    let mut fixture = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-    fixture.write_all(SESSION_PROMOTION_FIXTURE).unwrap();
-    fixture.flush().unwrap();
-    let database_path = fixture.path().to_owned();
-    let key = SqlCipherKey::new("session promotion facade key").unwrap();
-    let group_id = GroupId::new(hex::decode(SESSION_PROMOTION_GROUP_ID_HEX).unwrap());
-    let mut session = AccountDeviceSession::open(config(&database_path, &key, b"alice-promotion"))
-        .expect("session is ready before maintenance promotion");
+    let database_path = dir.path().join("current-message.sqlite");
+    let key = SqlCipherKey::new("session current message facade key").unwrap();
+    let mut session =
+        AccountDeviceSession::open(config(&database_path, &key, b"alice-current-message")).unwrap();
+    let mut bob = AccountDeviceSession::open(config(
+        dir.path().join("bob.sqlite"),
+        &key,
+        b"bob-current-message",
+    ))
+    .unwrap();
+    let created = session
+        .create_group(CreateGroupRequest {
+            name: "current message fixture".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome_id) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].id.clone()),
+        other => panic!("expected current fixture group creation, got {other:?}"),
+    };
+    session.confirm_published(pending).await.unwrap();
+    let group_id = created.group_id;
+    let members = session.members(&group_id).unwrap();
+    assert_eq!(members.len(), 2);
+    let own_leaf_index = session.own_leaf_index(&group_id).unwrap();
+    assert_eq!(own_leaf_index, 0);
+    drop(session);
+    let message = {
+        let storage = SqliteAccountStorage::open_encrypted(&database_path, &key).unwrap();
+        let message = storage.get_message(&welcome_id).unwrap();
+        storage.close().unwrap();
+        message
+    };
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&database_path, &key).unwrap();
+        assert_eq!(storage.get_message(&welcome_id).unwrap(), message);
+        storage.close().unwrap();
+    }
+    let mut session =
+        AccountDeviceSession::open(config(&database_path, &key, b"alice-current-message"))
+            .expect("current schema session is ready after cold reopen");
 
     assert_eq!(session.epoch(&group_id).unwrap(), EpochId(1));
-    assert_eq!(session.members(&group_id).unwrap().len(), 2);
-    let progress = session.promote_legacy_message_rows(1).unwrap();
-    assert_eq!(progress.promoted, 1);
-    assert!(!progress.has_more);
-    assert_eq!(session.epoch(&group_id).unwrap(), EpochId(1));
-    assert_eq!(session.members(&group_id).unwrap().len(), 2);
-    let post_promotion_payload = app_payload_for(&session, b"usable after promotion");
-    session
+    assert_eq!(session.members(&group_id).unwrap(), members);
+    assert_eq!(session.own_leaf_index(&group_id).unwrap(), own_leaf_index);
+    let current_payload = app_payload_for(&session, b"usable after cold reopen");
+    let sent = session
         .send(SendIntent::AppMessage {
-            group_id,
-            payload: post_promotion_payload,
+            group_id: group_id.clone(),
+            payload: current_payload,
             expected_epoch: None,
         })
         .await
-        .expect("promotion preserves public session behavior");
+        .expect("cold reopen preserves public session behavior");
+    let sent_id = match &sent.publish[0] {
+        PublishWork::ApplicationMessage { msg, .. } => msg.id.clone(),
+        other => panic!("expected current application publish work, got {other:?}"),
+    };
+    drop(session);
+    let sent_message = {
+        let storage = SqliteAccountStorage::open_encrypted(&database_path, &key).unwrap();
+        assert_eq!(storage.get_message(&welcome_id).unwrap(), message);
+        let sent_message = storage.get_message(&sent_id).unwrap();
+        assert_eq!(sent_message.group_id, group_id);
+        assert_eq!(sent_message.epoch, EpochId(1));
+        assert_eq!(sent_message.state, cgka_traits::message::MessageState::Sent);
+        assert!(sent_message.deferred_peel.is_none());
+        assert!(!sent_message.payload.is_empty());
+        storage.close().unwrap();
+        sent_message
+    };
+    let reopened =
+        AccountDeviceSession::open(config(&database_path, &key, b"alice-current-message")).unwrap();
+    assert_eq!(reopened.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(reopened.members(&group_id).unwrap(), members);
+    assert_eq!(reopened.own_leaf_index(&group_id).unwrap(), own_leaf_index);
+    drop(reopened);
+    let storage = SqliteAccountStorage::open_encrypted(&database_path, &key).unwrap();
+    assert_eq!(storage.get_message(&welcome_id).unwrap(), message);
+    assert_eq!(storage.get_message(&sent_id).unwrap(), sent_message);
+    storage.close().unwrap();
 }
 
 #[tokio::test]
@@ -994,7 +1051,7 @@ async fn a_disband_request_carries_no_publish_work() {
     // A solo group merges that install without staging publish work; a Commit
     // only appears once there is another member to publish it to.
     assert!(enabled.publish.is_empty());
-    let _ = alice.drain();
+    let _ = alice.drain().unwrap();
 
     let requested = alice
         .send(SendIntent::Disband {
@@ -1107,4 +1164,256 @@ async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_sto
     );
     assert!(reopened.ensure_group_hydrated(&group).unwrap());
     assert_eq!(reopened.group_authority(&group).unwrap(), before);
+}
+
+#[tokio::test]
+async fn ensure_group_hydrated_reports_live_deferred_unknown_and_removed_groups() {
+    use cgka_traits::storage::GroupStorage;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("hydration-verdict.sqlite");
+    let key = SqlCipherKey::new("hydration verdict fixture").unwrap();
+    let identity = b"hydration-verdict";
+    let mut session = AccountDeviceSession::open(
+        config(&path, &key, identity).protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    let created = session
+        .create_group(CreateGroupRequest {
+            name: "hydration verdict".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group = created.group_id;
+    let members = session.members(&group).unwrap();
+    let epoch = session.epoch(&group).unwrap();
+    let record = session.group_record(&group).unwrap();
+    assert!(session.ensure_group_hydrated(&group).unwrap());
+    assert!(session.ensure_group_hydrated(&group).unwrap());
+    assert_eq!(session.members(&group).unwrap(), members);
+    assert_eq!(session.epoch(&group).unwrap(), epoch);
+    assert_eq!(session.group_record(&group).unwrap(), record);
+    session.drain().unwrap();
+    let unknown = GroupId::new(vec![0; 17]);
+    assert!(!session.live_group_ids().unwrap().contains(&unknown));
+    assert!(!session.ensure_group_hydrated(&unknown).unwrap());
+    assert!(!session.ensure_group_hydrated(&unknown).unwrap());
+    assert!(session.epoch_state(&unknown).unwrap().is_none());
+    assert!(session.quarantined_groups().unwrap().is_empty());
+    assert!(session.drain().unwrap().is_empty());
+    drop(session);
+
+    let mut deferred = AccountDeviceSession::open(
+        config(&path, &key, identity)
+            .protocol_profile(ProtocolProfile::Current)
+            .defer_group_hydration(),
+    )
+    .unwrap();
+    assert_eq!(
+        deferred.unhydrated_group_ids().unwrap(),
+        vec![group.clone()]
+    );
+    assert!(matches!(
+        deferred.members(&group),
+        Err(EngineError::GroupNotHydrated(ref id)) if id == &group
+    ));
+    assert!(deferred.ensure_group_hydrated(&group).unwrap());
+    assert!(deferred.unhydrated_group_ids().unwrap().is_empty());
+    assert_eq!(deferred.members(&group).unwrap(), members);
+    assert_eq!(deferred.epoch(&group).unwrap(), epoch);
+    assert!(deferred.ensure_group_hydrated(&group).unwrap());
+    drop(deferred);
+
+    // A removed local copy still hydrates for authenticated re-add, but is not live.
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut removed = storage.get_group(&group).unwrap();
+    removed.removed = true;
+    storage.put_group(&removed).unwrap();
+    let mut reopened = AccountDeviceSession::open(
+        config(&path, &key, identity)
+            .protocol_profile(ProtocolProfile::Current)
+            .defer_group_hydration(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.unhydrated_group_ids().unwrap(),
+        vec![group.clone()]
+    );
+    assert!(!reopened.ensure_group_hydrated(&group).unwrap());
+    assert!(reopened.unhydrated_group_ids().unwrap().is_empty());
+    assert_eq!(reopened.epoch(&group).unwrap(), epoch);
+    assert!(reopened.group_record(&group).unwrap().removed);
+    assert!(!reopened.live_group_ids().unwrap().contains(&group));
+    assert!(!reopened.ensure_group_hydrated(&group).unwrap());
+    assert!(reopened.quarantined_groups().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ensure_group_hydrated_refuses_eager_and_deferred_quarantine() {
+    use cgka_traits::engine::GroupHydrationQuarantineReason;
+    use cgka_traits::storage::GroupStorage;
+    for defer in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hydration-quarantine.sqlite");
+        let key = SqlCipherKey::new("hydration quarantine fixture").unwrap();
+        let identity = b"hydration-quarantine";
+        let mut initial = AccountDeviceSession::open(
+            config(&path, &key, identity).protocol_profile(ProtocolProfile::Current),
+        )
+        .unwrap();
+        let mut groups = Vec::new();
+        for name in ["deliberately corrupted", "healthy control"] {
+            groups.push(
+                initial
+                    .create_group(CreateGroupRequest {
+                        name: name.into(),
+                        description: String::new(),
+                        members: vec![],
+                        required_features: vec![],
+                        app_components: vec![],
+                        initial_admins: vec![],
+                    })
+                    .await
+                    .unwrap()
+                    .group_id,
+            );
+        }
+        let group = &groups[0];
+        let healthy = &groups[1];
+        let healthy_members = initial.members(healthy).unwrap();
+        drop(initial);
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let original = storage.get_group(group).unwrap();
+        assert_eq!(original.protocol_profile, ProtocolProfile::Current);
+        // Deliberate synthetic metadata corruption; MLS remains a genuine current group.
+        let mut corrupted = original.clone();
+        corrupted.protocol_profile = ProtocolProfile::Legacy;
+        storage.put_group(&corrupted).unwrap();
+        let mut open = config(&path, &key, identity).protocol_profile(ProtocolProfile::Current);
+        if defer {
+            open = open.defer_group_hydration();
+        }
+        let mut reopened = AccountDeviceSession::open(open).unwrap();
+        if defer {
+            assert!(reopened.unhydrated_group_ids().unwrap().contains(group));
+            assert!(reopened.quarantined_groups().unwrap().is_empty());
+        } else {
+            assert_eq!(
+                reopened.quarantined_groups().unwrap(),
+                vec![(
+                    group.clone(),
+                    GroupHydrationQuarantineReason::MemberValidationFailed,
+                )]
+            );
+        }
+        assert!(!reopened.ensure_group_hydrated(group).unwrap());
+        assert!(!reopened.ensure_group_hydrated(group).unwrap());
+        assert_eq!(
+            reopened.quarantined_groups().unwrap(),
+            vec![(
+                group.clone(),
+                GroupHydrationQuarantineReason::MemberValidationFailed,
+            )]
+        );
+        assert!(reopened.epoch_state(group).unwrap().is_none());
+        assert!(matches!(
+            reopened.members(group),
+            Err(EngineError::UnknownGroup(ref id)) if id == group
+        ));
+        assert_eq!(storage.get_group(group).unwrap(), corrupted);
+        assert!(reopened.ensure_group_hydrated(healthy).unwrap());
+        assert_eq!(reopened.members(healthy).unwrap(), healthy_members);
+        assert!(!reopened.live_group_ids().unwrap().contains(group));
+        drop(reopened);
+        storage.put_group(&original).unwrap();
+        let mut recovered = AccountDeviceSession::open(
+            config(&path, &key, identity).protocol_profile(ProtocolProfile::Current),
+        )
+        .unwrap();
+        assert!(recovered.quarantined_groups().unwrap().is_empty());
+        assert!(recovered.ensure_group_hydrated(group).unwrap());
+        assert_eq!(recovered.group_record(group).unwrap(), original);
+    }
+}
+
+#[tokio::test]
+async fn ensure_group_hydrated_refuses_a_real_disband_before_and_after_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("hydration-disband.sqlite");
+    let key = SqlCipherKey::new("hydration disband fixture").unwrap();
+    let identity = b"hydration-disband";
+    let mut session = AccountDeviceSession::open(
+        config(&path, &key, identity).protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    let group = session
+        .create_group(CreateGroupRequest {
+            name: "real terminal disband".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+        .group_id;
+    session
+        .send(SendIntent::EnableDisbanding {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let requested = session
+        .send(SendIntent::Disband {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(requested.pending_convergence, vec![group.clone()]);
+    let prepared = session.advance_convergence(&group).await.unwrap();
+    let pending = match prepared.publish.as_slice() {
+        [
+            PublishWork::GroupEvolution {
+                pending, welcomes, ..
+            },
+        ] => {
+            assert!(welcomes.is_empty());
+            *pending
+        }
+        other => panic!("expected one genuine prepared disband, got {other:?}"),
+    };
+    session.confirm_published(pending).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !matches!(
+        session.epoch_state(&group).unwrap(),
+        Some(cgka_traits::EpochState::Disbanded(_))
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "real disband did not settle"
+        );
+        session.advance_convergence(&group).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(session.group_record(&group).unwrap().disbanded.is_some());
+    assert!(!session.ensure_group_hydrated(&group).unwrap());
+    assert!(!session.ensure_group_hydrated(&group).unwrap());
+    assert!(!session.live_group_ids().unwrap().contains(&group));
+    drop(session);
+    let mut reopened = AccountDeviceSession::open(
+        config(&path, &key, identity).protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    assert!(matches!(
+        reopened.epoch_state(&group).unwrap(),
+        Some(cgka_traits::EpochState::Disbanded(_))
+    ));
+    assert!(!reopened.ensure_group_hydrated(&group).unwrap());
+    assert!(reopened.quarantined_groups().unwrap().is_empty());
+    assert!(reopened.group_record(&group).unwrap().disbanded.is_some());
 }

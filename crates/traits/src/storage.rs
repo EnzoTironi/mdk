@@ -475,6 +475,7 @@ pub trait MessageStorage {
 /// Durable queue for local outbound work that cannot be safely published
 /// until convergence reaches `Settled`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueuedOutboundIntent {
     pub id: MessageId,
     pub group_id: GroupId,
@@ -483,8 +484,24 @@ pub struct QueuedOutboundIntent {
     /// How many times convergence has already superseded a commit carrying
     /// this intent and re-queued it (mdk#1734). Bounded by the engine so a
     /// perpetually losing edit cannot re-issue forever.
-    #[serde(default)]
     pub reissue_attempts: u32,
+    /// Required durable preparation authority. An absent field is invalid;
+    /// restart must never interpret an already prepared intent as unprepared.
+    pub preparation: QueuedIntentPreparation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum QueuedIntentPreparation {
+    Unprepared {},
+    BoundArtifact { artifact: RegeneratedArtifact },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RegeneratedArtifact {
+    Message { message_id: MessageId },
+    PendingCommit { origin_message_id: MessageId },
 }
 
 /// The group state an own commit's intent was authored against, so a later
@@ -1059,6 +1076,73 @@ pub trait StorageProvider:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_preparation_is_required_and_has_no_legacy_or_unknown_state() {
+        let group_id = GroupId::new(vec![1; 32]);
+        let record = QueuedOutboundIntent {
+            id: MessageId::new(vec![2; 32]),
+            group_id: group_id.clone(),
+            intent: SendIntent::SelfUpdate { group_id },
+            created_at_ms: 1,
+            reissue_attempts: 0,
+            preparation: QueuedIntentPreparation::Unprepared {},
+        };
+        let mut encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            serde_json::from_value::<QueuedOutboundIntent>(encoded.clone()).unwrap(),
+            record
+        );
+        let mut missing_counter = encoded.clone();
+        missing_counter
+            .as_object_mut()
+            .unwrap()
+            .remove("reissue_attempts");
+        assert!(serde_json::from_value::<QueuedOutboundIntent>(missing_counter).is_err());
+        encoded.as_object_mut().unwrap().remove("preparation");
+        assert!(serde_json::from_value::<QueuedOutboundIntent>(encoded.clone()).is_err());
+        encoded["preparation"] = serde_json::json!({"state":"already_prepared"});
+        assert!(serde_json::from_value::<QueuedOutboundIntent>(encoded.clone()).is_err());
+        encoded["preparation"] =
+            serde_json::json!({"state":"unprepared","artifact":{"kind":"message"}});
+        assert!(serde_json::from_value::<QueuedOutboundIntent>(encoded).is_err());
+        for artifact in [
+            RegeneratedArtifact::Message {
+                message_id: MessageId::new(vec![3; 32]),
+            },
+            RegeneratedArtifact::PendingCommit {
+                origin_message_id: MessageId::new(vec![4; 32]),
+            },
+        ] {
+            let bound = QueuedOutboundIntent {
+                preparation: QueuedIntentPreparation::BoundArtifact { artifact },
+                ..record.clone()
+            };
+            let encoded = serde_json::to_value(&bound).unwrap();
+            assert_eq!(
+                serde_json::from_value::<QueuedOutboundIntent>(encoded.clone()).unwrap(),
+                bound
+            );
+            let mut unknown_state_field = encoded.clone();
+            unknown_state_field["preparation"]["unexpected"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<QueuedOutboundIntent>(unknown_state_field).is_err());
+            let mut unknown_artifact_field = encoded.clone();
+            unknown_artifact_field["preparation"]["artifact"]["unexpected"] =
+                serde_json::json!(true);
+            assert!(
+                serde_json::from_value::<QueuedOutboundIntent>(unknown_artifact_field).is_err()
+            );
+            let mut missing_artifact = encoded.clone();
+            missing_artifact["preparation"]
+                .as_object_mut()
+                .unwrap()
+                .remove("artifact");
+            assert!(serde_json::from_value::<QueuedOutboundIntent>(missing_artifact).is_err());
+            let mut unknown_kind = encoded;
+            unknown_kind["preparation"]["artifact"]["kind"] = serde_json::json!("other");
+            assert!(serde_json::from_value::<QueuedOutboundIntent>(unknown_kind).is_err());
+        }
+    }
 
     #[test]
     fn stored_key_package_debug_redacts_serialized_private_key_material() {

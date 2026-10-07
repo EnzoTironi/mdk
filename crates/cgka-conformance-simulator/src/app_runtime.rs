@@ -2650,7 +2650,6 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::AccountWorkerBusy => "account_worker_busy",
         AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
         AppError::ChatPresentationNotReady => "chat_presentation_not_ready",
-        AppError::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
         AppError::RuntimeBusy => "runtime_busy",
         AppError::RuntimeStopping => "runtime_stopping",
         AppError::TransportClosed => "transport_closed",
@@ -2695,7 +2694,6 @@ fn app_error_retryable(error: &AppError) -> bool {
             | AppError::RuntimeBusy
             | AppError::TransportClosed
             | AppError::ChatPresentationNotReady
-            | AppError::DirectConversationIndexNotReady
     )
 }
 fn app_error(error: AppError) -> SubjectError {
@@ -2726,7 +2724,6 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AccountWorkerBusy
         | AppError::AccountWorkerResponseTimedOut
         | AppError::ChatPresentationNotReady
-        | AppError::DirectConversationIndexNotReady
         | AppError::RuntimeStopping
         | AppError::TransportClosed
         | AppError::AccountCatchUp(_)

@@ -441,7 +441,15 @@ async fn cold_open_storage_and_hydration_timings() {
             .unwrap();
         let local_us = start.elapsed().as_micros();
         assert_eq!(page.page.page().messages.len(), 50);
-        assert_eq!(client.runtime.session().unhydrated_group_ids().len(), 1);
+        assert_eq!(
+            client
+                .runtime
+                .session()
+                .unhydrated_group_ids()
+                .unwrap()
+                .len(),
+            1
+        );
         let start = std::time::Instant::now();
         assert!(
             client

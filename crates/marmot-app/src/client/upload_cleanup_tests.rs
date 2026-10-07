@@ -207,6 +207,9 @@ async fn outgoing_publication_survives_retention_pressure_and_sql_faults() {
                 )
                 .unwrap();
             let mut policy = crate::runtime::attachment_controls::default_policy(&app.config);
+            drop(client);
+            let runtime = crate::MarmotAppRuntime::new(app);
+            runtime.start().await.unwrap();
             match fault {
                 "quota"=>{policy.retained_bytes=1024;policy.transfer_limit=1024;},
                 "disk"=>policy.disk_reserve=(i64::MAX as u64)-4*512*1024*1024-1,
@@ -222,8 +225,6 @@ async fn outgoing_publication_survives_retention_pressure_and_sql_faults() {
             storage
                 .set_attachment_download_policy(&policy, crate::unix_now_seconds())
                 .unwrap();
-            drop(client);
-            let runtime = crate::MarmotAppRuntime::new(app);
             let id = if token_send {
                 runtime
                     .upload_media_with_client_token(

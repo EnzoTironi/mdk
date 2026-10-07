@@ -258,9 +258,8 @@ consent still default off. Source builds of `wn`/`wnd` can enable both with
 Connectivity coverage uses the latest bounded minute sample of app-wide relay
 health and emits one availability cell per sealed window. Quarantined groups are
 backlog samples, not newly failed transitions on startup. Storage migration rows
-count newly committed numbered migrations; reopening an unchanged database does
-not emit migration success. The migration attempt duration covers the migration
-runner, while the storage-open measurement covers the surrounding open operation.
+count the newly committed current account baseline: one on fresh installation and zero on current reopen.
+The attempt duration covers the installer transaction; storage-open measurement covers the surrounding open operation.
 
 ### Optional exporter lifecycle
 

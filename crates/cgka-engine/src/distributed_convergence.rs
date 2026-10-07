@@ -2679,6 +2679,19 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    pub(crate) fn current_test_engine_with_storage(
+        storage: storage_sqlite::SqliteAccountStorage,
+    ) -> crate::Engine<storage_sqlite::SqliteAccountStorage> {
+        let key = signing_key();
+        let identity = key.verifying_key().to_bytes().to_vec();
+        crate::EngineBuilder::new(storage)
+            .identity(identity)
+            .account_identity_proof_signer(Arc::new(TestProofSigner(key)))
+            .peeler(Box::new(PassthroughPeeler))
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn seen_id_snapshot_is_shared_until_the_set_changes() {
         let mut engine = test_engine();
